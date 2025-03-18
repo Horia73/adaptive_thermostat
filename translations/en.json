@@ -1,0 +1,73 @@
+{
+    "config": {
+      "step": {
+        "user": {
+          "title": "Configure Adaptive Thermostat",
+          "data": {
+            "name": "Name",
+            "heater": "Heater Entity (switch or input_boolean)",
+            "temp_sensor": "Temperature Sensor",
+            "humidity_sensor": "Humidity Sensor (optional)",
+            "door_window_sensor": "Door/Window Sensor (optional)",
+            "motion_sensor": "Motion Sensor (optional)",
+            "outdoor_sensor": "Outdoor Temperature Sensor (optional)",
+            "weather_sensor": "Weather Entity (required if outdoor sensor not available)",
+            "outside_temp_off": "Outside Temperature Shutoff Threshold",
+            "sleep_preset": "Sleep Mode Temperature",
+            "home_preset": "Home Mode Temperature",
+            "away_preset": "Away Mode Temperature"
+          },
+          "description": "Set up your Adaptive Thermostat with smart temperature control based on indoor and outdoor conditions."
+        }
+      },
+      "error": {
+        "missing_heater": "You must select a heater entity (switch or input_boolean)",
+        "missing_temp_sensor": "You must select a temperature sensor",
+        "missing_outdoor_data": "You must provide either an outdoor temperature sensor or a weather entity"
+      },
+      "abort": {
+        "already_configured": "This thermostat is already configured"
+      }
+    },
+    "options": {
+      "step": {
+        "init": {
+          "title": "Edit Adaptive Thermostat",
+          "data": {
+            "name": "Name",
+            "heater": "Heater Entity (switch or input_boolean)",
+            "temp_sensor": "Temperature Sensor",
+            "humidity_sensor": "Humidity Sensor (optional)",
+            "door_window_sensor": "Door/Window Sensor (optional)",
+            "motion_sensor": "Motion Sensor (optional)",
+            "outdoor_sensor": "Outdoor Temperature Sensor (optional)",
+            "weather_sensor": "Weather Entity (required if outdoor sensor not available)",
+            "outside_temp_off": "Outside Temperature Shutoff Threshold",
+            "sleep_preset": "Sleep Mode Temperature",
+            "home_preset": "Home Mode Temperature",
+            "away_preset": "Away Mode Temperature"
+          },
+          "description": "Adjust the settings for your Adaptive Thermostat."
+        }
+      },
+      "error": {
+        "missing_heater": "You must select a heater entity (switch or input_boolean)",
+        "missing_temp_sensor": "You must select a temperature sensor",
+        "missing_outdoor_data": "You must provide either an outdoor temperature sensor or a weather entity"
+      }
+    },
+    "selector": {
+      "name_desc": "A friendly name for this thermostat",
+      "heater_desc": "The switch or input_boolean entity that controls your heating system",
+      "temp_sensor_desc": "Temperature sensor to measure the current room temperature",
+      "humidity_sensor_desc": "Optional humidity sensor to monitor room humidity",
+      "door_window_sensor_desc": "Optional door/window sensor to detect open windows",
+      "motion_sensor_desc": "Optional motion sensor to detect occupancy",
+      "outdoor_sensor_desc": "Optional outdoor temperature sensor",
+      "weather_sensor_desc": "Weather entity to get outdoor temperature when outdoor sensor is not available",
+      "outside_temp_off_desc": "Outside temperature threshold above which the heater will turn off (energy saving)",
+      "sleep_preset_desc": "Temperature setpoint for sleep mode (°C)",
+      "home_preset_desc": "Temperature setpoint for home mode (°C)",
+      "away_preset_desc": "Temperature setpoint for away mode (°C)"
+    }
+  }

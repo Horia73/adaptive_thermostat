@@ -1,0 +1,11 @@
+{
+  "domain": "adaptive_thermostat",
+  "name": "Adaptive Thermostat",
+  "documentation": "https://github.com/yourusername/adaptive_thermostat",
+  "dependencies": [],
+  "codeowners": ["@yourusername"],
+  "requirements": [],
+  "config_flow": true,
+  "version": "1.0.0",
+  "iot_class": "calculated"
+} 
