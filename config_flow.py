@@ -1,366 +1,291 @@
 """Config flow for Adaptive Thermostat integration."""
 import logging
 import voluptuous as vol
+from typing import Any
 
 from homeassistant import config_entries
 from homeassistant.core import callback
 from homeassistant.data_entry_flow import FlowResult
 from homeassistant.helpers import selector
-from homeassistant.const import (
-    CONF_NAME,
-)
+from homeassistant.const import CONF_NAME
 
-from . import DOMAIN
+# Import constants
+from .const import (
+    DOMAIN,
+    CONF_HEATER,
+    CONF_TEMP_SENSOR,
+    CONF_HUMIDITY_SENSOR,
+    CONF_DOOR_WINDOW_SENSOR,
+    CONF_MOTION_SENSOR,
+    CONF_OUTDOOR_SENSOR,
+    CONF_WEATHER_SENSOR,
+    CONF_SLEEP_PRESET,
+    CONF_HOME_PRESET,
+    CONF_AWAY_PRESET,
+    DEFAULT_NAME,
+    DEFAULT_HOME_PRESET,
+    DEFAULT_SLEEP_PRESET,
+    DEFAULT_AWAY_PRESET,
+)
 
 _LOGGER = logging.getLogger(__name__)
 
-# Configuration options
-CONF_HEATER = "heater"
-CONF_TEMP_SENSOR = "temp_sensor"
-CONF_HUMIDITY_SENSOR = "humidity_sensor"
-CONF_DOOR_WINDOW_SENSOR = "door_window_sensor"
-CONF_MOTION_SENSOR = "motion_sensor"
-CONF_OUTDOOR_SENSOR = "outdoor_sensor"
-CONF_WEATHER_SENSOR = "weather_sensor"
-CONF_OUTSIDE_TEMP_OFF = "outside_temp_off"
-CONF_SLEEP_PRESET = "sleep_preset"
-CONF_HOME_PRESET = "home_preset"
-CONF_AWAY_PRESET = "away_preset"
+# List of keys that are entity selectors
+ENTITY_SELECTOR_KEYS = [
+    CONF_HEATER,
+    CONF_TEMP_SENSOR,
+    CONF_HUMIDITY_SENSOR,
+    CONF_DOOR_WINDOW_SENSOR,
+    CONF_MOTION_SENSOR,
+    CONF_OUTDOOR_SENSOR,
+    CONF_WEATHER_SENSOR,
+]
+
+OPTIONAL_ENTITY_SELECTOR_KEYS = [ # Keys for OPTIONAL entity selectors
+    CONF_HUMIDITY_SENSOR,
+    CONF_DOOR_WINDOW_SENSOR,
+    CONF_MOTION_SENSOR,
+    CONF_OUTDOOR_SENSOR,
+    CONF_WEATHER_SENSOR,
+]
 
 
+# Schema for the initial user step (remains unchanged)
+STEP_USER_DATA_SCHEMA = vol.Schema(
+    {
+        vol.Required(CONF_NAME, default=""): str,
+        vol.Required(CONF_HEATER): selector.EntitySelector(
+            selector.EntitySelectorConfig(domain=["switch", "input_boolean"]),
+        ),
+        vol.Required(CONF_TEMP_SENSOR): selector.EntitySelector(
+            selector.EntitySelectorConfig(
+                domain=["sensor"], device_class="temperature"
+            ),
+        ),
+        vol.Optional(CONF_HUMIDITY_SENSOR): selector.EntitySelector(
+            selector.EntitySelectorConfig(
+                domain=["sensor"], device_class="humidity", multiple=False
+            ),
+        ),
+        vol.Optional(CONF_DOOR_WINDOW_SENSOR): selector.EntitySelector(
+            selector.EntitySelectorConfig(
+                domain=["binary_sensor"], device_class=["door", "window"], multiple=False
+            ),
+        ),
+        vol.Optional(CONF_MOTION_SENSOR): selector.EntitySelector(
+            selector.EntitySelectorConfig(
+                domain=["binary_sensor"], device_class="motion", multiple=False
+            ),
+        ),
+        vol.Optional(CONF_OUTDOOR_SENSOR): selector.EntitySelector(
+            selector.EntitySelectorConfig(
+                domain=["sensor"], device_class="temperature", multiple=False
+            ),
+        ),
+        vol.Optional(CONF_WEATHER_SENSOR): selector.EntitySelector(
+            selector.EntitySelectorConfig(
+                domain=["sensor"], multiple=False
+            ),
+        ),
+        vol.Required(CONF_HOME_PRESET, default=DEFAULT_HOME_PRESET): selector.NumberSelector(
+            selector.NumberSelectorConfig(
+                min=10, max=30, step=0.1, mode="box"
+            ),
+        ),
+        vol.Required(CONF_SLEEP_PRESET, default=DEFAULT_SLEEP_PRESET): selector.NumberSelector(
+            selector.NumberSelectorConfig(
+                min=10, max=30, step=0.1, mode="box"
+            ),
+        ),
+        vol.Required(CONF_AWAY_PRESET, default=DEFAULT_AWAY_PRESET): selector.NumberSelector(
+            selector.NumberSelectorConfig(
+                min=10, max=30, step=0.1, mode="box"
+            ),
+        ),
+    }
+)
+
+# Helper function create_options_schema (No change needed)
+def create_options_schema(current_config: dict[str, Any]) -> vol.Schema:
+    """Create the schema for the options flow, pre-filling defaults."""
+    name_default = current_config.get(CONF_NAME, DEFAULT_NAME)
+    home_preset_default = current_config.get(CONF_HOME_PRESET, DEFAULT_HOME_PRESET)
+    sleep_preset_default = current_config.get(CONF_SLEEP_PRESET, DEFAULT_SLEEP_PRESET)
+    away_preset_default = current_config.get(CONF_AWAY_PRESET, DEFAULT_AWAY_PRESET)
+
+    humidity_sensor_default = current_config.get(CONF_HUMIDITY_SENSOR) # Returns None if key missing
+    door_sensor_default = current_config.get(CONF_DOOR_WINDOW_SENSOR)
+    motion_sensor_default = current_config.get(CONF_MOTION_SENSOR)
+    outdoor_sensor_default = current_config.get(CONF_OUTDOOR_SENSOR)
+    weather_sensor_default = current_config.get(CONF_WEATHER_SENSOR)
+
+    _LOGGER.debug(f"[Schema Creation] Value used for {CONF_HUMIDITY_SENSOR} suggested_value: {humidity_sensor_default}")
+
+    return vol.Schema(
+        {
+            vol.Required(CONF_NAME, default=name_default): str,
+            vol.Required(CONF_HEATER, default=current_config.get(CONF_HEATER)): selector.EntitySelector(
+                selector.EntitySelectorConfig(domain=["switch", "input_boolean"]),
+            ),
+            vol.Required(CONF_TEMP_SENSOR, default=current_config.get(CONF_TEMP_SENSOR)): selector.EntitySelector(
+                selector.EntitySelectorConfig(
+                    domain=["sensor"], device_class="temperature"
+                ),
+            ),
+            vol.Optional(CONF_HUMIDITY_SENSOR, description={"suggested_value": humidity_sensor_default}): selector.EntitySelector(
+                selector.EntitySelectorConfig(
+                    domain=["sensor"], device_class="humidity", multiple=False
+                ),
+            ),
+            # ... other optional sensors ...
+            vol.Optional(CONF_DOOR_WINDOW_SENSOR, description={"suggested_value": door_sensor_default}): selector.EntitySelector(
+                selector.EntitySelectorConfig(
+                    domain=["binary_sensor"], device_class=["door", "window"], multiple=False
+                ),
+            ),
+            vol.Optional(CONF_MOTION_SENSOR, description={"suggested_value": motion_sensor_default}): selector.EntitySelector(
+                selector.EntitySelectorConfig(
+                    domain=["binary_sensor"], device_class="motion", multiple=False
+                ),
+            ),
+            vol.Optional(CONF_OUTDOOR_SENSOR, description={"suggested_value": outdoor_sensor_default}): selector.EntitySelector(
+                selector.EntitySelectorConfig(
+                    domain=["sensor"], device_class="temperature", multiple=False
+                ),
+            ),
+            vol.Optional(CONF_WEATHER_SENSOR, description={"suggested_value": weather_sensor_default}): selector.EntitySelector(
+                selector.EntitySelectorConfig(
+                    domain=["sensor"], multiple=False
+                ),
+            ),
+            # ... presets ...
+            vol.Required(CONF_HOME_PRESET, default=home_preset_default): selector.NumberSelector(
+                selector.NumberSelectorConfig(
+                    min=10, max=30, step=0.1, mode="box"
+                ),
+            ),
+            vol.Required(CONF_SLEEP_PRESET, default=sleep_preset_default): selector.NumberSelector(
+                selector.NumberSelectorConfig(
+                    min=10, max=30, step=0.1, mode="box"
+                ),
+            ),
+            vol.Required(CONF_AWAY_PRESET, default=away_preset_default): selector.NumberSelector(
+                selector.NumberSelectorConfig(
+                    min=10, max=30, step=0.1, mode="box"
+                ),
+            ),
+        }
+    )
+
+
+# Config Flow Handler (remains unchanged)
 class AdaptiveThermostatConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
-    """Handle a config flow for Adaptive Thermostat."""
-
     VERSION = 1
-
     @staticmethod
     @callback
-    def async_get_options_flow(config_entry):
-        """Get the options flow for this handler."""
+    def async_get_options_flow(config_entry: config_entries.ConfigEntry) -> config_entries.OptionsFlow:
+        _LOGGER.debug("Mimic VT Flow: Returning instance of AdaptiveThermostatOptionsFlow(%s)", config_entry.entry_id)
         return AdaptiveThermostatOptionsFlow(config_entry)
 
-    async def async_step_user(self, user_input=None) -> FlowResult:
-        """Handle the initial step."""
+    async def async_step_user(self, user_input: dict[str, Any] | None = None) -> FlowResult:
+        # (Using Key Deletion logic from previous attempt)
         errors = {}
-
         if user_input is not None:
-            # Validate user input
-            if not user_input.get(CONF_HEATER):
-                errors[CONF_HEATER] = "missing_heater"
-            if not user_input.get(CONF_TEMP_SENSOR):
-                errors[CONF_TEMP_SENSOR] = "missing_temp_sensor"
-            if not user_input.get(CONF_WEATHER_SENSOR) and not user_input.get(CONF_OUTDOOR_SENSOR):
-                errors[CONF_WEATHER_SENSOR] = "missing_outdoor_data"
+            final_data = {}
+            for key, value in user_input.items():
+                 if key in OPTIONAL_ENTITY_SELECTOR_KEYS and value is None:
+                      _LOGGER.debug("User Step: Skipping key '%s' due to None value", key)
+                      continue
+                 elif value is not None:
+                      final_data[key] = value
+
+            if not final_data.get(CONF_HEATER) or not final_data.get(CONF_TEMP_SENSOR):
+                 errors["base"] = "heater_or_temp_missing"
 
             if not errors:
-                # Create entry
-                return self.async_create_entry(
-                    title=user_input[CONF_NAME],
-                    data=user_input,
-                )
-
-        # Prepare default values
-        default_values = {
-            CONF_OUTSIDE_TEMP_OFF: 20,
-            CONF_SLEEP_PRESET: 21,
-            CONF_HOME_PRESET: 22,
-            CONF_AWAY_PRESET: 18,
-        }
-
-        # Use provided values or defaults
-        suggested_values = user_input or default_values
-
+                 _LOGGER.debug("Creating config entry with data: %s", final_data)
+                 return self.async_create_entry(
+                     title=final_data.get(CONF_NAME, DEFAULT_NAME),
+                     data=final_data
+                 )
         return self.async_show_form(
-            step_id="user",
-            data_schema=vol.Schema(
-                {
-                    vol.Required(CONF_NAME): str,
-                    vol.Required(CONF_HEATER): selector.EntitySelector(
-                        selector.EntitySelectorConfig(
-                            domain=["switch", "input_boolean"]
-                        ),
-                    ),
-                    vol.Required(CONF_TEMP_SENSOR): selector.EntitySelector(
-                        selector.EntitySelectorConfig(
-                            domain=["sensor"],
-                            device_class=["temperature"],
-                        ),
-                    ),
-                    vol.Optional(CONF_HUMIDITY_SENSOR): selector.EntitySelector(
-                        selector.EntitySelectorConfig(
-                            domain=["sensor"],
-                            device_class=["humidity"],
-                        ),
-                    ),
-                    vol.Optional(CONF_DOOR_WINDOW_SENSOR): selector.EntitySelector(
-                        selector.EntitySelectorConfig(
-                            domain=["binary_sensor"],
-                            device_class=["door", "window"],
-                        ),
-                    ),
-                    vol.Optional(CONF_MOTION_SENSOR): selector.EntitySelector(
-                        selector.EntitySelectorConfig(
-                            domain=["binary_sensor"],
-                            device_class=["motion"],
-                        ),
-                    ),
-                    vol.Optional(CONF_OUTDOOR_SENSOR): selector.EntitySelector(
-                        selector.EntitySelectorConfig(
-                            domain=["sensor"],
-                            device_class=["temperature"],
-                        ),
-                    ),
-                    vol.Required(CONF_WEATHER_SENSOR, default=suggested_values.get(CONF_WEATHER_SENSOR)): selector.EntitySelector(
-                        selector.EntitySelectorConfig(
-                            domain=["weather"],
-                        ),
-                    ),
-                    vol.Required(
-                        CONF_OUTSIDE_TEMP_OFF,
-                        default=suggested_values.get(CONF_OUTSIDE_TEMP_OFF),
-                    ): selector.NumberSelector(
-                        selector.NumberSelectorConfig(
-                            min=0,
-                            max=40,
-                            step=0.1,
-                            unit_of_measurement="°C",
-                        ),
-                    ),
-                    vol.Required(
-                        CONF_SLEEP_PRESET,
-                        default=suggested_values.get(CONF_SLEEP_PRESET),
-                    ): selector.NumberSelector(
-                        selector.NumberSelectorConfig(
-                            min=10,
-                            max=30,
-                            step=0.1,
-                            unit_of_measurement="°C",
-                        ),
-                    ),
-                    vol.Required(
-                        CONF_HOME_PRESET,
-                        default=suggested_values.get(CONF_HOME_PRESET),
-                    ): selector.NumberSelector(
-                        selector.NumberSelectorConfig(
-                            min=10,
-                            max=30,
-                            step=0.1,
-                            unit_of_measurement="°C",
-                        ),
-                    ),
-                    vol.Required(
-                        CONF_AWAY_PRESET,
-                        default=suggested_values.get(CONF_AWAY_PRESET),
-                    ): selector.NumberSelector(
-                        selector.NumberSelectorConfig(
-                            min=10,
-                            max=30,
-                            step=0.1,
-                            unit_of_measurement="°C",
-                        ),
-                    ),
-                }
-            ),
-            errors=errors,
-            description_placeholders={
-                "name_desc": "name_desc",
-                "heater_desc": "heater_desc",
-                "temp_sensor_desc": "temp_sensor_desc",
-                "humidity_sensor_desc": "humidity_sensor_desc",
-                "door_window_sensor_desc": "door_window_sensor_desc",
-                "motion_sensor_desc": "motion_sensor_desc",
-                "outdoor_sensor_desc": "outdoor_sensor_desc",
-                "weather_sensor_desc": "weather_sensor_desc",
-                "outside_temp_off_desc": "outside_temp_off_desc",
-                "sleep_preset_desc": "sleep_preset_desc",
-                "home_preset_desc": "home_preset_desc",
-                "away_preset_desc": "away_preset_desc",
-            },
+            step_id="user", data_schema=STEP_USER_DATA_SCHEMA, errors=errors
         )
 
 
+# Options Flow Handler (Mimicking VT State Management)
 class AdaptiveThermostatOptionsFlow(config_entries.OptionsFlow):
     """Handle options flow for Adaptive Thermostat."""
 
-    def __init__(self, config_entry):
+    def __init__(self, config_entry: config_entries.ConfigEntry) -> None:
         """Initialize options flow."""
+        _LOGGER.warning("Mimic VT Flow: Using DEPRECATED __init__")
+        # Store config_entry directly (DEPRECATED)
         self.config_entry = config_entry
-        self.options = dict(config_entry.data)
+        # Initialize _infos with merged data and options
+        # We use this dict internally like VT does
+        self._infos = {**config_entry.data, **config_entry.options}
+        _LOGGER.debug("Mimic VT Flow __init__: Initial self._infos: %s", self._infos)
 
-    async def async_step_init(self, user_input=None) -> FlowResult:
+
+    async def async_step_init(self, user_input: dict[str, Any] | None = None) -> FlowResult:
         """Manage the options."""
         errors = {}
+        _LOGGER.debug("Mimic VT Flow: init step START for %s", self.config_entry.entry_id)
 
+        # --- Process Submitted Input ---
         if user_input is not None:
-            # Validate user input
-            if not user_input.get(CONF_HEATER):
-                errors[CONF_HEATER] = "missing_heater"
-            if not user_input.get(CONF_TEMP_SENSOR):
-                errors[CONF_TEMP_SENSOR] = "missing_temp_sensor"
-            if not user_input.get(CONF_WEATHER_SENSOR) and not user_input.get(CONF_OUTDOOR_SENSOR):
-                errors[CONF_WEATHER_SENSOR] = "missing_outdoor_data"
+            _LOGGER.debug("Mimic VT Flow [submit] - Received user input: %s", user_input)
+
+            # --- Update internal self._infos dictionary ---
+            # Start with the current state stored in self._infos
+            # (This assumes only one step, so _infos holds state from __init__)
+            working_options = self._infos.copy()
+
+            # Iterate through user_input provided by the form
+            for key, value in user_input.items():
+                 if key in OPTIONAL_ENTITY_SELECTOR_KEYS:
+                     if value is None: # User cleared the field
+                         if key in working_options:
+                             _LOGGER.debug("Mimic VT Flow [submit] - Deleting key '%s' from options", key)
+                             del working_options[key] # Delete the key
+                     else:
+                         working_options[key] = value # Update with new value
+                 else:
+                     # Update non-optional fields provided by the form
+                     working_options[key] = value
+
+            # Now self._infos holds the desired final state (with cleared keys removed)
+            self._infos = working_options
+            _LOGGER.debug("Mimic VT Flow [submit] - Updated self._infos: %s", self._infos)
+
+            # --- Validation (on the updated self._infos) ---
+            # Check REQUIRED fields (should always exist, either from data or options)
+            if not self._infos.get(CONF_HEATER): errors["base"] = "heater_missing"
+            elif not self._infos.get(CONF_TEMP_SENSOR): errors["base"] = "temp_sensor_missing"
+            if CONF_HOME_PRESET not in self._infos: errors["base"] = "home_preset_missing"
+            # ... other validation ...
 
             if not errors:
-                # Update entry - completely replace the data instead of updating it
-                self.hass.config_entries.async_update_entry(
-                    self.config_entry, data={} # First clear it
-                )
-                self.hass.config_entries.async_update_entry(
-                    self.config_entry, data=user_input # Then set the new data
-                )
-                return self.async_create_entry(title="", data=user_input)
+                _LOGGER.debug("Mimic VT Flow [submit] - Saving self._infos as options: %s", self._infos)
+                # --- Use standard method to save the *entire* self._infos dict as options ---
+                # This replaces the existing options completely.
+                return self.async_create_entry(title="", data=self._infos)
+            else:
+                _LOGGER.warning("Mimic VT Flow [submit] - Validation errors: %s", errors)
+        # --- End Process Submitted Input ---
 
-        # Get the data schema with optional fields properly handled
-        schema = {
-            vol.Required(CONF_NAME, default=self.options.get(CONF_NAME)): str,
-            vol.Required(CONF_HEATER, default=self.options.get(CONF_HEATER)): selector.EntitySelector(
-                selector.EntitySelectorConfig(
-                    domain=["switch", "input_boolean"]
-                ),
-            ),
-            vol.Required(CONF_TEMP_SENSOR, default=self.options.get(CONF_TEMP_SENSOR)): selector.EntitySelector(
-                selector.EntitySelectorConfig(
-                    domain=["sensor"],
-                    device_class=["temperature"],
-                ),
-            ),
-        }
-        
-        # Only add optional fields if they have values
-        # Use .get() with None as the default value
-        humidity_sensor = self.options.get(CONF_HUMIDITY_SENSOR)
-        if humidity_sensor is not None:
-            schema[vol.Optional(CONF_HUMIDITY_SENSOR, default=humidity_sensor)] = selector.EntitySelector(
-                selector.EntitySelectorConfig(
-                    domain=["sensor"],
-                    device_class=["humidity"],
-                ),
-            )
-        else:
-            schema[vol.Optional(CONF_HUMIDITY_SENSOR)] = selector.EntitySelector(
-                selector.EntitySelectorConfig(
-                    domain=["sensor"],
-                    device_class=["humidity"],
-                ),
-            )
-            
-        door_window_sensor = self.options.get(CONF_DOOR_WINDOW_SENSOR)
-        if door_window_sensor is not None:
-            schema[vol.Optional(CONF_DOOR_WINDOW_SENSOR, default=door_window_sensor)] = selector.EntitySelector(
-                selector.EntitySelectorConfig(
-                    domain=["binary_sensor"],
-                    device_class=["door", "window"],
-                ),
-            )
-        else:
-            schema[vol.Optional(CONF_DOOR_WINDOW_SENSOR)] = selector.EntitySelector(
-                selector.EntitySelectorConfig(
-                    domain=["binary_sensor"],
-                    device_class=["door", "window"],
-                ),
-            )
-            
-        motion_sensor = self.options.get(CONF_MOTION_SENSOR)
-        if motion_sensor is not None:
-            schema[vol.Optional(CONF_MOTION_SENSOR, default=motion_sensor)] = selector.EntitySelector(
-                selector.EntitySelectorConfig(
-                    domain=["binary_sensor"],
-                    device_class=["motion"],
-                ),
-            )
-        else:
-            schema[vol.Optional(CONF_MOTION_SENSOR)] = selector.EntitySelector(
-                selector.EntitySelectorConfig(
-                    domain=["binary_sensor"],
-                    device_class=["motion"],
-                ),
-            )
-            
-        outdoor_sensor = self.options.get(CONF_OUTDOOR_SENSOR)
-        if outdoor_sensor is not None:
-            schema[vol.Optional(CONF_OUTDOOR_SENSOR, default=outdoor_sensor)] = selector.EntitySelector(
-                selector.EntitySelectorConfig(
-                    domain=["sensor"],
-                    device_class=["temperature"],
-                ),
-            )
-        else:
-            schema[vol.Optional(CONF_OUTDOOR_SENSOR)] = selector.EntitySelector(
-                selector.EntitySelectorConfig(
-                    domain=["sensor"],
-                    device_class=["temperature"],
-                ),
-            )
-        
-        # Add remaining required fields
-        schema.update({
-            vol.Required(CONF_WEATHER_SENSOR, default=self.options.get(CONF_WEATHER_SENSOR)): selector.EntitySelector(
-                selector.EntitySelectorConfig(
-                    domain=["weather"],
-                ),
-            ),
-            vol.Required(
-                CONF_OUTSIDE_TEMP_OFF,
-                default=self.options.get(CONF_OUTSIDE_TEMP_OFF),
-            ): selector.NumberSelector(
-                selector.NumberSelectorConfig(
-                    min=0,
-                    max=40,
-                    step=0.1,
-                    unit_of_measurement="°C",
-                ),
-            ),
-            vol.Required(
-                CONF_SLEEP_PRESET,
-                default=self.options.get(CONF_SLEEP_PRESET),
-            ): selector.NumberSelector(
-                selector.NumberSelectorConfig(
-                    min=10,
-                    max=30,
-                    step=0.1,
-                    unit_of_measurement="°C",
-                ),
-            ),
-            vol.Required(
-                CONF_HOME_PRESET,
-                default=self.options.get(CONF_HOME_PRESET),
-            ): selector.NumberSelector(
-                selector.NumberSelectorConfig(
-                    min=10,
-                    max=30,
-                    step=0.1,
-                    unit_of_measurement="°C",
-                ),
-            ),
-            vol.Required(
-                CONF_AWAY_PRESET,
-                default=self.options.get(CONF_AWAY_PRESET),
-            ): selector.NumberSelector(
-                selector.NumberSelectorConfig(
-                    min=10,
-                    max=30,
-                    step=0.1,
-                    unit_of_measurement="°C",
-                ),
-            ),
-        })
 
+        # --- Show Form ---
+        # Use self._infos (which holds current state) to create the schema
+        _LOGGER.debug("Mimic VT Flow [init] - Creating schema from self._infos: %s", self._infos)
+        humidity_sensor_value_read = self._infos.get(CONF_HUMIDITY_SENSOR) # Read from internal dict
+        _LOGGER.warning(f"Mimic VT Flow [init] - Value read for {CONF_HUMIDITY_SENSOR}: '{humidity_sensor_value_read}' (Type: {type(humidity_sensor_value_read)})")
+
+        options_schema = create_options_schema(self._infos) # Pass internal dict
+        _LOGGER.debug("Mimic VT Flow [init] - Showing form.")
         return self.async_show_form(
             step_id="init",
-            data_schema=vol.Schema(schema),
+            data_schema=options_schema,
             errors=errors,
-            description_placeholders={
-                "name_desc": "name_desc",
-                "heater_desc": "heater_desc",
-                "temp_sensor_desc": "temp_sensor_desc",
-                "humidity_sensor_desc": "humidity_sensor_desc",
-                "door_window_sensor_desc": "door_window_sensor_desc",
-                "motion_sensor_desc": "motion_sensor_desc",
-                "outdoor_sensor_desc": "outdoor_sensor_desc",
-                "weather_sensor_desc": "weather_sensor_desc",
-                "outside_temp_off_desc": "outside_temp_off_desc",
-                "sleep_preset_desc": "sleep_preset_desc",
-                "home_preset_desc": "home_preset_desc",
-                "away_preset_desc": "away_preset_desc",
-            },
         )

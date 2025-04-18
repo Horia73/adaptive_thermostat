@@ -1,11 +1,12 @@
 {
   "domain": "adaptive_thermostat",
   "name": "Adaptive Thermostat",
-  "documentation": "https://github.com/yourusername/adaptive_thermostat",
+  "documentation": "https://github.com/Horia73/adaptive_thermostat",
   "dependencies": [],
-  "codeowners": ["@yourusername"],
+  "codeowners": ["@Horia73"],
   "requirements": [],
   "config_flow": true,
   "version": "1.0.0",
   "iot_class": "calculated"
+
 } 
