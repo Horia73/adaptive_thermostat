@@ -736,7 +736,6 @@ class AdaptiveThermostatCardEditor extends LitElement {
 customElements.define('adaptive-thermostat-card-editor', AdaptiveThermostatCardEditor);
 customElements.define('adaptive-thermostat-card', AdaptiveThermostatCard);
 
-// Register with HACS
 window.customCards = window.customCards || [];
 window.customCards.push({
   type: 'adaptive-thermostat-card',
