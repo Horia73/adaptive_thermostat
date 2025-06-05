@@ -11,32 +11,12 @@ from .const import DOMAIN, PLATFORMS
 _LOGGER = logging.getLogger(__name__)
 
 async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
-    """Set up the Adaptive Thermostat integration and register Lovelace card."""
+    """Set up the Adaptive Thermostat integration."""
     hass.data.setdefault(DOMAIN, {})
-
-    # Register the Lovelace card
-    # This ensures the card is available, complementing HACS's registration via manifest.json.
-    # The URL must match the one HACS uses, derived from your manifest.json.
-    card_url = f"/hacsfiles/{DOMAIN}/adaptive-thermostat-card.js"
-    resource_type = "module"
-
-    if hasattr(hass.components, 'lovelace') and hasattr(hass.components.lovelace, 'async_register_resource'):
-        _LOGGER.debug("Attempting to register Lovelace card: %s as type %s", card_url, resource_type)
-        try:
-            await hass.components.lovelace.async_register_resource(hass, card_url, resource_type)
-            _LOGGER.info("Successfully ensured Lovelace card %s (type: %s) is registered.", card_url, resource_type)
-        except Exception as e:
-            _LOGGER.error(
-                "Error registering Lovelace card %s: %s. "
-                "HACS registration via manifest.json or manual addition may still work.",
-                card_url, e
-            )
-    else:
-        _LOGGER.warning(
-            "Lovelace component or async_register_resource not available. "
-            "Cannot programmatically register card. Relying on HACS manifest entry or manual addition."
-        )
-
+    # No Lovelace registration attempt here anymore.
+    # Rely on manifest.json and HACS for card availability,
+    # and manual user addition if necessary.
+    _LOGGER.info("Adaptive Thermostat async_setup completed. Platforms will be set up via async_setup_entry.")
     return True
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:

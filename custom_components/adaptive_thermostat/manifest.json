@@ -8,8 +8,5 @@
   "requirements": [],
   "config_flow": true,
   "version": "1.0.0",
-  "iot_class": "calculated",
-  "lovelace_resources": [
-    "/hacsfiles/adaptive_thermostat/adaptive-thermostat-card.js"
-  ]
+  "iot_class": "calculated"
 } 
