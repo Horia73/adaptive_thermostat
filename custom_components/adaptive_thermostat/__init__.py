@@ -11,9 +11,37 @@ from .const import DOMAIN, PLATFORMS
 _LOGGER = logging.getLogger(__name__)
 
 async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
-    """Set up the integration from YAML (placeholder)."""
-    hass.data.setdefault(DOMAIN, {})
-    # Return True as YAML config is not primary for this integration
+    """Set up the Adaptive Thermostat integration and register Lovelace card."""
+    hass.data.setdefault(DOMAIN, {}) # DOMAIN is imported from .const
+
+    # Register the Lovelace card
+    # This ensures the card is available, complementing HACS's registration via manifest.json.
+    # The URL must match the one HACS uses, derived from your manifest.json.
+    card_url = f"/hacsfiles/{DOMAIN}/adaptive-thermostat-card.js"
+    resource_type = "module"  # Assuming the card is an ES6 module. Change to "js" if it's a plain script.
+
+    # Ensure Lovelace component and registration function are available
+    if hasattr(hass.components, 'lovelace') and hasattr(hass.components.lovelace, 'async_register_resource'):
+        _LOGGER.debug("Attempting to register Lovelace card: %s as type %s", card_url, resource_type)
+        try:
+            # async_register_resource is idempotent.
+            # It will not add a duplicate if a resource with the same url and type already exists.
+            await hass.components.lovelace.async_register_resource(hass, card_url, resource_type)
+            _LOGGER.info("Successfully ensured Lovelace card %s (type: %s) is registered.", card_url, resource_type)
+        except Exception as e:
+            # Log an error if registration fails, but don't prevent setup.
+            _LOGGER.error(
+                "Error registering Lovelace card %s: %s. "
+                "HACS registration via manifest.json should still work.",
+                card_url, e
+            )
+    else:
+        _LOGGER.warning(
+            "Lovelace component or async_register_resource not available. "
+            "Cannot programmatically register card. Relying on HACS manifest entry."
+        )
+
+    # Return True as YAML config is not primary for this integration.
     return True
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:

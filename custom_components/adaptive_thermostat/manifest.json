@@ -2,11 +2,14 @@
   "domain": "adaptive_thermostat",
   "name": "Adaptive Thermostat",
   "documentation": "https://github.com/Horia73/adaptive_thermostat",
+  "issue_tracker": "https://github.com/Horia73/adaptive_thermostat/issues",
   "dependencies": [],
   "codeowners": ["@Horia73"],
   "requirements": [],
   "config_flow": true,
   "version": "1.0.0",
-  "iot_class": "calculated"
-
+  "iot_class": "calculated",
+  "lovelace_resources": [
+    "/hacsfiles/adaptive_thermostat/adaptive-thermostat-card.js"
+  ]
 } 
