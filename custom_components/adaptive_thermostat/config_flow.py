@@ -132,28 +132,37 @@ def create_options_schema(current_config: dict[str, Any]) -> vol.Schema:
                     domain=["sensor"], device_class="temperature"
                 ),
             ),
+
             vol.Optional(CONF_HUMIDITY_SENSOR, default=humidity_sensor_default): selector.EntitySelector(
+
                 selector.EntitySelectorConfig(
                     domain=["sensor"], device_class="humidity", multiple=False
                 ),
             ),
             # ... other optional sensors ...
+
             vol.Optional(CONF_DOOR_WINDOW_SENSOR, default=door_sensor_default): selector.EntitySelector(
+
                 selector.EntitySelectorConfig(
                     domain=["binary_sensor"], device_class=["door", "window"], multiple=False
                 ),
             ),
+
             vol.Optional(CONF_MOTION_SENSOR, default=motion_sensor_default): selector.EntitySelector(
+
                 selector.EntitySelectorConfig(
                     domain=["binary_sensor"], device_class="motion", multiple=False
                 ),
-            ),
+
             vol.Optional(CONF_OUTDOOR_SENSOR, default=outdoor_sensor_default): selector.EntitySelector(
+
                 selector.EntitySelectorConfig(
                     domain=["sensor"], device_class="temperature", multiple=False
                 ),
             ),
+
             vol.Optional(CONF_WEATHER_SENSOR, default=weather_sensor_default): selector.EntitySelector(
+
                 selector.EntitySelectorConfig(
                     domain=["sensor"], multiple=False
                 ),
@@ -193,11 +202,13 @@ class AdaptiveThermostatConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         if user_input is not None:
             final_data = {}
             for key, value in user_input.items():
+
                 if key in OPTIONAL_ENTITY_SELECTOR_KEYS and (value is None or value == ""):
                     _LOGGER.debug("User Step: Skipping key '%s' due to empty value", key)
                     continue
                 elif value is not None and value != "":
                     final_data[key] = value
+
 
             if not final_data.get(CONF_HEATER) or not final_data.get(CONF_TEMP_SENSOR):
                  errors["base"] = "heater_or_temp_missing"
@@ -244,6 +255,7 @@ class AdaptiveThermostatOptionsFlow(config_entries.OptionsFlow):
 
             # Iterate through user_input provided by the form
             for key, value in user_input.items():
+
                 if key in OPTIONAL_ENTITY_SELECTOR_KEYS:
                     if value is None or value == "":  # User cleared the field
                         if key in working_options:
@@ -254,6 +266,7 @@ class AdaptiveThermostatOptionsFlow(config_entries.OptionsFlow):
                 else:
                     # Update non-optional fields provided by the form
                     working_options[key] = value
+
 
             # Now self._infos holds the desired final state (with cleared keys removed)
             self._infos = working_options
@@ -289,3 +302,4 @@ class AdaptiveThermostatOptionsFlow(config_entries.OptionsFlow):
             data_schema=options_schema,
             errors=errors,
         )
+

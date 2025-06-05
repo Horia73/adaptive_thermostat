@@ -18,6 +18,7 @@ The integration provides a thermostat entity that adapts its behaviour based on 
 ### Lovelace card
 
 This integration bundles a Lovelace card located in `www/adaptive-thermostat-card.js`.
+
 From Home Assistant 2021.11 and later the card is registered automatically as
 a Lovelace resource thanks to the entry in `manifest.json`. After installing the
 integration simply add a **Manual** card and set its type to
@@ -25,3 +26,4 @@ integration simply add a **Manual** card and set its type to
 
 If the card does not appear, add it manually under **Settings → Dashboards → Resources** using the URL
 `/hacsfiles/adaptive_thermostat/adaptive-thermostat-card.js`.
+

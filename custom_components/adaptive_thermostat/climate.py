@@ -20,7 +20,9 @@ from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.event import async_track_state_change_event, Event
+
 from homeassistant.helpers.restore_state import RestoreEntity
+
 # Import PlatformNotReady if implementing stricter setup validation
 # from homeassistant.exceptions import PlatformNotReady
 
@@ -60,6 +62,7 @@ async def async_setup_entry(
 
 
 class AdaptiveThermostat(ClimateEntity, RestoreEntity):
+
     """Representation of an Adaptive Thermostat."""
 
     _attr_has_entity_name = True # Use default name generation based on device/config entry
@@ -144,6 +147,7 @@ class AdaptiveThermostat(ClimateEntity, RestoreEntity):
         await super().async_added_to_hass()
         _LOGGER.debug("[%s] Entity added to HASS", self._entry_id)
 
+
         # Restore previous state to avoid unexpected heating after restart
         last_state = await self.async_get_last_state()
         if last_state:
@@ -158,6 +162,7 @@ class AdaptiveThermostat(ClimateEntity, RestoreEntity):
             preset = last_state.attributes.get("preset_mode")
             if preset in self._attr_preset_modes:
                 self._current_preset = preset
+
 
         # Register state change listeners (handles None values correctly)
         entities_to_track = []
@@ -436,9 +441,11 @@ class AdaptiveThermostat(ClimateEntity, RestoreEntity):
         _LOGGER.info("[%s] Turning heater ON: %s", self._entry_id, self._heater_entity_id)
         try:
             await self.hass.services.async_call(
+
                 domain,
                 "turn_on",
                 {"entity_id": self._heater_entity_id},
+
             )
         except Exception as e:
             _LOGGER.error("[%s] Failed to turn on heater %s: %s", self._entry_id, self._heater_entity_id, e)
@@ -457,9 +464,11 @@ class AdaptiveThermostat(ClimateEntity, RestoreEntity):
         _LOGGER.info("[%s] Turning heater OFF: %s", self._entry_id, self._heater_entity_id)
         try:
             await self.hass.services.async_call(
+
                 domain,
                 "turn_off",
                 {"entity_id": self._heater_entity_id},
             )
         except Exception as e:
             _LOGGER.error("[%s] Failed to turn off heater %s: %s", self._entry_id, self._heater_entity_id, e)
+
