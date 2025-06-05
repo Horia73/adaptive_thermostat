@@ -7,6 +7,7 @@
   "requirements": [],
   "config_flow": true,
   "version": "1.0.0",
+
   "iot_class": "calculated",
   "resources": [
     {
@@ -14,5 +15,8 @@
       "path": "www/adaptive-thermostat-card.js"
     }
   ]
+=======
+  "iot_class": "calculated"
+
 
 } 
