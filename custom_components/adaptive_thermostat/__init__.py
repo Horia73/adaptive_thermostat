@@ -53,4 +53,6 @@ async def async_update_options(hass: HomeAssistant, entry: ConfigEntry) -> None:
         entry.title,
     )
     # Reload the config entry, triggering async_unload_entry and async_setup_entry
+
     await hass.config_entries.async_reload(entry.entry_id)
+
