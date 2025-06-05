@@ -27,5 +27,4 @@ manually under **Settings → Dashboards → Resources** using the URL:
 ```
 /adaptive_thermostat/adaptive-thermostat-card.js
 ```
-=======
 Install via [HACS](https://hacs.xyz/) by adding this repository as a custom integration source.
