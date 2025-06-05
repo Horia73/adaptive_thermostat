@@ -10,6 +10,6 @@
   "version": "1.0.0",
   "iot_class": "calculated",
   "lovelace_resources": [
-    "/adaptive_thermostat_local_assets/adaptive-thermostat-card.js"
+    "/hacsfiles/adaptive_thermostat/adaptive-thermostat-card.js"
   ]
 } 
