@@ -3,23 +3,23 @@
 import logging
 from typing import Any # Import Any for type hinting
 
-from homeassistant.components.climate import (
+from homeassistant.components.climate import ( # type: ignore
     ClimateEntity,
     ClimateEntityFeature,
     HVACMode,
     HVACAction,
 )
-from homeassistant.const import (
+from homeassistant.const import ( # type: ignore
     ATTR_TEMPERATURE,
     STATE_ON,
     STATE_OFF,
     CONF_NAME,
     UnitOfTemperature, # Import temperature unit if needed directly
 )
-from homeassistant.config_entries import ConfigEntry
-from homeassistant.core import HomeAssistant, callback
-from homeassistant.helpers.entity_platform import AddEntitiesCallback
-from homeassistant.helpers.event import async_track_state_change_event, Event
+from homeassistant.config_entries import ConfigEntry # type: ignore
+from homeassistant.core import HomeAssistant, callback # type: ignore
+from homeassistant.helpers.entity_platform import AddEntitiesCallback # type: ignore
+from homeassistant.helpers.event import async_track_state_change_event, Event # type: ignore
 # Import PlatformNotReady if implementing stricter setup validation
 # from homeassistant.exceptions import PlatformNotReady
 
@@ -33,10 +33,13 @@ from .const import (
     CONF_DOOR_WINDOW_SENSOR,
     CONF_MOTION_SENSOR,
     CONF_OUTDOOR_SENSOR,
-    CONF_WEATHER_SENSOR,
+    CONF_BACKUP_OUTDOOR_SENSOR,
     CONF_SLEEP_PRESET,
     CONF_HOME_PRESET,
     CONF_AWAY_PRESET,
+    CONF_CONFIG_TYPE,
+    CONFIG_TYPE_INDIVIDUAL_ZONE,
+    CONFIG_TYPE_CENTRAL_HEATER,
     DEFAULT_NAME, # Import defaults for fallback
     DEFAULT_HOME_PRESET,
     DEFAULT_SLEEP_PRESET,
@@ -96,7 +99,7 @@ class AdaptiveThermostat(ClimateEntity):
         self._door_window_sensor_entity_id = get_entity_id(CONF_DOOR_WINDOW_SENSOR)
         self._motion_sensor_entity_id = get_entity_id(CONF_MOTION_SENSOR)
         self._outdoor_sensor_entity_id = get_entity_id(CONF_OUTDOOR_SENSOR)
-        self._weather_sensor_entity_id = get_entity_id(CONF_WEATHER_SENSOR)
+        self._backup_outdoor_sensor_entity_id = get_entity_id(CONF_BACKUP_OUTDOOR_SENSOR)
         # --- End Optional Sensor Reading ---
 
         # Preset temperatures
@@ -130,7 +133,7 @@ class AdaptiveThermostat(ClimateEntity):
             "motion_sensor": self._motion_sensor_entity_id,
             "door_window_sensor": self._door_window_sensor_entity_id,
             "outdoor_sensor": self._outdoor_sensor_entity_id,
-            "weather_sensor": self._weather_sensor_entity_id,
+            "backup_outdoor_sensor": self._backup_outdoor_sensor_entity_id,
         }
         _LOGGER.debug("[%s] Extra state attributes set: %s", self._entry_id, self._attr_extra_state_attributes)
 

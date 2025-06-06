@@ -2,12 +2,12 @@
 import logging
 from typing import Any, Dict, Optional
 
-import voluptuous as vol
+import voluptuous as vol # type: ignore
 
-from homeassistant import config_entries
-from homeassistant.core import callback
-from homeassistant.helpers import selector
-from homeassistant.const import CONF_NAME
+from homeassistant import config_entries # type: ignore
+from homeassistant.core import callback # type: ignore
+from homeassistant.helpers import selector # type: ignore
+from homeassistant.const import CONF_NAME # type: ignore
 
 from .const import (
     DOMAIN,
@@ -217,11 +217,10 @@ class AdaptiveThermostatOptionsFlow(config_entries.OptionsFlow):
 
     def __init__(self, config_entry: config_entries.ConfigEntry):
         """Initialize options flow."""
-        # self.config_entry is automatically set by the base class
+        # self.config_entry is automatically set by the base class - no need to set it explicitly 
         self.current_options = dict(config_entry.options)
         self.config_type = config_entry.data.get(CONF_CONFIG_TYPE)
         self.initial_data = dict(config_entry.data)
-
 
     def _get_options_schema(self) -> vol.Schema:
         """Return the appropriate schema based on config_type, with suggested values."""
@@ -249,13 +248,13 @@ class AdaptiveThermostatOptionsFlow(config_entries.OptionsFlow):
             vol.Optional(CONF_MOTION_SENSOR): selector.EntitySelector(
                 selector.EntitySelectorConfig(domain=["binary_sensor"], device_class="motion", multiple=False)
             ),
-            vol.Required(CONF_HOME_PRESET): selector.NumberSelector(
+            vol.Required(CONF_HOME_PRESET, default=DEFAULT_HOME_PRESET): selector.NumberSelector(
                 selector.NumberSelectorConfig(min=10, max=30, step=0.1, mode="box")
             ),
-            vol.Required(CONF_SLEEP_PRESET): selector.NumberSelector(
+            vol.Required(CONF_SLEEP_PRESET, default=DEFAULT_SLEEP_PRESET): selector.NumberSelector(
                 selector.NumberSelectorConfig(min=10, max=30, step=0.1, mode="box")
             ),
-            vol.Required(CONF_AWAY_PRESET): selector.NumberSelector(
+            vol.Required(CONF_AWAY_PRESET, default=DEFAULT_AWAY_PRESET): selector.NumberSelector(
                 selector.NumberSelectorConfig(min=10, max=30, step=0.1, mode="box")
             ),
         }
@@ -267,13 +266,13 @@ class AdaptiveThermostatOptionsFlow(config_entries.OptionsFlow):
             vol.Required(CONF_TEMP_SENSOR): selector.EntitySelector(
                 selector.EntitySelectorConfig(domain=["sensor"], device_class="temperature")
             ),
-            vol.Required(CONF_HOME_PRESET): selector.NumberSelector(
+            vol.Required(CONF_HOME_PRESET, default=DEFAULT_HOME_PRESET): selector.NumberSelector(
                 selector.NumberSelectorConfig(min=10, max=30, step=0.1, mode="box")
             ),
-            vol.Required(CONF_SLEEP_PRESET): selector.NumberSelector(
+            vol.Required(CONF_SLEEP_PRESET, default=DEFAULT_SLEEP_PRESET): selector.NumberSelector(
                 selector.NumberSelectorConfig(min=10, max=30, step=0.1, mode="box")
             ),
-            vol.Required(CONF_AWAY_PRESET): selector.NumberSelector(
+            vol.Required(CONF_AWAY_PRESET, default=DEFAULT_AWAY_PRESET): selector.NumberSelector(
                 selector.NumberSelectorConfig(min=10, max=30, step=0.1, mode="box")
             ),
         }
@@ -292,14 +291,19 @@ class AdaptiveThermostatOptionsFlow(config_entries.OptionsFlow):
             
             current_value = self.current_options.get(key_str, self.initial_data.get(key_str))
             
-            if current_value is None and key_obj.default is not vol.UNDEFINED:
+            # Handle default values properly, checking for vol.UNDEFINED
+            if current_value is None and hasattr(key_obj, 'default') and key_obj.default is not vol.UNDEFINED:
                 default_val = key_obj.default
                 current_value = default_val() if callable(default_val) else default_val
 
             if isinstance(key_obj, vol.Optional):
                 options_schema_dict[vol.Optional(key_str, description={"suggested_value": current_value if current_value is not None else ""})] = selector_config
             else: # vol.Required
-                options_schema_dict[vol.Required(key_str, default=current_value if current_value is not None else (key_obj.default() if callable(key_obj.default) else key_obj.default))] = selector_config
+                # For required fields, use the current value or the default from the key_obj
+                default_value = current_value
+                if default_value is None and hasattr(key_obj, 'default') and key_obj.default is not vol.UNDEFINED:
+                    default_value = key_obj.default() if callable(key_obj.default) else key_obj.default
+                options_schema_dict[vol.Required(key_str, default=default_value)] = selector_config
         
         return vol.Schema(options_schema_dict)
 
@@ -321,7 +325,8 @@ class AdaptiveThermostatOptionsFlow(config_entries.OptionsFlow):
                             is_optional_field = True
                             break
                     
-                    if (value is None or value == "") and is_optional_field:
+                    # For optional fields, if value is None or empty string, remove from options
+                    if is_optional_field and (value is None or value == ""):
                         updated_options.pop(key, None)
                     else:
                         updated_options[key] = value
@@ -334,159 +339,6 @@ class AdaptiveThermostatOptionsFlow(config_entries.OptionsFlow):
                     path = error_detail.path[0] if error_detail.path else "base"
                     errors[path if isinstance(path, str) else "base"] = "invalid_option_input"
             except Exception as e: # pylint: disable=broad-except
-                _LOGGER.exception("Unexpected error in options saving")
-                errors["base"] = "unknown_options_error"
-
-        options_schema = self._get_options_schema()
-        return self.async_show_form(
-            step_id="init",
-            data_schema=options_schema,
-            errors=errors,
-            description_placeholders={
-                "config_type_name": self.config_entry.data.get(CONF_CONFIG_TYPE, "Unknown").replace("_", " ").title()
-            }
-        )
-# Ensure final newline
-
-        """Create the config entry from the stored data."""
-        # Clean data: remove keys with None or empty string values, except for those that are explicitly allowed to be None
-        # For this integration, most optional sensors if None should just not be in the dict.
-        final_data = {k: v for k, v in self._config_data.items() if v is not None and v != ""}
-        _LOGGER.info(f"Creating Adaptive Thermostat entry: {final_data.get(CONF_NAME)}")
-        _LOGGER.debug(f"Final config data for entry: {final_data}")
-        return self.async_create_entry(title=final_data[CONF_NAME], data=final_data)
-
-    @staticmethod
-    @callback
-    def async_get_options_flow(config_entry: config_entries.ConfigEntry) -> config_entries.OptionsFlow:
-        """Get the options flow for this handler."""
-        return AdaptiveThermostatOptionsFlow(config_entry)
-
-
-class AdaptiveThermostatOptionsFlow(config_entries.OptionsFlow):
-    """Handle an options flow for Adaptive Thermostat."""
-
-    def __init__(self, config_entry: config_entries.ConfigEntry):
-        """Initialize options flow."""
-        self.config_entry = config_entry # Made available by parent class, but explicit for clarity
-        self.current_options = dict(config_entry.options)
-        self.config_type = config_entry.data.get(CONF_CONFIG_TYPE)
-
-    def _get_options_schema(self) -> vol.Schema:
-        """Return the appropriate schema based on config_type, with suggested values."""
-        options_schema_dict = {}
-
-        # Define base schema definitions for options (using selectors)
-        # These include all fields configurable in the options UI for each type
-
-        individual_zone_fields = {
-            vol.Required(CONF_HEATER): selector.EntitySelector(
-                selector.EntitySelectorConfig(domain=["switch", "input_boolean", "climate"])
-            ),
-            vol.Required(CONF_TEMP_SENSOR): selector.EntitySelector(
-                selector.EntitySelectorConfig(domain=["sensor"], device_class="temperature")
-            ),
-            vol.Required(CONF_OUTDOOR_SENSOR): selector.EntitySelector(
-                selector.EntitySelectorConfig(domain=["sensor"], device_class="temperature")
-            ),
-            vol.Optional(CONF_BACKUP_OUTDOOR_SENSOR): selector.EntitySelector(
-                selector.EntitySelectorConfig(domain=["sensor"], device_class="temperature", multiple=False)
-            ),
-            vol.Optional(CONF_HUMIDITY_SENSOR): selector.EntitySelector(
-                selector.EntitySelectorConfig(domain=["sensor"], device_class="humidity", multiple=False)
-            ),
-            vol.Optional(CONF_DOOR_WINDOW_SENSOR): selector.EntitySelector(
-                selector.EntitySelectorConfig(domain=["binary_sensor"], device_class=["door", "window"], multiple=False)
-            ),
-            vol.Optional(CONF_MOTION_SENSOR): selector.EntitySelector(
-                selector.EntitySelectorConfig(domain=["binary_sensor"], device_class="motion", multiple=False)
-            ),
-            vol.Required(CONF_HOME_PRESET): selector.NumberSelector(
-                selector.NumberSelectorConfig(min=10, max=30, step=0.1, mode="box")
-            ),
-            vol.Required(CONF_SLEEP_PRESET): selector.NumberSelector(
-                selector.NumberSelectorConfig(min=10, max=30, step=0.1, mode="box")
-            ),
-            vol.Required(CONF_AWAY_PRESET): selector.NumberSelector(
-                selector.NumberSelectorConfig(min=10, max=30, step=0.1, mode="box")
-            ),
-        }
-
-        central_heater_fields = {
-            vol.Required(CONF_HEATER): selector.EntitySelector(
-                selector.EntitySelectorConfig(domain=["climate", "switch", "input_boolean"])
-            ),
-            vol.Required(CONF_TEMP_SENSOR): selector.EntitySelector(
-                selector.EntitySelectorConfig(domain=["sensor"], device_class="temperature")
-            ),
-            vol.Required(CONF_HOME_PRESET): selector.NumberSelector(
-                selector.NumberSelectorConfig(min=10, max=30, step=0.1, mode="box")
-            ),
-            vol.Required(CONF_SLEEP_PRESET): selector.NumberSelector(
-                selector.NumberSelectorConfig(min=10, max=30, step=0.1, mode="box")
-            ),
-            vol.Required(CONF_AWAY_PRESET): selector.NumberSelector(
-                selector.NumberSelectorConfig(min=10, max=30, step=0.1, mode="box")
-            ),
-        }
-
-        current_fields_def = {}
-        if self.config_type == CONFIG_TYPE_INDIVIDUAL_ZONE:
-            current_fields_def = individual_zone_fields
-        elif self.config_type == CONFIG_TYPE_CENTRAL_HEATER:
-            current_fields_def = central_heater_fields
-        else:
-            _LOGGER.error(f"Options flow: Unknown configuration type: {self.config_type}")
-            # Should not happen, but return an empty schema to prevent further errors
-            return vol.Schema({})
-
-        # Populate schema with current option values, falling back to data, then to schema defaults
-        for key_obj, selector_config in current_fields_def.items():
-            key_str = key_obj.schema if isinstance(key_obj, vol.Marker) else key_obj
-            
-            # Default value hierarchy: existing options -> initial data -> schema default (if any)
-            current_value = self.current_options.get(key_str, self.config_entry.data.get(key_str))
-            
-            if current_value is None and key_obj.default is not vol.UNDEFINED:
-                current_value = key_obj.default()
-            
-            # For Optional fields, use description with suggested_value for existing value
-            # For Required fields, use default for existing value
-            if isinstance(key_obj, vol.Optional):
-                options_schema_dict[vol.Optional(key_str, description={"suggested_value": current_value if current_value is not None else ""})] = selector_config
-            else: # vol.Required
-                options_schema_dict[vol.Required(key_str, default=current_value if current_value is not None else key_obj.default())] = selector_config
-        
-        return vol.Schema(options_schema_dict)
-
-    async def async_step_init(self, user_input: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-        """Manage the options."""
-        errors: Dict[str, str] = {}
-
-        if user_input is not None:
-            updated_options = self.current_options.copy()
-            try:
-                # Validate against the specific schema for this config type
-                # The _get_options_schema() already incorporates current values as defaults
-                # So, direct validation should work.
-                current_schema = self._get_options_schema()
-                _validate_input(user_input, current_schema) # This will raise on error
-
-                # Process user_input: update options, handle cleared fields
-                for key, value in user_input.items():
-                    if value is None or value == "": # Field cleared by user
-                        updated_options.pop(key, None) # Remove if it exists
-                    else:
-                        updated_options[key] = value
-                
-                _LOGGER.debug(f"Options Flow: Updating entry with new options: {updated_options}")
-                return self.async_create_entry(title="", data=updated_options)
-            except vol.MultipleInvalid as e:
-                _LOGGER.error(f"Validation error in options step: {e}")
-                for error_detail in e.errors:
-                    path = error_detail.path[0] if error_detail.path else "base"
-                    errors[path] = str(error_detail.msg) # Or a more specific error key from strings.json
-            except Exception as e:
                 _LOGGER.exception("Unexpected error in options saving")
                 errors["base"] = "unknown_options_error"
 

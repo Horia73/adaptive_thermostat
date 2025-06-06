@@ -42,7 +42,9 @@
       "cannot_connect": "[%key:common::config_flow::error::cannot_connect%]",
       "invalid_auth": "[%key:common::config_flow::error::invalid_auth%]",
       "unknown": "[%key:common::config_flow::error::unknown%]",
-      "name_exists": "This name is already in use. Please choose a unique name."
+      "name_exists": "This name is already in use. Please choose a unique name.",
+      "invalid_input": "Invalid input provided. Please check your entries and try again.",
+      "unknown_config_type": "Unknown configuration type selected. Please choose a valid option."
     },
     "abort": {
       "already_configured": "[%key:common::config_flow::abort::already_configured_device%]",
@@ -75,7 +77,9 @@
       }
     },
     "error": {
-        "unknown": "An unknown error occurred while saving options."
+        "unknown": "An unknown error occurred while saving options.",
+        "invalid_option_input": "Invalid input provided in options. Please check your entries and try again.",
+        "unknown_options_error": "An unexpected error occurred while saving options. Please try again."
     }
   }
 }
