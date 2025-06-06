@@ -12,6 +12,7 @@ from homeassistant.const import CONF_NAME # type: ignore
 from .const import (
     DOMAIN,
     CONF_HEATER,
+    CONF_CENTRAL_HEATER,
     CONF_TEMP_SENSOR,
     CONF_HUMIDITY_SENSOR,
     CONF_DOOR_WINDOW_SENSOR,
@@ -21,9 +22,6 @@ from .const import (
     CONF_HOME_PRESET,
     CONF_SLEEP_PRESET,
     CONF_AWAY_PRESET,
-    CONF_CONFIG_TYPE,
-    CONFIG_TYPE_INDIVIDUAL_ZONE,
-    CONFIG_TYPE_CENTRAL_HEATER,
     DEFAULT_HOME_PRESET,
     DEFAULT_SLEEP_PRESET,
     DEFAULT_AWAY_PRESET,
@@ -31,30 +29,24 @@ from .const import (
 
 _LOGGER = logging.getLogger(__name__)
 
-STEP_USER_SELECT_TYPE_SCHEMA = vol.Schema(
+STEP_USER_DATA_SCHEMA = vol.Schema(
     {
         vol.Required(CONF_NAME, default="Adaptive Thermostat"): str,
-        vol.Required(CONF_CONFIG_TYPE, default=CONFIG_TYPE_INDIVIDUAL_ZONE): selector.SelectSelector(
-            selector.SelectSelectorConfig(
-                options=[
-                    selector.SelectOptionDict(value=CONFIG_TYPE_INDIVIDUAL_ZONE, label="Individual Zone (Heater/Valve)"),
-                    selector.SelectOptionDict(value=CONFIG_TYPE_CENTRAL_HEATER, label="Central Heater"),
-                ],
-                mode=selector.SelectSelectorMode.DROPDOWN,
-            )
-        ),
     }
 )
 
-STEP_INDIVIDUAL_ZONE_DATA_SCHEMA = vol.Schema(
+STEP_ZONE_DATA_SCHEMA = vol.Schema(
     {
         vol.Required(CONF_HEATER): selector.EntitySelector(
             selector.EntitySelectorConfig(domain=["switch", "input_boolean", "climate", "valve"])
         ),
+        vol.Optional(CONF_CENTRAL_HEATER): selector.EntitySelector(
+            selector.EntitySelectorConfig(domain=["switch", "input_boolean", "climate"])
+        ),
         vol.Required(CONF_TEMP_SENSOR): selector.EntitySelector(
             selector.EntitySelectorConfig(domain=["sensor"], device_class="temperature")
         ),
-        vol.Required(CONF_OUTDOOR_SENSOR): selector.EntitySelector( # Mandatory
+        vol.Required(CONF_OUTDOOR_SENSOR): selector.EntitySelector(
             selector.EntitySelectorConfig(domain=["sensor"], device_class="temperature")
         ),
         vol.Optional(CONF_BACKUP_OUTDOOR_SENSOR): selector.EntitySelector(
@@ -81,25 +73,15 @@ STEP_INDIVIDUAL_ZONE_DATA_SCHEMA = vol.Schema(
     }
 )
 
-STEP_CENTRAL_HEATER_DATA_SCHEMA = vol.Schema(
-    {
-        vol.Required(CONF_HEATER): selector.EntitySelector(
-            selector.EntitySelectorConfig(domain=["climate", "switch", "input_boolean"])
-        ),
-        # No temperature sensor or presets for central heater - it just controls the main system
-    }
-)
-
 def _validate_input(user_input: dict, schema: vol.Schema) -> dict:
     """Validate user input against schema, clean up empty optional fields."""
-    validated_input = schema(user_input) # vol.Schema already handles raising errors
-    cleaned_input = validated_input.copy() # Work on a copy
+    validated_input = schema(user_input)
+    cleaned_input = validated_input.copy()
 
-    for key_marker in schema.schema: # Iterate over schema keys (vol.Marker instances)
+    for key_marker in schema.schema:
         key_str = key_marker.schema if isinstance(key_marker, vol.Marker) else key_marker
         
         if key_str in cleaned_input and cleaned_input[key_str] == "":
-            # Correctly check if the schema key (marker) is Optional
             if isinstance(key_marker, vol.Optional):
                  cleaned_input[key_str] = None
     return cleaned_input
@@ -115,23 +97,16 @@ class AdaptiveThermostatConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         self._config_data = {}
 
     async def async_step_user(self, user_input: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-        """Handle the initial step where the user selects the configuration type."""
+        """Handle the initial step where the user enters the zone name."""
         errors: Dict[str, str] = {}
         if user_input is not None:
             try:
-                # Validate basic input first
                 self._config_data.update(user_input)
                 # Ensure unique name
                 await self.async_set_unique_id(user_input[CONF_NAME])
                 self._abort_if_unique_id_configured()
-
-                config_type = user_input[CONF_CONFIG_TYPE]
-                if config_type == CONFIG_TYPE_INDIVIDUAL_ZONE:
-                    return await self.async_step_individual_zone_setup()
-                elif config_type == CONFIG_TYPE_CENTRAL_HEATER:
-                    return await self.async_step_central_heater_setup()
-                else:
-                    errors["base"] = "unknown_config_type"
+                
+                return await self.async_step_zone_setup()
 
             except vol.MultipleInvalid as e:
                 _LOGGER.error(f"Validation error in user step: {e}")
@@ -146,52 +121,29 @@ class AdaptiveThermostatConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                 errors["base"] = "unknown"
 
         return self.async_show_form(
-            step_id="user", data_schema=STEP_USER_SELECT_TYPE_SCHEMA, errors=errors
+            step_id="user", data_schema=STEP_USER_DATA_SCHEMA, errors=errors
         )
 
-    async def async_step_individual_zone_setup(self, user_input: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-        """Handle the setup for an individual zone."""
+    async def async_step_zone_setup(self, user_input: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        """Handle the zone setup."""
         errors: Dict[str, str] = {}
         if user_input is not None:
             try:
-                validated_input = _validate_input(user_input, STEP_INDIVIDUAL_ZONE_DATA_SCHEMA)
+                validated_input = _validate_input(user_input, STEP_ZONE_DATA_SCHEMA)
                 self._config_data.update(validated_input)
                 return self._async_create_entry()
             except vol.MultipleInvalid as e:
-                _LOGGER.error(f"Validation error in individual zone setup: {e}")
+                _LOGGER.error(f"Validation error in zone setup: {e}")
                 for error in e.errors:
                     path = error.path[0] if error.path else "base"
                     errors[path if isinstance(path, str) else "base"] = "invalid_input"
             except Exception: # pylint: disable=broad-except
-                _LOGGER.exception("Unexpected exception in individual_zone_setup")
+                _LOGGER.exception("Unexpected exception in zone_setup")
                 errors["base"] = "unknown"
 
         return self.async_show_form(
-            step_id="individual_zone_setup",
-            data_schema=STEP_INDIVIDUAL_ZONE_DATA_SCHEMA,
-            errors=errors,
-        )
-
-    async def async_step_central_heater_setup(self, user_input: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-        """Handle the setup for a central heater."""
-        errors: Dict[str, str] = {}
-        if user_input is not None:
-            try:
-                validated_input = _validate_input(user_input, STEP_CENTRAL_HEATER_DATA_SCHEMA)
-                self._config_data.update(validated_input)
-                return self._async_create_entry()
-            except vol.MultipleInvalid as e:
-                _LOGGER.error(f"Validation error in central heater setup: {e}")
-                for error in e.errors:
-                    path = error.path[0] if error.path else "base"
-                    errors[path if isinstance(path, str) else "base"] = "invalid_input"
-            except Exception: # pylint: disable=broad-except
-                _LOGGER.exception("Unexpected exception in central_heater_setup")
-                errors["base"] = "unknown"
-
-        return self.async_show_form(
-            step_id="central_heater_setup",
-            data_schema=STEP_CENTRAL_HEATER_DATA_SCHEMA,
+            step_id="zone_setup",
+            data_schema=STEP_ZONE_DATA_SCHEMA,
             errors=errors,
         )
 
@@ -202,115 +154,56 @@ class AdaptiveThermostatConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         _LOGGER.debug(f"Final config data for entry: {final_data}")
         return self.async_create_entry(title=final_data[CONF_NAME], data=final_data)
 
+    async def async_step_reconfigure(self, user_input: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        """Handle reconfiguration of the integration."""
+        config_entry = self._get_reconfigure_entry()
+        errors: Dict[str, str] = {}
+        
+        if user_input is not None:
+            try:
+                # Ensure unique ID remains the same
+                await self.async_set_unique_id(config_entry.unique_id)
+                self._abort_if_unique_id_mismatch()
+                
+                validated_input = _validate_input(user_input, STEP_ZONE_DATA_SCHEMA)
+                updated_data = {**config_entry.data, **validated_input}
+                
+                return self.async_update_reload_and_abort(
+                    config_entry,
+                    data_updates=updated_data,
+                )
+            except vol.MultipleInvalid as e:
+                _LOGGER.error(f"Validation error in reconfigure: {e}")
+                for error in e.errors:
+                    path = error.path[0] if error.path else "base"
+                    errors[path if isinstance(path, str) else "base"] = "invalid_input"
+            except Exception: # pylint: disable=broad-except
+                _LOGGER.exception("Unexpected exception in reconfigure")
+                errors["base"] = "unknown"
+
+        # Pre-populate form with current values
+        current_data = config_entry.data
+        schema_dict = {}
+        for key_obj, selector_config in STEP_ZONE_DATA_SCHEMA.schema.items():
+            key_str = key_obj.schema if isinstance(key_obj, vol.Marker) else key_obj
+            current_value = current_data.get(key_str)
+            
+            if isinstance(key_obj, vol.Optional):
+                schema_dict[vol.Optional(key_str, description={"suggested_value": current_value or ""})] = selector_config
+            else:
+                schema_dict[vol.Required(key_str, default=current_value or key_obj.default)] = selector_config
+        
+        return self.async_show_form(
+            step_id="reconfigure_zone",
+            data_schema=vol.Schema(schema_dict),
+            errors=errors,
+        )
+
     @staticmethod
     @callback
     def async_get_options_flow(config_entry: config_entries.ConfigEntry) -> config_entries.OptionsFlow:
         """Get the options flow for this handler."""
         return AdaptiveThermostatOptionsFlow(config_entry)
-
-    async def async_step_reconfigure(self, user_input: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-        """Handle reconfiguration of the integration."""
-        config_entry = self._get_reconfigure_entry()
-        self._config_data = dict(config_entry.data)
-        
-        config_type = config_entry.data.get(CONF_CONFIG_TYPE, CONFIG_TYPE_INDIVIDUAL_ZONE)
-        
-        if config_type == CONFIG_TYPE_INDIVIDUAL_ZONE:
-            return await self.async_step_reconfigure_individual_zone(user_input)
-        elif config_type == CONFIG_TYPE_CENTRAL_HEATER:
-            return await self.async_step_reconfigure_central_heater(user_input)
-        else:
-            return self.async_abort(reason="unknown_config_type")
-
-    async def async_step_reconfigure_individual_zone(self, user_input: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-        """Handle reconfiguration for individual zone."""
-        config_entry = self._get_reconfigure_entry()
-        errors: Dict[str, str] = {}
-        
-        if user_input is not None:
-            try:
-                # Ensure unique ID remains the same
-                await self.async_set_unique_id(config_entry.unique_id)
-                self._abort_if_unique_id_mismatch()
-                
-                validated_input = _validate_input(user_input, STEP_INDIVIDUAL_ZONE_DATA_SCHEMA)
-                updated_data = {**config_entry.data, **validated_input}
-                
-                return self.async_update_reload_and_abort(
-                    config_entry,
-                    data_updates=updated_data,
-                )
-            except vol.MultipleInvalid as e:
-                _LOGGER.error(f"Validation error in reconfigure individual zone: {e}")
-                for error in e.errors:
-                    path = error.path[0] if error.path else "base"
-                    errors[path if isinstance(path, str) else "base"] = "invalid_input"
-            except Exception: # pylint: disable=broad-except
-                _LOGGER.exception("Unexpected exception in reconfigure_individual_zone")
-                errors["base"] = "unknown"
-
-        # Pre-populate form with current values
-        current_data = config_entry.data
-        schema_dict = {}
-        for key_obj, selector_config in STEP_INDIVIDUAL_ZONE_DATA_SCHEMA.schema.items():
-            key_str = key_obj.schema if isinstance(key_obj, vol.Marker) else key_obj
-            current_value = current_data.get(key_str)
-            
-            if isinstance(key_obj, vol.Optional):
-                schema_dict[vol.Optional(key_str, description={"suggested_value": current_value or ""})] = selector_config
-            else:
-                schema_dict[vol.Required(key_str, default=current_value or key_obj.default)] = selector_config
-        
-        return self.async_show_form(
-            step_id="reconfigure_individual_zone",
-            data_schema=vol.Schema(schema_dict),
-            errors=errors,
-        )
-
-    async def async_step_reconfigure_central_heater(self, user_input: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-        """Handle reconfiguration for central heater."""
-        config_entry = self._get_reconfigure_entry()
-        errors: Dict[str, str] = {}
-        
-        if user_input is not None:
-            try:
-                # Ensure unique ID remains the same
-                await self.async_set_unique_id(config_entry.unique_id)
-                self._abort_if_unique_id_mismatch()
-                
-                validated_input = _validate_input(user_input, STEP_CENTRAL_HEATER_DATA_SCHEMA)
-                updated_data = {**config_entry.data, **validated_input}
-                
-                return self.async_update_reload_and_abort(
-                    config_entry,
-                    data_updates=updated_data,
-                )
-            except vol.MultipleInvalid as e:
-                _LOGGER.error(f"Validation error in reconfigure central heater: {e}")
-                for error in e.errors:
-                    path = error.path[0] if error.path else "base"
-                    errors[path if isinstance(path, str) else "base"] = "invalid_input"
-            except Exception: # pylint: disable=broad-except
-                _LOGGER.exception("Unexpected exception in reconfigure_central_heater")
-                errors["base"] = "unknown"
-
-        # Pre-populate form with current values
-        current_data = config_entry.data
-        schema_dict = {}
-        for key_obj, selector_config in STEP_CENTRAL_HEATER_DATA_SCHEMA.schema.items():
-            key_str = key_obj.schema if isinstance(key_obj, vol.Marker) else key_obj
-            current_value = current_data.get(key_str)
-            
-            if isinstance(key_obj, vol.Optional):
-                schema_dict[vol.Optional(key_str, description={"suggested_value": current_value or ""})] = selector_config
-            else:
-                schema_dict[vol.Required(key_str, default=current_value or key_obj.default)] = selector_config
-        
-        return self.async_show_form(
-            step_id="reconfigure_central_heater",
-            data_schema=vol.Schema(schema_dict),
-            errors=errors,
-        )
 
 
 class AdaptiveThermostatOptionsFlow(config_entries.OptionsFlow):
@@ -320,16 +213,18 @@ class AdaptiveThermostatOptionsFlow(config_entries.OptionsFlow):
         """Initialize options flow."""
         # self.config_entry is automatically set by the base class - no need to set it explicitly 
         self.current_options = dict(config_entry.options)
-        self.config_type = config_entry.data.get(CONF_CONFIG_TYPE)
         self.initial_data = dict(config_entry.data)
 
     def _get_options_schema(self) -> vol.Schema:
-        """Return the appropriate schema based on config_type, with suggested values."""
+        """Return the options schema with suggested values."""
         options_schema_dict = {}
 
-        individual_zone_fields = {
+        zone_fields = {
             vol.Required(CONF_HEATER): selector.EntitySelector(
                 selector.EntitySelectorConfig(domain=["switch", "input_boolean", "climate", "valve"])
+            ),
+            vol.Optional(CONF_CENTRAL_HEATER): selector.EntitySelector(
+                selector.EntitySelectorConfig(domain=["switch", "input_boolean", "climate"])
             ),
             vol.Required(CONF_TEMP_SENSOR): selector.EntitySelector(
                 selector.EntitySelectorConfig(domain=["sensor"], device_class="temperature")
@@ -360,23 +255,7 @@ class AdaptiveThermostatOptionsFlow(config_entries.OptionsFlow):
             ),
         }
 
-        central_heater_fields = {
-            vol.Required(CONF_HEATER): selector.EntitySelector(
-                selector.EntitySelectorConfig(domain=["climate", "switch", "input_boolean"])
-            ),
-            # No temperature sensor or presets for central heater - it just controls the main system
-        }
-
-        current_fields_def = {}
-        if self.config_type == CONFIG_TYPE_INDIVIDUAL_ZONE:
-            current_fields_def = individual_zone_fields
-        elif self.config_type == CONFIG_TYPE_CENTRAL_HEATER:
-            current_fields_def = central_heater_fields
-        else:
-            _LOGGER.error(f"Options flow: Unknown configuration type: {self.config_type}")
-            return vol.Schema({})
-
-        for key_obj, selector_config in current_fields_def.items():
+        for key_obj, selector_config in zone_fields.items():
             key_str = key_obj.schema if isinstance(key_obj, vol.Marker) else key_obj
             
             current_value = self.current_options.get(key_str, self.initial_data.get(key_str))
@@ -442,9 +321,6 @@ class AdaptiveThermostatOptionsFlow(config_entries.OptionsFlow):
             step_id="init",
             data_schema=options_schema,
             errors=errors,
-            description_placeholders={
-                "config_type_name": self.config_entry.data.get(CONF_CONFIG_TYPE, "Unknown").replace("_", " ").title()
-            }
         )
 
            
