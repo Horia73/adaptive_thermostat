@@ -94,6 +94,21 @@ class AdaptiveThermostat(ClimateEntity):
         self._heater_entity_id = config.get(CONF_HEATER)
         self._temp_sensor_entity_id = config.get(CONF_TEMP_SENSOR)
 
+        # Handle multiple heaters - convert single heater to list format
+        heater_config = config.get(CONF_HEATER)
+        if heater_config:
+            if isinstance(heater_config, str):
+                self._heater_entity_ids = [heater_config]
+            elif isinstance(heater_config, list):
+                self._heater_entity_ids = heater_config
+            else:
+                self._heater_entity_ids = [heater_config]
+        else:
+            self._heater_entity_ids = []
+        
+        # Keep backward compatibility for single heater reference
+        self._heater_entity_id = self._heater_entity_ids[0] if self._heater_entity_ids else None
+
         # Central heater configuration (optional)
         self._central_heater_entity_id = get_entity_id(CONF_CENTRAL_HEATER)
         
@@ -111,8 +126,8 @@ class AdaptiveThermostat(ClimateEntity):
         self._last_outdoor_temp = None
 
         # Check required fields
-        if not self._heater_entity_id:
-            _LOGGER.error("[%s] Heater entity ID is missing from configuration", self._entry_id)
+        if not self._heater_entity_ids:
+            _LOGGER.error("[%s] No heater entities configured", self._entry_id)
         if not self._temp_sensor_entity_id:
             _LOGGER.error("[%s] Temperature sensor entity ID is missing from configuration", self._entry_id)
 
@@ -148,6 +163,7 @@ class AdaptiveThermostat(ClimateEntity):
         # Extra state attributes for UI card
         self._attr_extra_state_attributes = {
             "heater_entity_id": self._heater_entity_id,
+            "heater_entity_ids": self._heater_entity_ids,
             "central_heater_entity_id": self._central_heater_entity_id,
             "temp_sensor_entity_id": self._temp_sensor_entity_id,
             "humidity_sensor": self._humidity_sensor_entity_id,
@@ -155,6 +171,7 @@ class AdaptiveThermostat(ClimateEntity):
             "door_window_sensor": self._door_window_sensor_entity_id,
             "outdoor_sensor": self._outdoor_sensor_entity_id,
             "weather_sensor": self._backup_outdoor_sensor_entity_id,  # Renamed for card compatibility
+            "manual_override": False,  # Track manual override state for card
         }
         _LOGGER.debug("[%s] Extra state attributes set: %s", self._entry_id, self._attr_extra_state_attributes)
 
@@ -164,6 +181,15 @@ class AdaptiveThermostat(ClimateEntity):
 
         # Listener for state changes
         self._remove_listener = None
+
+        # Device information for grouping entities
+        self._attr_device_info = {
+            "identifiers": {(DOMAIN, entry.entry_id)},
+            "name": self._attr_name,
+            "manufacturer": "Adaptive Thermostat",
+            "model": "Smart Zone Controller",
+            "sw_version": "1.0",
+        }
 
     async def async_added_to_hass(self) -> None:
         """Run when entity about to be added."""
@@ -179,6 +205,21 @@ class AdaptiveThermostat(ClimateEntity):
         if self._heater_entity_id:
              entities_to_track.append(self._heater_entity_id)
 
+        # Add all heater entities to tracking
+        for heater_id in self._heater_entity_ids:
+            if heater_id and heater_id not in entities_to_track:
+                entities_to_track.append(heater_id)
+
+        # Add outdoor sensors to tracking for auto on/off and card updates
+        if self._outdoor_sensor_entity_id:
+            entities_to_track.append(self._outdoor_sensor_entity_id)
+        if self._backup_outdoor_sensor_entity_id:
+            entities_to_track.append(self._backup_outdoor_sensor_entity_id)
+        if self._motion_sensor_entity_id:
+            entities_to_track.append(self._motion_sensor_entity_id)
+        if self._door_window_sensor_entity_id:
+            entities_to_track.append(self._door_window_sensor_entity_id)
+
         if entities_to_track:
             self._remove_listener = async_track_state_change_event(
                 self.hass, entities_to_track, self._async_state_changed
@@ -189,6 +230,12 @@ class AdaptiveThermostat(ClimateEntity):
 
         # Get initial state by scheduling first update
         self.async_schedule_update_ha_state(True)
+
+        # Ensure initial sensor data is loaded immediately
+        await self.async_update()
+        
+        # Force initial state write to ensure card gets data immediately
+        self.async_write_ha_state()
 
     async def async_will_remove_from_hass(self) -> None:
         """Run when entity will be removed from hass."""
@@ -247,6 +294,31 @@ class AdaptiveThermostat(ClimateEntity):
         """Return the current preset mode, e.g., home, away, temp."""
         return self._current_preset
 
+    @property
+    def preset_modes(self) -> list[str] | None:
+        """Return a list of available preset modes."""
+        return list(self._presets.keys())
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any] | None:
+        """Return the optional state attributes."""
+        return self._attr_extra_state_attributes
+
+    @property
+    def min_temp(self) -> float:
+        """Return the minimum temperature."""
+        return 5.0
+
+    @property
+    def max_temp(self) -> float:
+        """Return the maximum temperature."""
+        return 35.0
+
+    @property
+    def target_temperature_step(self) -> float:
+        """Return the supported step of target temperature."""
+        return 0.1
+
     # --- Service calls ---
 
     async def async_set_hvac_mode(self, hvac_mode: HVACMode) -> None:
@@ -255,6 +327,7 @@ class AdaptiveThermostat(ClimateEntity):
         
         # Mark as manual override when user manually changes HVAC mode
         self._manual_override = True
+        self._attr_extra_state_attributes["manual_override"] = True
         
         if hvac_mode == HVACMode.OFF:
             await self._async_turn_heater_off()
@@ -278,6 +351,7 @@ class AdaptiveThermostat(ClimateEntity):
         
         # Mark as manual override when user manually changes preset
         self._manual_override = True
+        self._attr_extra_state_attributes["manual_override"] = True
         
         self._current_preset = preset_mode
         self._target_temperature = self._presets[preset_mode]
@@ -298,6 +372,7 @@ class AdaptiveThermostat(ClimateEntity):
         
         # Mark as manual override when user manually sets temperature
         self._manual_override = True
+        self._attr_extra_state_attributes["manual_override"] = True
         
         self._target_temperature = float(temperature)
         
@@ -337,6 +412,9 @@ class AdaptiveThermostat(ClimateEntity):
                 except (ValueError, TypeError):
                     _LOGGER.warning("[%s] Invalid humidity from sensor: %s", self._entry_id, humidity_state.state)
 
+        # Update extra state attributes with current sensor readings for card
+        self._update_sensor_attributes()
+
         # Handle auto on/off based on outdoor temperature
         if self._auto_on_off_enabled and not self._manual_override:
             await self._async_handle_auto_onoff()
@@ -344,6 +422,121 @@ class AdaptiveThermostat(ClimateEntity):
         # Trigger heating control if in heat mode
         if self._hvac_mode == HVACMode.HEAT:
             await self._async_control_heating()
+
+    def _update_sensor_attributes(self) -> None:
+        """Update extra state attributes with current sensor readings."""
+        # Get current outdoor temperature (primary sensor)
+        outdoor_temp = None
+        if self._outdoor_sensor_entity_id:
+            outdoor_state = self.hass.states.get(self._outdoor_sensor_entity_id)
+            if outdoor_state and outdoor_state.state not in ["unknown", "unavailable"]:
+                try:
+                    outdoor_temp = float(outdoor_state.state)
+                except (ValueError, TypeError):
+                    pass
+        
+        # Get backup outdoor temperature
+        backup_outdoor_temp = None
+        if self._backup_outdoor_sensor_entity_id:
+            backup_state = self.hass.states.get(self._backup_outdoor_sensor_entity_id)
+            if backup_state and backup_state.state not in ["unknown", "unavailable"]:
+                try:
+                    backup_outdoor_temp = float(backup_state.state)
+                except (ValueError, TypeError):
+                    pass
+        
+        # Get motion sensor state
+        motion_active = None
+        if self._motion_sensor_entity_id:
+            motion_state = self.hass.states.get(self._motion_sensor_entity_id)
+            if motion_state:
+                motion_active = motion_state.state == STATE_ON
+        
+        # Get door/window sensor state
+        door_window_open = None
+        if self._door_window_sensor_entity_id:
+            door_window_state = self.hass.states.get(self._door_window_sensor_entity_id)
+            if door_window_state:
+                door_window_open = door_window_state.state == STATE_ON
+        
+        # Get heater states
+        heater_states = []
+        for heater_id in self._heater_entity_ids:
+            heater_state = self.hass.states.get(heater_id)
+            if heater_state:
+                heater_states.append({
+                    "entity_id": heater_id,
+                    "state": heater_state.state,
+                    "friendly_name": heater_state.attributes.get("friendly_name", heater_id)
+                })
+        
+        # Get central heater state
+        central_heater_state = None
+        if self._central_heater_entity_id:
+            central_state = self.hass.states.get(self._central_heater_entity_id)
+            if central_state:
+                central_heater_state = {
+                    "entity_id": self._central_heater_entity_id,
+                    "state": central_state.state,
+                    "friendly_name": central_state.attributes.get("friendly_name", self._central_heater_entity_id)
+                }
+        
+        # Update extra state attributes with all current data
+        self._attr_extra_state_attributes.update({
+            # Sensor entity IDs (for card compatibility)
+            "heater_entity_id": self._heater_entity_id,
+            "heater_entity_ids": self._heater_entity_ids,
+            "central_heater_entity_id": self._central_heater_entity_id,
+            "temp_sensor_entity_id": self._temp_sensor_entity_id,
+            "humidity_sensor": self._humidity_sensor_entity_id,
+            "motion_sensor": self._motion_sensor_entity_id,
+            "door_window_sensor": self._door_window_sensor_entity_id,
+            "outdoor_sensor": self._outdoor_sensor_entity_id,
+            "weather_sensor": self._backup_outdoor_sensor_entity_id,  # Card compatibility
+            
+            # Preset information (critical for card)
+            "preset_modes": list(self._presets.keys()),
+            "current_preset_mode": self._current_preset,
+            "preset_temperatures": self._presets,
+            
+            # Current sensor readings (for card display)
+            "current_outdoor_temp": outdoor_temp,
+            "current_backup_outdoor_temp": backup_outdoor_temp,
+            "current_motion_active": motion_active,
+            "current_door_window_open": door_window_open,
+            
+            # HVAC information
+            "hvac_modes": [mode.value for mode in self._attr_hvac_modes],
+            "current_hvac_mode": self._hvac_mode.value,
+            "hvac_action": self.hvac_action.value if self.hvac_action else "unknown",
+            
+            # Temperature information
+            "current_temperature": self._current_temperature,
+            "target_temperature": self._target_temperature,
+            "current_humidity": self._current_humidity,
+            
+            # Heater information
+            "heater_states": heater_states,
+            "central_heater_state": central_heater_state,
+            "zone_heater_on": self._zone_heater_on,
+            
+            # Auto control status
+            "auto_on_off_enabled": self._auto_on_off_enabled,
+            "auto_on_temp": self._auto_on_temp,
+            "auto_off_temp": self._auto_off_temp,
+            "manual_override": self._manual_override,
+            
+            # Temperature thresholds and timing
+            "central_heater_turn_on_delay": self._central_heater_turn_on_delay,
+            "central_heater_turn_off_delay": self._central_heater_turn_off_delay,
+            
+            # Entity availability status
+            "entity_available": True,
+            "last_updated": self.hass.states.get('sensor.time', {}).get('last_updated', 'unknown'),
+        })
+        
+        _LOGGER.debug("[%s] Updated sensor attributes for card - Preset modes: %s, Current preset: %s, HVAC mode: %s", 
+                     self._entry_id, list(self._presets.keys()), self._current_preset, self._hvac_mode.value)
 
     async def _async_handle_auto_onoff(self) -> None:
         """Handle automatic on/off based on outdoor temperature."""
@@ -398,6 +591,7 @@ class AdaptiveThermostat(ClimateEntity):
         if ((outdoor_temp < self._auto_on_temp and self._hvac_mode == HVACMode.HEAT) or 
             (outdoor_temp > self._auto_off_temp and self._hvac_mode == HVACMode.OFF)):
             self._manual_override = False
+            self._attr_extra_state_attributes["manual_override"] = False
 
     async def _async_control_heating(self) -> None:
         """Control heating based on current vs target temperature."""
@@ -470,3 +664,96 @@ class AdaptiveThermostat(ClimateEntity):
                 
         _LOGGER.debug("[%s] No other zones need heat from central heater", self._entry_id)
         return False
+
+    async def _async_turn_heater_on(self) -> None:
+        """Turn on zone heaters and coordinate with central heater."""
+        # Turn on all zone heaters
+        for heater_id in self._heater_entity_ids:
+            await self._async_turn_on_entity(heater_id, "zone heater")
+        
+        # Coordinate with central heater if configured
+        if self._central_heater_entity_id:
+            await self._async_coordinate_central_heater_on()
+
+    async def _async_turn_heater_off(self) -> None:
+        """Turn off zone heaters and coordinate with central heater."""
+        # Turn off all zone heaters first
+        for heater_id in self._heater_entity_ids:
+            await self._async_turn_off_entity(heater_id, "zone heater")
+        
+        # Coordinate with central heater if configured
+        if self._central_heater_entity_id:
+            await self._async_coordinate_central_heater_off()
+
+    async def _async_coordinate_central_heater_on(self) -> None:
+        """Coordinate turning on central heater after zone valves."""
+        if not self._central_heater_entity_id:
+            return
+            
+        # Cancel any existing task
+        if self._central_heater_task:
+            self._central_heater_task.cancel()
+            self._central_heater_task = None
+        
+        # Create task to turn on central heater after delay
+        self._central_heater_task = asyncio.create_task(
+            self._async_delayed_central_heater_on()
+        )
+
+    async def _async_coordinate_central_heater_off(self) -> None:
+        """Coordinate turning off central heater after checking other zones."""
+        if not self._central_heater_entity_id:
+            return
+            
+        # Cancel any existing task
+        if self._central_heater_task:
+            self._central_heater_task.cancel()
+            self._central_heater_task = None
+        
+        # Check if other zones still need heat
+        if not await self._async_check_other_zones_need_heat():
+            # Create task to turn off central heater after delay
+            self._central_heater_task = asyncio.create_task(
+                self._async_delayed_central_heater_off()
+            )
+
+    async def _async_delayed_central_heater_on(self) -> None:
+        """Turn on central heater after configured delay."""
+        try:
+            _LOGGER.debug("[%s] Waiting %s seconds before turning on central heater", 
+                         self._entry_id, self._central_heater_turn_on_delay)
+            await asyncio.sleep(self._central_heater_turn_on_delay)
+            
+            # Check if we still need to turn on (in case zone turned off during delay)
+            if self._zone_heater_on:
+                await self._async_turn_on_entity(self._central_heater_entity_id, "central heater")
+                _LOGGER.info("[%s] Central heater turned on after %s second delay", 
+                            self._entry_id, self._central_heater_turn_on_delay)
+        except asyncio.CancelledError:
+            _LOGGER.debug("[%s] Central heater turn-on task cancelled", self._entry_id)
+        finally:
+            self._central_heater_task = None
+
+    async def _async_delayed_central_heater_off(self) -> None:
+        """Turn off central heater after configured delay for pump protection."""
+        try:
+            _LOGGER.debug("[%s] Waiting %s seconds before turning off central heater (pump protection)", 
+                         self._entry_id, self._central_heater_turn_off_delay)
+            await asyncio.sleep(self._central_heater_turn_off_delay)
+            
+            # Double-check no other zones need heat before turning off
+            if not await self._async_check_other_zones_need_heat():
+                await self._async_turn_off_entity(self._central_heater_entity_id, "central heater")
+                _LOGGER.info("[%s] Central heater turned off after %s second delay", 
+                            self._entry_id, self._central_heater_turn_off_delay)
+        except asyncio.CancelledError:
+            _LOGGER.debug("[%s] Central heater turn-off task cancelled", self._entry_id)
+        finally:
+            self._central_heater_task = None
+
+    def reset_manual_override(self) -> None:
+        """Reset manual override to allow auto on/off to resume."""
+        _LOGGER.info("[%s] Manual override reset - auto on/off will resume", self._entry_id)
+        self._manual_override = False
+        self._attr_extra_state_attributes["manual_override"] = False
+        self.async_write_ha_state()

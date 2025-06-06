@@ -124,8 +124,8 @@
       "invalid_selection": "Invalid selection made."
     },
     "abort": {
-      "already_configured": "[%key:common::config_flow::abort::already_configured_device%]",
-      "reauth_successful": "[%key:common::config_flow::abort::reauth_successful%]"
+      "already_configured": "Zone already configured",
+      "single_instance_allowed": "Only a single configuration of Adaptive Thermostat is allowed."
     }
   },
   "options": {
@@ -152,6 +152,18 @@
       "unknown": "An unknown error occurred while saving options.",
       "invalid_option_input": "Invalid input provided in options. Please check your entries and try again.",
       "unknown_options_error": "An unexpected error occurred while saving options. Please try again."
+    }
+  },
+  "services": {
+    "reset_manual_override": {
+      "name": "Reset Manual Override",
+      "description": "Reset manual override to allow automatic on/off control to resume",
+      "fields": {
+        "entity_id": {
+          "name": "Entity",
+          "description": "The adaptive thermostat entity to reset"
+        }
+      }
     }
   }
 }

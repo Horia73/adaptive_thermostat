@@ -1,0 +1,11 @@
+reset_manual_override:
+  name: Reset Manual Override
+  description: Reset manual override to allow automatic on/off control to resume
+  fields:
+    entity_id:
+      name: Entity
+      description: The adaptive thermostat entity to reset
+      required: true
+      selector:
+        entity:
+          domain: climate 

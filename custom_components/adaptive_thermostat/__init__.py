@@ -1,9 +1,11 @@
 """The Adaptive Thermostat integration."""
 
 import logging
+import voluptuous as vol
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.core import HomeAssistant
+from homeassistant.core import HomeAssistant, ServiceCall
 from homeassistant.helpers.typing import ConfigType
+from homeassistant.helpers import config_validation as cv
 
 # Import constants from const.py
 from .const import DOMAIN, PLATFORMS
@@ -27,6 +29,32 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
     # Forward the setup to the climate platform.
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
+
+    # Register services if not already registered
+    if not hass.services.has_service(DOMAIN, "reset_manual_override"):
+        async def reset_manual_override_service(call: ServiceCall) -> None:
+            """Service to reset manual override for a thermostat."""
+            entity_id = call.data.get("entity_id")
+            
+            # Find the climate entity
+            for climate_entity_id in hass.states.async_entity_ids("climate"):
+                if climate_entity_id == entity_id:
+                    climate_entity = hass.data.get("climate", {}).get(climate_entity_id)
+                    if climate_entity and hasattr(climate_entity, 'reset_manual_override'):
+                        climate_entity.reset_manual_override()
+                        _LOGGER.info("Reset manual override for %s", entity_id)
+                        return
+            
+            _LOGGER.warning("Could not find adaptive thermostat entity: %s", entity_id)
+
+        hass.services.async_register(
+            DOMAIN,
+            "reset_manual_override",
+            reset_manual_override_service,
+            schema=vol.Schema({
+                vol.Required("entity_id"): cv.entity_id,
+            }),
+        )
 
     # Listen for options updates.
     entry.async_on_unload(entry.add_update_listener(async_update_options))

@@ -40,7 +40,7 @@ _LOGGER = logging.getLogger(__name__)
 
 STEP_USER_DATA_SCHEMA = vol.Schema(
     {
-        vol.Required(CONF_NAME, default="Adaptive Thermostat"): str,
+        vol.Required(CONF_NAME): str,
     }
 )
 
