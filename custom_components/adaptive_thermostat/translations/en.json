@@ -11,7 +11,7 @@
       },
       "zone_setup": {
         "title": "Configure Heating Zone",
-        "description": "Set up the entities and temperature presets for this heating zone.",
+        "description": "Set up the entities for this heating zone.",
         "data": {
           "heater": "Zone Heater/Valve (Switch, Input Boolean, Climate, or Valve)",
           "central_heater": "Central System Heater (Optional - for zones using central heating)",
@@ -20,7 +20,30 @@
           "backup_outdoor_sensor": "Backup Outdoor Sensor (Optional)",
           "humidity_sensor": "Humidity Sensor (Optional)",
           "door_window_sensor": "Door/Window Sensor(s) (Optional)",
-          "motion_sensor": "Motion Sensor (Optional)",
+          "motion_sensor": "Motion Sensor (Optional)"
+        }
+      },
+      "timing_setup": {
+        "title": "Central Heater Timing",
+        "description": "Configure the timing delays for central heater coordination. These settings help protect your heating system.",
+        "data": {
+          "central_heater_turn_on_delay": "Turn On Delay (seconds after valve opens)",
+          "central_heater_turn_off_delay": "Turn Off Delay (seconds to wait before closing valve)"
+        }
+      },
+      "auto_onoff_setup": {
+        "title": "Automatic On/Off",
+        "description": "Configure automatic thermostat control based on outdoor temperature. Manual overrides from the thermostat card are always allowed.",
+        "data": {
+          "auto_on_off_enabled": "Enable Automatic On/Off",
+          "auto_on_temp": "Auto Turn On Temperature (when outdoor temp falls below)",
+          "auto_off_temp": "Auto Turn Off Temperature (when outdoor temp rises above)"
+        }
+      },
+      "presets_setup": {
+        "title": "Temperature Presets",
+        "description": "Configure the temperature presets for different scenarios.",
+        "data": {
           "home_preset": "Home Temperature Preset (°C)",
           "sleep_preset": "Sleep Temperature Preset (°C)",
           "away_preset": "Away Temperature Preset (°C)"

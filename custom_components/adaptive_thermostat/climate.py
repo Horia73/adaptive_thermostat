@@ -37,12 +37,19 @@ from .const import (
     CONF_SLEEP_PRESET,
     CONF_HOME_PRESET,
     CONF_AWAY_PRESET,
+    CONF_CENTRAL_HEATER_TURN_ON_DELAY,
+    CONF_CENTRAL_HEATER_TURN_OFF_DELAY,
+    CONF_AUTO_ON_OFF_ENABLED,
+    CONF_AUTO_ON_TEMP,
+    CONF_AUTO_OFF_TEMP,
     DEFAULT_NAME,
     DEFAULT_HOME_PRESET,
     DEFAULT_SLEEP_PRESET,
     DEFAULT_AWAY_PRESET,
     CENTRAL_HEATER_TURN_ON_DELAY,
     CENTRAL_HEATER_TURN_OFF_DELAY,
+    DEFAULT_AUTO_ON_TEMP,
+    DEFAULT_AUTO_OFF_TEMP,
 )
 
 _LOGGER = logging.getLogger(__name__)
@@ -90,6 +97,19 @@ class AdaptiveThermostat(ClimateEntity):
         # Central heater configuration (optional)
         self._central_heater_entity_id = get_entity_id(CONF_CENTRAL_HEATER)
         
+        # Central heater timing configuration
+        self._central_heater_turn_on_delay = config.get(CONF_CENTRAL_HEATER_TURN_ON_DELAY, CENTRAL_HEATER_TURN_ON_DELAY)
+        self._central_heater_turn_off_delay = config.get(CONF_CENTRAL_HEATER_TURN_OFF_DELAY, CENTRAL_HEATER_TURN_OFF_DELAY)
+        
+        # Auto on/off configuration
+        self._auto_on_off_enabled = config.get(CONF_AUTO_ON_OFF_ENABLED, False)
+        self._auto_on_temp = config.get(CONF_AUTO_ON_TEMP, DEFAULT_AUTO_ON_TEMP)
+        self._auto_off_temp = config.get(CONF_AUTO_OFF_TEMP, DEFAULT_AUTO_OFF_TEMP)
+        
+        # Manual override state - when user manually controls the thermostat
+        self._manual_override = False
+        self._last_outdoor_temp = None
+
         # Check required fields
         if not self._heater_entity_id:
             _LOGGER.error("[%s] Heater entity ID is missing from configuration", self._entry_id)
@@ -134,17 +154,16 @@ class AdaptiveThermostat(ClimateEntity):
             "motion_sensor": self._motion_sensor_entity_id,
             "door_window_sensor": self._door_window_sensor_entity_id,
             "outdoor_sensor": self._outdoor_sensor_entity_id,
-            "backup_outdoor_sensor": self._backup_outdoor_sensor_entity_id,
+            "weather_sensor": self._backup_outdoor_sensor_entity_id,  # Renamed for card compatibility
         }
         _LOGGER.debug("[%s] Extra state attributes set: %s", self._entry_id, self._attr_extra_state_attributes)
 
         # Central heater coordination state
         self._zone_heater_on = False
-        self._central_heater_turn_on_task = None
-        self._central_heater_turn_off_task = None
+        self._central_heater_task = None
 
         # Listener for state changes
-        self._unsub_state_listener = None
+        self._remove_listener = None
 
     async def async_added_to_hass(self) -> None:
         """Run when entity about to be added."""
@@ -161,7 +180,7 @@ class AdaptiveThermostat(ClimateEntity):
              entities_to_track.append(self._heater_entity_id)
 
         if entities_to_track:
-            self._unsub_state_listener = async_track_state_change_event(
+            self._remove_listener = async_track_state_change_event(
                 self.hass, entities_to_track, self._async_state_changed
             )
             _LOGGER.debug("[%s] Registered state listener for: %s", self._entry_id, entities_to_track)
@@ -172,18 +191,17 @@ class AdaptiveThermostat(ClimateEntity):
         self.async_schedule_update_ha_state(True)
 
     async def async_will_remove_from_hass(self) -> None:
-        """Run when entity will be removed from HASS."""
-        _LOGGER.debug("[%s] Entity removing from HASS", self._entry_id)
+        """Run when entity will be removed from hass."""
+        _LOGGER.debug("[%s] Removing adaptive thermostat from Home Assistant", self._entry_id)
         
         # Cancel any pending central heater tasks
-        if self._central_heater_turn_on_task:
-            self._central_heater_turn_on_task.cancel()
-        if self._central_heater_turn_off_task:
-            self._central_heater_turn_off_task.cancel()
+        if self._central_heater_task:
+            self._central_heater_task.cancel()
+            self._central_heater_task = None
             
-        if self._unsub_state_listener:
-            self._unsub_state_listener()
-            self._unsub_state_listener = None
+        if self._remove_listener:
+            self._remove_listener()
+            self._remove_listener = None
             _LOGGER.debug("[%s] Unsubscribed state listener.", self._entry_id)
         await super().async_will_remove_from_hass()
 
@@ -235,6 +253,9 @@ class AdaptiveThermostat(ClimateEntity):
         """Set new target hvac mode."""
         _LOGGER.debug("[%s] Setting HVAC mode to: %s", self._entry_id, hvac_mode)
         
+        # Mark as manual override when user manually changes HVAC mode
+        self._manual_override = True
+        
         if hvac_mode == HVACMode.OFF:
             await self._async_turn_heater_off()
             self._hvac_mode = HVACMode.OFF
@@ -254,6 +275,10 @@ class AdaptiveThermostat(ClimateEntity):
             return
 
         _LOGGER.debug("[%s] Setting preset mode to: %s", self._entry_id, preset_mode)
+        
+        # Mark as manual override when user manually changes preset
+        self._manual_override = True
+        
         self._current_preset = preset_mode
         self._target_temperature = self._presets[preset_mode]
         
@@ -270,6 +295,10 @@ class AdaptiveThermostat(ClimateEntity):
             return
 
         _LOGGER.debug("[%s] Setting target temperature to: %s°C", self._entry_id, temperature)
+        
+        # Mark as manual override when user manually sets temperature
+        self._manual_override = True
+        
         self._target_temperature = float(temperature)
         
         # Clear preset mode when manually setting temperature
@@ -308,137 +337,115 @@ class AdaptiveThermostat(ClimateEntity):
                 except (ValueError, TypeError):
                     _LOGGER.warning("[%s] Invalid humidity from sensor: %s", self._entry_id, humidity_state.state)
 
+        # Handle auto on/off based on outdoor temperature
+        if self._auto_on_off_enabled and not self._manual_override:
+            await self._async_handle_auto_onoff()
+
         # Trigger heating control if in heat mode
         if self._hvac_mode == HVACMode.HEAT:
             await self._async_control_heating()
 
+    async def _async_handle_auto_onoff(self) -> None:
+        """Handle automatic on/off based on outdoor temperature."""
+        outdoor_temp = None
+        
+        # Try primary outdoor sensor first
+        if self._outdoor_sensor_entity_id:
+            outdoor_state = self.hass.states.get(self._outdoor_sensor_entity_id)
+            if outdoor_state and outdoor_state.state not in ["unknown", "unavailable"]:
+                try:
+                    outdoor_temp = float(outdoor_state.state)
+                except (ValueError, TypeError):
+                    _LOGGER.warning("[%s] Invalid outdoor temperature: %s", self._entry_id, outdoor_state.state)
+        
+        # Fallback to backup sensor if primary failed
+        if outdoor_temp is None and self._backup_outdoor_sensor_entity_id:
+            backup_state = self.hass.states.get(self._backup_outdoor_sensor_entity_id)
+            if backup_state and backup_state.state not in ["unknown", "unavailable"]:
+                try:
+                    outdoor_temp = float(backup_state.state)
+                except (ValueError, TypeError):
+                    _LOGGER.warning("[%s] Invalid backup outdoor temperature: %s", self._entry_id, backup_state.state)
+        
+        if outdoor_temp is None:
+            return  # No valid outdoor temperature available
+        
+        # Only process if temperature changed significantly (0.5°C hysteresis)
+        if self._last_outdoor_temp is not None and abs(outdoor_temp - self._last_outdoor_temp) < 0.5:
+            return
+        
+        self._last_outdoor_temp = outdoor_temp
+        
+        _LOGGER.debug("[%s] Auto on/off check - Outdoor temp: %s°C, Current mode: %s", 
+                     self._entry_id, outdoor_temp, self._hvac_mode)
+        
+        # Auto turn on when outdoor temp drops below threshold
+        if outdoor_temp < self._auto_on_temp and self._hvac_mode == HVACMode.OFF:
+            _LOGGER.info("[%s] Auto turning ON - Outdoor temp %s°C < %s°C", 
+                        self._entry_id, outdoor_temp, self._auto_on_temp)
+            self._hvac_mode = HVACMode.HEAT
+            await self._async_control_heating()
+            
+        # Auto turn off when outdoor temp rises above threshold
+        elif outdoor_temp > self._auto_off_temp and self._hvac_mode == HVACMode.HEAT:
+            _LOGGER.info("[%s] Auto turning OFF - Outdoor temp %s°C > %s°C", 
+                        self._entry_id, outdoor_temp, self._auto_off_temp)
+            await self._async_turn_heater_off()
+            self._hvac_mode = HVACMode.OFF
+            
+        # Clear manual override if auto conditions would naturally change state
+        # This allows auto mode to resume after user's manual intervention has become obsolete
+        if ((outdoor_temp < self._auto_on_temp and self._hvac_mode == HVACMode.HEAT) or 
+            (outdoor_temp > self._auto_off_temp and self._hvac_mode == HVACMode.OFF)):
+            self._manual_override = False
+
     async def _async_control_heating(self) -> None:
         """Control heating based on current vs target temperature."""
+        should_heat = await self._async_should_heat()
+        
+        # If we need to heat and heater is off, turn it on
+        if should_heat and not self._zone_heater_on:
+            _LOGGER.debug("[%s] Need to heat: current=%s°C, target=%s°C", self._entry_id, self._current_temperature, self._target_temperature)
+            await self._async_turn_heater_on()
+            self._zone_heater_on = True
+            
+        # If we don't need to heat and heater is on, turn it off
+        elif not should_heat and self._zone_heater_on:
+            _LOGGER.debug("[%s] Don't need to heat: current=%s°C, target=%s°C", self._entry_id, self._current_temperature, self._target_temperature)
+            await self._async_turn_heater_off()
+            self._zone_heater_on = False
+
+    async def _async_should_heat(self) -> bool:
+        """Determine if heating is needed based on temperature difference."""
         if self._current_temperature is None or self._target_temperature is None:
-            _LOGGER.debug("[%s] Cannot control heating: missing temperature data", self._entry_id)
-            return
-
-        # Simple thermostat logic with hysteresis
+            return False
+        
         temp_diff = self._target_temperature - self._current_temperature
-        
-        if temp_diff > HEATING_ON_OFFSET:
-            # Need heating
-            if not self._zone_heater_on:
-                await self._async_turn_heater_on()
-        elif temp_diff < -HEATING_ON_OFFSET:
-            # Too warm, turn off
-            if self._zone_heater_on:
-                await self._async_turn_heater_off()
+        return temp_diff > HEATING_ON_OFFSET
 
-    async def _async_turn_heater_on(self) -> None:
-        """Turn on the zone heater and manage central heater coordination."""
-        if not self._heater_entity_id:
+    async def _async_turn_on_entity(self, entity_id: str, entity_name: str) -> None:
+        """Turn on an entity (switch or climate)."""
+        if not entity_id:
             return
-
-        _LOGGER.info("[%s] Turning on zone heater: %s", self._entry_id, self._heater_entity_id)
+            
+        domain = "climate" if entity_id.startswith("climate.") else "switch"
+        _LOGGER.info("[%s] Turning on %s: %s", self._entry_id, entity_name, entity_id)
         
-        # Cancel any pending turn-off task for central heater
-        if self._central_heater_turn_off_task:
-            self._central_heater_turn_off_task.cancel()
-            self._central_heater_turn_off_task = None
-
-        # Turn on zone heater (valve/radiator)
         await self.hass.services.async_call(
-            "climate" if self._heater_entity_id.startswith("climate.") else "switch",
-            "turn_on",
-            {"entity_id": self._heater_entity_id},
-            blocking=True,
+            domain, "turn_on", {"entity_id": entity_id}, blocking=True
         )
-        
-        self._zone_heater_on = True
-        
-        # If we have a central heater, schedule it to turn on after delay
-        if self._central_heater_entity_id:
-            self._central_heater_turn_on_task = asyncio.create_task(
-                self._async_delayed_central_heater_on()
-            )
 
-    async def _async_turn_heater_off(self) -> None:
-        """Turn off the zone heater and manage central heater coordination."""
-        if not self._heater_entity_id:
+    async def _async_turn_off_entity(self, entity_id: str, entity_name: str) -> None:
+        """Turn off an entity (switch or climate)."""
+        if not entity_id:
             return
-
-        _LOGGER.info("[%s] Turning off zone heater: %s", self._entry_id, self._heater_entity_id)
+            
+        domain = "climate" if entity_id.startswith("climate.") else "switch"
+        _LOGGER.info("[%s] Turning off %s: %s", self._entry_id, entity_name, entity_id)
         
-        # Cancel any pending turn-on task for central heater
-        if self._central_heater_turn_on_task:
-            self._central_heater_turn_on_task.cancel()
-            self._central_heater_turn_on_task = None
-
-        self._zone_heater_on = False
-        
-        # If we have a central heater, check if other zones need it
-        if self._central_heater_entity_id:
-            other_zones_need_heat = await self._async_check_other_zones_need_heat()
-            
-            if not other_zones_need_heat:
-                # We're the last zone, schedule central heater turn off + valve turn off
-                self._central_heater_turn_off_task = asyncio.create_task(
-                    self._async_delayed_central_heater_off_and_valve()
-                )
-            else:
-                # Other zones still need heat, just turn off our valve
-                await self.hass.services.async_call(
-                    "climate" if self._heater_entity_id.startswith("climate.") else "switch",
-                    "turn_off",
-                    {"entity_id": self._heater_entity_id},
-                    blocking=True,
-                )
-        else:
-            # No central heater, just turn off zone heater
-            await self.hass.services.async_call(
-                "climate" if self._heater_entity_id.startswith("climate.") else "switch",
-                "turn_off",
-                {"entity_id": self._heater_entity_id},
-                blocking=True,
-            )
-
-    async def _async_delayed_central_heater_on(self) -> None:
-        """Turn on central heater after delay."""
-        try:
-            await asyncio.sleep(CENTRAL_HEATER_TURN_ON_DELAY)
-            _LOGGER.info("[%s] Turning on central heater: %s", self._entry_id, self._central_heater_entity_id)
-            
-            await self.hass.services.async_call(
-                "climate" if self._central_heater_entity_id.startswith("climate.") else "switch",
-                "turn_on",
-                {"entity_id": self._central_heater_entity_id},
-                blocking=True,
-            )
-        except asyncio.CancelledError:
-            _LOGGER.debug("[%s] Central heater turn-on task cancelled", self._entry_id)
-
-    async def _async_delayed_central_heater_off_and_valve(self) -> None:
-        """Turn off central heater, wait, then turn off valve to prevent pump running in closed system."""
-        try:
-            # Turn off central heater first
-            _LOGGER.info("[%s] Turning off central heater: %s", self._entry_id, self._central_heater_entity_id)
-            await self.hass.services.async_call(
-                "climate" if self._central_heater_entity_id.startswith("climate.") else "switch",
-                "turn_off",
-                {"entity_id": self._central_heater_entity_id},
-                blocking=True,
-            )
-            
-            # Wait for the pump to stop
-            await asyncio.sleep(CENTRAL_HEATER_TURN_OFF_DELAY)
-            
-            # Now turn off the valve
-            _LOGGER.info("[%s] Turning off zone heater: %s", self._entry_id, self._heater_entity_id)
-            await self.hass.services.async_call(
-                "climate" if self._heater_entity_id.startswith("climate.") else "switch",
-                "turn_off",
-                {"entity_id": self._heater_entity_id},
-                blocking=True,
-            )
-            
-        except asyncio.CancelledError:
-            _LOGGER.debug("[%s] Central heater turn-off task cancelled", self._entry_id)
+        await self.hass.services.async_call(
+            domain, "turn_off", {"entity_id": entity_id}, blocking=True
+        )
 
     async def _async_check_other_zones_need_heat(self) -> bool:
         """Check if other zones using the same central heater need heat."""

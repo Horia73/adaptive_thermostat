@@ -22,9 +22,18 @@ from .const import (
     CONF_HOME_PRESET,
     CONF_SLEEP_PRESET,
     CONF_AWAY_PRESET,
+    CONF_CENTRAL_HEATER_TURN_ON_DELAY,
+    CONF_CENTRAL_HEATER_TURN_OFF_DELAY,
+    CONF_AUTO_ON_OFF_ENABLED,
+    CONF_AUTO_ON_TEMP,
+    CONF_AUTO_OFF_TEMP,
     DEFAULT_HOME_PRESET,
     DEFAULT_SLEEP_PRESET,
     DEFAULT_AWAY_PRESET,
+    CENTRAL_HEATER_TURN_ON_DELAY,
+    CENTRAL_HEATER_TURN_OFF_DELAY,
+    DEFAULT_AUTO_ON_TEMP,
+    DEFAULT_AUTO_OFF_TEMP,
 )
 
 _LOGGER = logging.getLogger(__name__)
@@ -61,6 +70,34 @@ STEP_ZONE_DATA_SCHEMA = vol.Schema(
         vol.Optional(CONF_MOTION_SENSOR): selector.EntitySelector(
             selector.EntitySelectorConfig(domain=["binary_sensor"], device_class="motion", multiple=False)
         ),
+    }
+)
+
+STEP_TIMING_SCHEMA = vol.Schema(
+    {
+        vol.Required(CONF_CENTRAL_HEATER_TURN_ON_DELAY, default=CENTRAL_HEATER_TURN_ON_DELAY): selector.NumberSelector(
+            selector.NumberSelectorConfig(min=5, max=60, step=1, mode="box", unit_of_measurement="seconds")
+        ),
+        vol.Required(CONF_CENTRAL_HEATER_TURN_OFF_DELAY, default=CENTRAL_HEATER_TURN_OFF_DELAY): selector.NumberSelector(
+            selector.NumberSelectorConfig(min=30, max=300, step=10, mode="box", unit_of_measurement="seconds")
+        ),
+    }
+)
+
+STEP_AUTO_ONOFF_SCHEMA = vol.Schema(
+    {
+        vol.Required(CONF_AUTO_ON_OFF_ENABLED, default=False): selector.BooleanSelector(),
+        vol.Required(CONF_AUTO_ON_TEMP, default=DEFAULT_AUTO_ON_TEMP): selector.NumberSelector(
+            selector.NumberSelectorConfig(min=-10, max=25, step=0.5, mode="box", unit_of_measurement="°C")
+        ),
+        vol.Required(CONF_AUTO_OFF_TEMP, default=DEFAULT_AUTO_OFF_TEMP): selector.NumberSelector(
+            selector.NumberSelectorConfig(min=10, max=35, step=0.5, mode="box", unit_of_measurement="°C")
+        ),
+    }
+)
+
+STEP_PRESETS_SCHEMA = vol.Schema(
+    {
         vol.Required(CONF_HOME_PRESET, default=DEFAULT_HOME_PRESET): selector.NumberSelector(
             selector.NumberSelectorConfig(min=10, max=30, step=0.1, mode="box")
         ),
@@ -131,7 +168,13 @@ class AdaptiveThermostatConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             try:
                 validated_input = _validate_input(user_input, STEP_ZONE_DATA_SCHEMA)
                 self._config_data.update(validated_input)
-                return self._async_create_entry()
+                
+                # Check if central heater is configured to determine next step
+                if self._config_data.get(CONF_CENTRAL_HEATER):
+                    return await self.async_step_timing_setup()
+                else:
+                    return await self.async_step_auto_onoff_setup()
+                
             except vol.MultipleInvalid as e:
                 _LOGGER.error(f"Validation error in zone setup: {e}")
                 for error in e.errors:
@@ -144,6 +187,75 @@ class AdaptiveThermostatConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         return self.async_show_form(
             step_id="zone_setup",
             data_schema=STEP_ZONE_DATA_SCHEMA,
+            errors=errors,
+        )
+
+    async def async_step_timing_setup(self, user_input: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        """Handle central heater timing configuration."""
+        errors: Dict[str, str] = {}
+        if user_input is not None:
+            try:
+                validated_input = _validate_input(user_input, STEP_TIMING_SCHEMA)
+                self._config_data.update(validated_input)
+                return await self.async_step_auto_onoff_setup()
+            except vol.MultipleInvalid as e:
+                _LOGGER.error(f"Validation error in timing setup: {e}")
+                for error in e.errors:
+                    path = error.path[0] if error.path else "base"
+                    errors[path if isinstance(path, str) else "base"] = "invalid_input"
+            except Exception: # pylint: disable=broad-except
+                _LOGGER.exception("Unexpected exception in timing_setup")
+                errors["base"] = "unknown"
+
+        return self.async_show_form(
+            step_id="timing_setup",
+            data_schema=STEP_TIMING_SCHEMA,
+            errors=errors,
+        )
+
+    async def async_step_auto_onoff_setup(self, user_input: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        """Handle auto on/off configuration."""
+        errors: Dict[str, str] = {}
+        if user_input is not None:
+            try:
+                validated_input = _validate_input(user_input, STEP_AUTO_ONOFF_SCHEMA)
+                self._config_data.update(validated_input)
+                return await self.async_step_presets_setup()
+            except vol.MultipleInvalid as e:
+                _LOGGER.error(f"Validation error in auto on/off setup: {e}")
+                for error in e.errors:
+                    path = error.path[0] if error.path else "base"
+                    errors[path if isinstance(path, str) else "base"] = "invalid_input"
+            except Exception: # pylint: disable=broad-except
+                _LOGGER.exception("Unexpected exception in auto_onoff_setup")
+                errors["base"] = "unknown"
+
+        return self.async_show_form(
+            step_id="auto_onoff_setup",
+            data_schema=STEP_AUTO_ONOFF_SCHEMA,
+            errors=errors,
+        )
+
+    async def async_step_presets_setup(self, user_input: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        """Handle temperature presets configuration."""
+        errors: Dict[str, str] = {}
+        if user_input is not None:
+            try:
+                validated_input = _validate_input(user_input, STEP_PRESETS_SCHEMA)
+                self._config_data.update(validated_input)
+                return self._async_create_entry()
+            except vol.MultipleInvalid as e:
+                _LOGGER.error(f"Validation error in presets setup: {e}")
+                for error in e.errors:
+                    path = error.path[0] if error.path else "base"
+                    errors[path if isinstance(path, str) else "base"] = "invalid_input"
+            except Exception: # pylint: disable=broad-except
+                _LOGGER.exception("Unexpected exception in presets_setup")
+                errors["base"] = "unknown"
+
+        return self.async_show_form(
+            step_id="presets_setup",
+            data_schema=STEP_PRESETS_SCHEMA,
             errors=errors,
         )
 
