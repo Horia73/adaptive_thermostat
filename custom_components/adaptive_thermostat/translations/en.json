@@ -24,7 +24,6 @@
           "humidity_sensor": "Humidity Sensor (Optional)",
           "door_window_sensor": "Door/Window Sensor(s) (Optional)",
           "motion_sensor": "Motion Sensor (Optional)",
-          "weather_sensor": "Weather Entity (Optional, for additional weather data like cloudiness, wind)",
           "home_preset": "Home Temperature Preset (°C)",
           "sleep_preset": "Sleep Temperature Preset (°C)",
           "away_preset": "Away Temperature Preset (°C)"
@@ -35,9 +34,7 @@
         "description": "Set up the main heater entity and temperature presets for the central heating system.",
         "data": {
           "heater": "Central Heater Entity (Climate, Switch, or Input Boolean)",
-          "home_preset": "Home Temperature Preset (°C)",
-          "sleep_preset": "Sleep Temperature Preset (°C)",
-          "away_preset": "Away Temperature Preset (°C)"
+          "temp_sensor": "Temperature Sensor (for general system reference)"
         }
       }
     },
@@ -71,7 +68,6 @@
           "humidity_sensor": "Humidity Sensor (Optional)",
           "door_window_sensor": "Door/Window Sensor(s) (Optional)",
           "motion_sensor": "Motion Sensor (Optional)",
-          "weather_sensor": "Weather Entity (Optional)",
           "home_preset": "Home Temperature Preset (°C)",
           "sleep_preset": "Sleep Temperature Preset (°C)",
           "away_preset": "Away Temperature Preset (°C)"
