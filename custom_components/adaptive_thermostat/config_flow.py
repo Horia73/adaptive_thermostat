@@ -273,8 +273,42 @@ class AdaptiveThermostatConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         # Initialize with current config data for reconfiguration
         self._config_data = dict(config_entry.data)
         
-        # Start with the zone setup step (skip name since it's in the title)
-        return await self.async_step_reconfigure_zone_setup()
+        # Always start with name setup for full reconfiguration
+        return await self.async_step_reconfigure_name_setup()
+
+    async def async_step_reconfigure_name_setup(self, user_input: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        """Handle reconfiguration of the thermostat name."""
+        config_entry = self._get_reconfigure_entry()
+        errors: Dict[str, str] = {}
+        
+        if user_input is not None:
+            try:
+                validated_input = _validate_input(user_input, STEP_USER_DATA_SCHEMA)
+                self._config_data.update(validated_input)
+                
+                # Always continue to zone setup
+                return await self.async_step_reconfigure_zone_setup()
+                
+            except vol.MultipleInvalid as e:
+                _LOGGER.error(f"Validation error in reconfigure name setup: {e}")
+                for error in e.errors:
+                    path = error.path[0] if error.path else "base"
+                    errors[path if isinstance(path, str) else "base"] = "invalid_input"
+            except Exception: # pylint: disable=broad-except
+                _LOGGER.exception("Unexpected exception in reconfigure name setup")
+                errors["base"] = "unknown"
+
+        # Create simple schema with current name
+        current_data = config_entry.data
+        current_name = current_data.get(CONF_NAME, config_entry.title)
+        
+        schema_dict = {vol.Required(CONF_NAME, default=current_name): str}
+
+        return self.async_show_form(
+            step_id="reconfigure_name_setup",
+            data_schema=vol.Schema(schema_dict),
+            errors=errors,
+        )
 
     async def async_step_reconfigure_zone_setup(self, user_input: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         """Handle reconfiguration of zone setup."""
@@ -290,11 +324,8 @@ class AdaptiveThermostatConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                 validated_input = _validate_input(user_input, STEP_ZONE_DATA_SCHEMA)
                 self._config_data.update(validated_input)
                 
-                # Check if central heater is configured to determine next step
-                if self._config_data.get(CONF_CENTRAL_HEATER):
-                    return await self.async_step_reconfigure_timing_setup()
-                else:
-                    return await self.async_step_reconfigure_auto_onoff_setup()
+                # Always continue to timing setup
+                return await self.async_step_reconfigure_timing_setup()
                 
             except vol.MultipleInvalid as e:
                 _LOGGER.error(f"Validation error in reconfigure zone setup: {e}")
@@ -308,6 +339,7 @@ class AdaptiveThermostatConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         # Pre-populate form with current values
         current_data = config_entry.data
         schema_dict = {}
+        
         for key_obj, selector_config in STEP_ZONE_DATA_SCHEMA.schema.items():
             key_str = key_obj.schema if isinstance(key_obj, vol.Marker) else key_obj
             current_value = current_data.get(key_str)
@@ -315,7 +347,10 @@ class AdaptiveThermostatConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             if isinstance(key_obj, vol.Optional):
                 schema_dict[vol.Optional(key_str, description={"suggested_value": current_value or ""})] = selector_config
             else:
-                schema_dict[vol.Required(key_str, default=current_value or key_obj.default)] = selector_config
+                default_value = current_value
+                if default_value is None and hasattr(key_obj, 'default') and key_obj.default is not vol.UNDEFINED:
+                    default_value = key_obj.default() if callable(key_obj.default) else key_obj.default
+                schema_dict[vol.Required(key_str, default=default_value)] = selector_config
         
         return self.async_show_form(
             step_id="reconfigure_zone_setup",
@@ -342,12 +377,16 @@ class AdaptiveThermostatConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                 _LOGGER.exception("Unexpected exception in reconfigure timing setup")
                 errors["base"] = "unknown"
 
-        # Pre-populate form with current values
+        # Pre-populate form with current values or defaults
         current_data = config_entry.data
         schema_dict = {}
         for key_obj, selector_config in STEP_TIMING_SCHEMA.schema.items():
             key_str = key_obj.schema if isinstance(key_obj, vol.Marker) else key_obj
-            current_value = current_data.get(key_str, key_obj.default if hasattr(key_obj, 'default') else None)
+            current_value = current_data.get(key_str)
+            
+            # Use current value or fall back to schema default
+            if current_value is None and hasattr(key_obj, 'default') and key_obj.default is not vol.UNDEFINED:
+                current_value = key_obj.default() if callable(key_obj.default) else key_obj.default
             
             schema_dict[vol.Required(key_str, default=current_value)] = selector_config
         
@@ -376,12 +415,16 @@ class AdaptiveThermostatConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                 _LOGGER.exception("Unexpected exception in reconfigure auto on/off setup")
                 errors["base"] = "unknown"
 
-        # Pre-populate form with current values
+        # Pre-populate form with current values or defaults
         current_data = config_entry.data
         schema_dict = {}
         for key_obj, selector_config in STEP_AUTO_ONOFF_SCHEMA.schema.items():
             key_str = key_obj.schema if isinstance(key_obj, vol.Marker) else key_obj
-            current_value = current_data.get(key_str, key_obj.default if hasattr(key_obj, 'default') else None)
+            current_value = current_data.get(key_str)
+            
+            # Use current value or fall back to schema default
+            if current_value is None and hasattr(key_obj, 'default') and key_obj.default is not vol.UNDEFINED:
+                current_value = key_obj.default() if callable(key_obj.default) else key_obj.default
             
             schema_dict[vol.Required(key_str, default=current_value)] = selector_config
         
@@ -415,12 +458,16 @@ class AdaptiveThermostatConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                 _LOGGER.exception("Unexpected exception in reconfigure presets setup")
                 errors["base"] = "unknown"
 
-        # Pre-populate form with current values
+        # Pre-populate form with current values or defaults
         current_data = config_entry.data
         schema_dict = {}
         for key_obj, selector_config in STEP_PRESETS_SCHEMA.schema.items():
             key_str = key_obj.schema if isinstance(key_obj, vol.Marker) else key_obj
-            current_value = current_data.get(key_str, key_obj.default if hasattr(key_obj, 'default') else None)
+            current_value = current_data.get(key_str)
+            
+            # Use current value or fall back to schema default
+            if current_value is None and hasattr(key_obj, 'default') and key_obj.default is not vol.UNDEFINED:
+                current_value = key_obj.default() if callable(key_obj.default) else key_obj.default
             
             schema_dict[vol.Required(key_str, default=current_value)] = selector_config
         

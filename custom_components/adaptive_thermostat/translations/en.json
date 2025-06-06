@@ -66,9 +66,16 @@
           "away_preset": "Away Temperature Preset (°C)"
         }
       },
+      "reconfigure_name_setup": {
+        "title": "Step 1/5: Thermostat Name",
+        "description": "Configure the name for this thermostat.",
+        "data": {
+          "name": "Thermostat Name"
+        }
+      },
       "reconfigure_zone_setup": {
-        "title": "Reconfigure Heating Zone",
-        "description": "Update the entities for this heating zone.",
+        "title": "Step 2/5: Heating Zone Configuration",
+        "description": "Configure the entities for this heating zone.",
         "data": {
           "heater": "Zone Heater/Valve (Switch, Input Boolean, Climate, or Valve)",
           "central_heater": "Central System Heater (Optional - for zones using central heating)",
@@ -81,16 +88,16 @@
         }
       },
       "reconfigure_timing_setup": {
-        "title": "Reconfigure Central Heater Timing",
-        "description": "Update the timing delays for central heater coordination.",
+        "title": "Step 3/5: Central Heater Timing",
+        "description": "Configure the timing delays for central heater coordination. These settings help protect your heating system.",
         "data": {
           "central_heater_turn_on_delay": "Turn On Delay (seconds after valve opens)",
           "central_heater_turn_off_delay": "Turn Off Delay (seconds to wait before closing valve)"
         }
       },
       "reconfigure_auto_onoff_setup": {
-        "title": "Reconfigure Automatic On/Off",
-        "description": "Update automatic thermostat control settings based on outdoor temperature.",
+        "title": "Step 4/5: Automatic On/Off",
+        "description": "Configure automatic thermostat control based on outdoor temperature. Manual overrides from the thermostat card are always allowed.",
         "data": {
           "auto_on_off_enabled": "Enable Automatic On/Off",
           "auto_on_temp": "Auto Turn On Temperature (when outdoor temp falls below)",
@@ -98,8 +105,8 @@
         }
       },
       "reconfigure_presets_setup": {
-        "title": "Reconfigure Temperature Presets",
-        "description": "Update the temperature presets for different scenarios.",
+        "title": "Step 5/5: Temperature Presets",
+        "description": "Configure the temperature presets for different scenarios.",
         "data": {
           "home_preset": "Home Temperature Preset (°C)",
           "sleep_preset": "Sleep Temperature Preset (°C)",
@@ -112,8 +119,11 @@
       "invalid_auth": "[%key:common::config_flow::error::invalid_auth%]",
       "unknown": "[%key:common::config_flow::error::unknown%]",
       "name_exists": "This name is already in use. Please choose a unique name.",
-      "invalid_input": "Invalid input provided. Please check your entries and try again.",
-      "unknown_config_type": "Unknown configuration type selected. Please choose a valid option."
+      "invalid_input": "Invalid input provided.",
+      "unknown_config_type": "Unknown configuration type.",
+      "invalid_option_input": "Invalid option input provided.",
+      "unknown_options_error": "Unknown error occurred while saving options.",
+      "invalid_selection": "Invalid selection made."
     },
     "abort": {
       "already_configured": "[%key:common::config_flow::abort::already_configured_device%]",
