@@ -121,8 +121,6 @@
       "name_exists": "This name is already in use. Please choose a unique name.",
       "invalid_input": "Invalid input provided.",
       "unknown_config_type": "Unknown configuration type.",
-      "invalid_option_input": "Invalid option input provided.",
-      "unknown_options_error": "Unknown error occurred while saving options.",
       "invalid_selection": "Invalid selection made."
     },
     "abort": {

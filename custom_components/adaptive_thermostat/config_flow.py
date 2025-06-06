@@ -133,6 +133,13 @@ class AdaptiveThermostatConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         """Initialize the config flow."""
         self._config_data = {}
 
+    @staticmethod
+    @callback
+    def async_get_options_flow(config_entry: config_entries.ConfigEntry) -> config_entries.OptionsFlow:
+        """Get the options flow for this handler."""
+        # Disable options flow - use reconfigure instead
+        return None
+
     async def async_step_user(self, user_input: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         """Handle the initial step where the user enters the zone name."""
         errors: Dict[str, str] = {}
@@ -270,8 +277,12 @@ class AdaptiveThermostatConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         """Handle reconfiguration of the integration."""
         config_entry = self._get_reconfigure_entry()
         
+        _LOGGER.info(f"[RECONFIGURE] Starting full reconfiguration for {config_entry.title}")
+        
         # Initialize with current config data for reconfiguration
         self._config_data = dict(config_entry.data)
+        
+        _LOGGER.debug(f"[RECONFIGURE] Current config data: {self._config_data}")
         
         # Always start with name setup for full reconfiguration
         return await self.async_step_reconfigure_name_setup()
@@ -281,11 +292,15 @@ class AdaptiveThermostatConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         config_entry = self._get_reconfigure_entry()
         errors: Dict[str, str] = {}
         
+        _LOGGER.info(f"[RECONFIGURE] Name setup step for {config_entry.title}")
+        
         if user_input is not None:
+            _LOGGER.debug(f"[RECONFIGURE] Name setup received input: {user_input}")
             try:
                 validated_input = _validate_input(user_input, STEP_USER_DATA_SCHEMA)
                 self._config_data.update(validated_input)
                 
+                _LOGGER.info(f"[RECONFIGURE] Name updated, proceeding to zone setup")
                 # Always continue to zone setup
                 return await self.async_step_reconfigure_zone_setup()
                 
@@ -301,6 +316,8 @@ class AdaptiveThermostatConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         # Create simple schema with current name
         current_data = config_entry.data
         current_name = current_data.get(CONF_NAME, config_entry.title)
+        
+        _LOGGER.debug(f"[RECONFIGURE] Showing name form with current name: {current_name}")
         
         schema_dict = {vol.Required(CONF_NAME, default=current_name): str}
 
@@ -474,130 +491,6 @@ class AdaptiveThermostatConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         return self.async_show_form(
             step_id="reconfigure_presets_setup",
             data_schema=vol.Schema(schema_dict),
-            errors=errors,
-        )
-
-    @staticmethod
-    @callback
-    def async_get_options_flow(config_entry: config_entries.ConfigEntry) -> config_entries.OptionsFlow:
-        """Get the options flow for this handler."""
-        return AdaptiveThermostatOptionsFlow(config_entry)
-
-
-class AdaptiveThermostatOptionsFlow(config_entries.OptionsFlow):
-    """Handle an options flow for Adaptive Thermostat."""
-
-    def __init__(self, config_entry: config_entries.ConfigEntry):
-        """Initialize options flow."""
-        # self.config_entry is automatically set by the base class - no need to set it explicitly 
-        self.current_options = dict(config_entry.options)
-        self.initial_data = dict(config_entry.data)
-
-    def _get_options_schema(self) -> vol.Schema:
-        """Return the options schema with suggested values."""
-        options_schema_dict = {}
-
-        zone_fields = {
-            vol.Required(CONF_HEATER): selector.EntitySelector(
-                selector.EntitySelectorConfig(domain=["switch", "input_boolean", "climate", "valve"])
-            ),
-            vol.Optional(CONF_CENTRAL_HEATER): selector.EntitySelector(
-                selector.EntitySelectorConfig(domain=["switch", "input_boolean", "climate"])
-            ),
-            vol.Required(CONF_TEMP_SENSOR): selector.EntitySelector(
-                selector.EntitySelectorConfig(domain=["sensor"], device_class="temperature")
-            ),
-            vol.Required(CONF_OUTDOOR_SENSOR): selector.EntitySelector(
-                selector.EntitySelectorConfig(domain=["sensor"], device_class="temperature")
-            ),
-            vol.Optional(CONF_BACKUP_OUTDOOR_SENSOR): selector.EntitySelector(
-                selector.EntitySelectorConfig(domain=["sensor"], device_class="temperature", multiple=False)
-            ),
-            vol.Optional(CONF_HUMIDITY_SENSOR): selector.EntitySelector(
-                selector.EntitySelectorConfig(domain=["sensor"], device_class="humidity", multiple=False)
-            ),
-            vol.Optional(CONF_DOOR_WINDOW_SENSOR): selector.EntitySelector(
-                selector.EntitySelectorConfig(domain=["binary_sensor"], device_class=["door", "window"], multiple=False)
-            ),
-            vol.Optional(CONF_MOTION_SENSOR): selector.EntitySelector(
-                selector.EntitySelectorConfig(domain=["binary_sensor"], device_class="motion", multiple=False)
-            ),
-            vol.Required(CONF_HOME_PRESET, default=DEFAULT_HOME_PRESET): selector.NumberSelector(
-                selector.NumberSelectorConfig(min=10, max=30, step=0.1, mode="box")
-            ),
-            vol.Required(CONF_SLEEP_PRESET, default=DEFAULT_SLEEP_PRESET): selector.NumberSelector(
-                selector.NumberSelectorConfig(min=10, max=30, step=0.1, mode="box")
-            ),
-            vol.Required(CONF_AWAY_PRESET, default=DEFAULT_AWAY_PRESET): selector.NumberSelector(
-                selector.NumberSelectorConfig(min=10, max=30, step=0.1, mode="box")
-            ),
-        }
-
-        for key_obj, selector_config in zone_fields.items():
-            key_str = key_obj.schema if isinstance(key_obj, vol.Marker) else key_obj
-            
-            current_value = self.current_options.get(key_str, self.initial_data.get(key_str))
-            
-            # Handle default values properly, checking for vol.UNDEFINED
-            if current_value is None and hasattr(key_obj, 'default') and key_obj.default is not vol.UNDEFINED:
-                default_val = key_obj.default
-                current_value = default_val() if callable(default_val) else default_val
-
-            if isinstance(key_obj, vol.Optional):
-                options_schema_dict[vol.Optional(key_str, description={"suggested_value": current_value if current_value is not None else ""})] = selector_config
-            else: # vol.Required
-                # For required fields, use the current value or the default from the key_obj
-                default_value = current_value
-                if default_value is None and hasattr(key_obj, 'default') and key_obj.default is not vol.UNDEFINED:
-                    default_value = key_obj.default() if callable(key_obj.default) else key_obj.default
-                options_schema_dict[vol.Required(key_str, default=default_value)] = selector_config
-        
-        return vol.Schema(options_schema_dict)
-
-    async def async_step_init(self, user_input: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-        """Manage the options."""
-        errors: Dict[str, str] = {}
-
-        if user_input is not None:
-            try:
-                current_schema = self._get_options_schema()
-                processed_input = current_schema(user_input) # Validate types and apply defaults from schema
-                
-                # Start with a clean slate for options
-                updated_options = {}
-
-                for key, value in processed_input.items():
-                    is_optional_field = False
-                    for schema_key_obj in current_schema.schema:
-                        schema_key_str = schema_key_obj.schema if isinstance(schema_key_obj, vol.Marker) else schema_key_obj
-                        if schema_key_str == key and isinstance(schema_key_obj, vol.Optional):
-                            is_optional_field = True
-                            break
-                    
-                    # For optional fields, only add to options if they have a meaningful value
-                    if is_optional_field:
-                        if value is not None and value != "" and value != "None":
-                            updated_options[key] = value
-                        # If value is None, empty string, or "None", don't add it (effectively clears it)
-                    else:
-                        # For required fields, always add the value
-                        updated_options[key] = value
-                
-                _LOGGER.debug(f"Options Flow: Updating entry with new options: {updated_options}")
-                return self.async_create_entry(title="", data=updated_options)
-            except vol.MultipleInvalid as e:
-                _LOGGER.error(f"Validation error in options step: {e}")
-                for error_detail in e.errors:
-                    path = error_detail.path[0] if error_detail.path else "base"
-                    errors[path if isinstance(path, str) else "base"] = "invalid_option_input"
-            except Exception as e: # pylint: disable=broad-except
-                _LOGGER.exception("Unexpected error in options saving")
-                errors["base"] = "unknown_options_error"
-
-        options_schema = self._get_options_schema()
-        return self.async_show_form(
-            step_id="init",
-            data_schema=options_schema,
             errors=errors,
         )
 
