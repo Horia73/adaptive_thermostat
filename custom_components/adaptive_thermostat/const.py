@@ -3,7 +3,7 @@
 DOMAIN = "adaptive_thermostat"
 
 # Platforms to set up
-PLATFORMS = ["climate", "sensor"]
+PLATFORMS = ["climate"]
 
 # Configuration Keys
 CONF_HEATER = "heater"

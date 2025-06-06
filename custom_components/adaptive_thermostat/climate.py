@@ -2,6 +2,7 @@
 
 import asyncio
 import logging
+import re
 from typing import Any, Dict, List
 
 from homeassistant.components.climate import ( # type: ignore
@@ -93,6 +94,10 @@ class AdaptiveThermostat(ClimateEntity):
         self._attr_name = config.get(CONF_NAME, DEFAULT_NAME)
         self._heater_entity_id = config.get(CONF_HEATER)
         self._temp_sensor_entity_id = config.get(CONF_TEMP_SENSOR)
+
+        # CRITICAL: Log zone initialization for debugging
+        _LOGGER.info("[%s] *** INITIALIZING ZONE '%s' ***", self._entry_id, self._attr_name)
+        _LOGGER.info("[%s] *** UNIQUE ID: %s ***", self._entry_id, self._attr_unique_id)
 
         # Handle multiple heaters - convert single heater to list format
         heater_config = config.get(CONF_HEATER)
@@ -194,7 +199,14 @@ class AdaptiveThermostat(ClimateEntity):
     async def async_added_to_hass(self) -> None:
         """Run when entity about to be added."""
         await super().async_added_to_hass()
-        _LOGGER.debug("[%s] Entity added to HASS", self._entry_id)
+        _LOGGER.info("[%s] *** ZONE '%s' STARTING UP - IMMEDIATE DATA SEND ***", self._entry_id, self._attr_name)
+
+        # CRITICAL: Load all sensor data immediately for card
+        await self.async_update()
+        
+        # CRITICAL: Write state immediately so card gets data on reload
+        self.async_write_ha_state()
+        _LOGGER.info("[%s] *** IMMEDIATE STATE WRITTEN FOR CARD ***", self._entry_id)
 
         # Register state change listeners
         entities_to_track = []
@@ -202,15 +214,13 @@ class AdaptiveThermostat(ClimateEntity):
             entities_to_track.append(self._temp_sensor_entity_id)
         if self._humidity_sensor_entity_id:
             entities_to_track.append(self._humidity_sensor_entity_id)
-        if self._heater_entity_id:
-             entities_to_track.append(self._heater_entity_id)
-
+        
         # Add all heater entities to tracking
         for heater_id in self._heater_entity_ids:
             if heater_id and heater_id not in entities_to_track:
                 entities_to_track.append(heater_id)
 
-        # Add outdoor sensors to tracking for auto on/off and card updates
+        # Add all optional sensors to tracking
         if self._outdoor_sensor_entity_id:
             entities_to_track.append(self._outdoor_sensor_entity_id)
         if self._backup_outdoor_sensor_entity_id:
@@ -224,18 +234,13 @@ class AdaptiveThermostat(ClimateEntity):
             self._remove_listener = async_track_state_change_event(
                 self.hass, entities_to_track, self._async_state_changed
             )
-            _LOGGER.debug("[%s] Registered state listener for: %s", self._entry_id, entities_to_track)
+            _LOGGER.info("[%s] Tracking %d entities for zone '%s': %s", 
+                        self._entry_id, len(entities_to_track), self._attr_name, entities_to_track)
         else:
             _LOGGER.warning("[%s] No valid sensors/heater configured for state tracking.", self._entry_id)
 
-        # Get initial state by scheduling first update
+        # Schedule periodic updates to ensure card stays current
         self.async_schedule_update_ha_state(True)
-
-        # Ensure initial sensor data is loaded immediately
-        await self.async_update()
-        
-        # Force initial state write to ensure card gets data immediately
-        self.async_write_ha_state()
 
     async def async_will_remove_from_hass(self) -> None:
         """Run when entity will be removed from hass."""
@@ -483,6 +488,11 @@ class AdaptiveThermostat(ClimateEntity):
         
         # Update extra state attributes with all current data
         self._attr_extra_state_attributes.update({
+            # ZONE IDENTIFICATION (CRITICAL for card uniqueness)
+            "zone_name": self._attr_name,
+            "zone_id": self._entry_id,
+            "zone_unique_id": self._attr_unique_id,
+            
             # Sensor entity IDs (for card compatibility)
             "heater_entity_id": self._heater_entity_id,
             "heater_entity_ids": self._heater_entity_ids,
@@ -499,34 +509,34 @@ class AdaptiveThermostat(ClimateEntity):
             "current_preset_mode": self._current_preset,
             "preset_temperatures": self._presets,
             
-            # Current sensor readings (for card display)
+            # Current sensor readings (INDIVIDUAL per zone)
             "current_outdoor_temp": outdoor_temp,
             "current_backup_outdoor_temp": backup_outdoor_temp,
             "current_motion_active": motion_active,
             "current_door_window_open": door_window_open,
             
-            # HVAC information
+            # HVAC information (INDIVIDUAL per zone)
             "hvac_modes": [mode.value for mode in self._attr_hvac_modes],
             "current_hvac_mode": self._hvac_mode.value,
             "hvac_action": self.hvac_action.value if self.hvac_action else "unknown",
             
-            # Temperature information
+            # Temperature information (INDIVIDUAL per zone)
             "current_temperature": self._current_temperature,
             "target_temperature": self._target_temperature,
             "current_humidity": self._current_humidity,
             
-            # Heater information
+            # Heater information (INDIVIDUAL per zone)
             "heater_states": heater_states,
             "central_heater_state": central_heater_state,
             "zone_heater_on": self._zone_heater_on,
             
-            # Auto control status
+            # Auto control status (INDIVIDUAL per zone)
             "auto_on_off_enabled": self._auto_on_off_enabled,
             "auto_on_temp": self._auto_on_temp,
             "auto_off_temp": self._auto_off_temp,
             "manual_override": self._manual_override,
             
-            # Temperature thresholds and timing
+            # Temperature thresholds and timing (INDIVIDUAL per zone)
             "central_heater_turn_on_delay": self._central_heater_turn_on_delay,
             "central_heater_turn_off_delay": self._central_heater_turn_off_delay,
             
@@ -537,6 +547,15 @@ class AdaptiveThermostat(ClimateEntity):
         
         _LOGGER.debug("[%s] Updated sensor attributes for card - Preset modes: %s, Current preset: %s, HVAC mode: %s", 
                      self._entry_id, list(self._presets.keys()), self._current_preset, self._hvac_mode.value)
+
+        _LOGGER.info("[%s] *** ZONE '%s' SENSOR UPDATE ***", self._entry_id, self._attr_name)
+        _LOGGER.info("[%s] - Temp Sensor: %s = %s°C", self._entry_id, self._temp_sensor_entity_id, self._current_temperature)
+        _LOGGER.info("[%s] - Outdoor Sensor: %s = %s°C", self._entry_id, self._outdoor_sensor_entity_id, outdoor_temp)
+        _LOGGER.info("[%s] - Humidity Sensor: %s = %s%%", self._entry_id, self._humidity_sensor_entity_id, self._current_humidity)
+        _LOGGER.info("[%s] - Motion Sensor: %s = %s", self._entry_id, self._motion_sensor_entity_id, motion_active)
+        _LOGGER.info("[%s] - Door/Window Sensor: %s = %s", self._entry_id, self._door_window_sensor_entity_id, door_window_open)
+        _LOGGER.info("[%s] *** ZONE '%s' SENDING TO CARD: Entity ID %s ***", 
+                     self._entry_id, self._attr_name, getattr(self, 'entity_id', 'UNKNOWN'))
 
     async def _async_handle_auto_onoff(self) -> None:
         """Handle automatic on/off based on outdoor temperature."""
