@@ -269,6 +269,16 @@ class AdaptiveThermostatConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
     async def async_step_reconfigure(self, user_input: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         """Handle reconfiguration of the integration."""
         config_entry = self._get_reconfigure_entry()
+        
+        # Initialize with current config data for reconfiguration
+        self._config_data = dict(config_entry.data)
+        
+        # Start with the zone setup step (skip name since it's in the title)
+        return await self.async_step_reconfigure_zone_setup()
+
+    async def async_step_reconfigure_zone_setup(self, user_input: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        """Handle reconfiguration of zone setup."""
+        config_entry = self._get_reconfigure_entry()
         errors: Dict[str, str] = {}
         
         if user_input is not None:
@@ -278,19 +288,21 @@ class AdaptiveThermostatConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                 self._abort_if_unique_id_mismatch()
                 
                 validated_input = _validate_input(user_input, STEP_ZONE_DATA_SCHEMA)
-                updated_data = {**config_entry.data, **validated_input}
+                self._config_data.update(validated_input)
                 
-                return self.async_update_reload_and_abort(
-                    config_entry,
-                    data_updates=updated_data,
-                )
+                # Check if central heater is configured to determine next step
+                if self._config_data.get(CONF_CENTRAL_HEATER):
+                    return await self.async_step_reconfigure_timing_setup()
+                else:
+                    return await self.async_step_reconfigure_auto_onoff_setup()
+                
             except vol.MultipleInvalid as e:
-                _LOGGER.error(f"Validation error in reconfigure: {e}")
+                _LOGGER.error(f"Validation error in reconfigure zone setup: {e}")
                 for error in e.errors:
                     path = error.path[0] if error.path else "base"
                     errors[path if isinstance(path, str) else "base"] = "invalid_input"
             except Exception: # pylint: disable=broad-except
-                _LOGGER.exception("Unexpected exception in reconfigure")
+                _LOGGER.exception("Unexpected exception in reconfigure zone setup")
                 errors["base"] = "unknown"
 
         # Pre-populate form with current values
@@ -306,7 +318,114 @@ class AdaptiveThermostatConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                 schema_dict[vol.Required(key_str, default=current_value or key_obj.default)] = selector_config
         
         return self.async_show_form(
-            step_id="reconfigure_zone",
+            step_id="reconfigure_zone_setup",
+            data_schema=vol.Schema(schema_dict),
+            errors=errors,
+        )
+
+    async def async_step_reconfigure_timing_setup(self, user_input: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        """Handle reconfiguration of central heater timing."""
+        config_entry = self._get_reconfigure_entry()
+        errors: Dict[str, str] = {}
+        
+        if user_input is not None:
+            try:
+                validated_input = _validate_input(user_input, STEP_TIMING_SCHEMA)
+                self._config_data.update(validated_input)
+                return await self.async_step_reconfigure_auto_onoff_setup()
+            except vol.MultipleInvalid as e:
+                _LOGGER.error(f"Validation error in reconfigure timing setup: {e}")
+                for error in e.errors:
+                    path = error.path[0] if error.path else "base"
+                    errors[path if isinstance(path, str) else "base"] = "invalid_input"
+            except Exception: # pylint: disable=broad-except
+                _LOGGER.exception("Unexpected exception in reconfigure timing setup")
+                errors["base"] = "unknown"
+
+        # Pre-populate form with current values
+        current_data = config_entry.data
+        schema_dict = {}
+        for key_obj, selector_config in STEP_TIMING_SCHEMA.schema.items():
+            key_str = key_obj.schema if isinstance(key_obj, vol.Marker) else key_obj
+            current_value = current_data.get(key_str, key_obj.default if hasattr(key_obj, 'default') else None)
+            
+            schema_dict[vol.Required(key_str, default=current_value)] = selector_config
+        
+        return self.async_show_form(
+            step_id="reconfigure_timing_setup",
+            data_schema=vol.Schema(schema_dict),
+            errors=errors,
+        )
+
+    async def async_step_reconfigure_auto_onoff_setup(self, user_input: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        """Handle reconfiguration of auto on/off settings."""
+        config_entry = self._get_reconfigure_entry()
+        errors: Dict[str, str] = {}
+        
+        if user_input is not None:
+            try:
+                validated_input = _validate_input(user_input, STEP_AUTO_ONOFF_SCHEMA)
+                self._config_data.update(validated_input)
+                return await self.async_step_reconfigure_presets_setup()
+            except vol.MultipleInvalid as e:
+                _LOGGER.error(f"Validation error in reconfigure auto on/off setup: {e}")
+                for error in e.errors:
+                    path = error.path[0] if error.path else "base"
+                    errors[path if isinstance(path, str) else "base"] = "invalid_input"
+            except Exception: # pylint: disable=broad-except
+                _LOGGER.exception("Unexpected exception in reconfigure auto on/off setup")
+                errors["base"] = "unknown"
+
+        # Pre-populate form with current values
+        current_data = config_entry.data
+        schema_dict = {}
+        for key_obj, selector_config in STEP_AUTO_ONOFF_SCHEMA.schema.items():
+            key_str = key_obj.schema if isinstance(key_obj, vol.Marker) else key_obj
+            current_value = current_data.get(key_str, key_obj.default if hasattr(key_obj, 'default') else None)
+            
+            schema_dict[vol.Required(key_str, default=current_value)] = selector_config
+        
+        return self.async_show_form(
+            step_id="reconfigure_auto_onoff_setup",
+            data_schema=vol.Schema(schema_dict),
+            errors=errors,
+        )
+
+    async def async_step_reconfigure_presets_setup(self, user_input: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        """Handle reconfiguration of temperature presets."""
+        config_entry = self._get_reconfigure_entry()
+        errors: Dict[str, str] = {}
+        
+        if user_input is not None:
+            try:
+                validated_input = _validate_input(user_input, STEP_PRESETS_SCHEMA)
+                self._config_data.update(validated_input)
+                
+                # Complete reconfiguration
+                return self.async_update_reload_and_abort(
+                    config_entry,
+                    data_updates=self._config_data,
+                )
+            except vol.MultipleInvalid as e:
+                _LOGGER.error(f"Validation error in reconfigure presets setup: {e}")
+                for error in e.errors:
+                    path = error.path[0] if error.path else "base"
+                    errors[path if isinstance(path, str) else "base"] = "invalid_input"
+            except Exception: # pylint: disable=broad-except
+                _LOGGER.exception("Unexpected exception in reconfigure presets setup")
+                errors["base"] = "unknown"
+
+        # Pre-populate form with current values
+        current_data = config_entry.data
+        schema_dict = {}
+        for key_obj, selector_config in STEP_PRESETS_SCHEMA.schema.items():
+            key_str = key_obj.schema if isinstance(key_obj, vol.Marker) else key_obj
+            current_value = current_data.get(key_str, key_obj.default if hasattr(key_obj, 'default') else None)
+            
+            schema_dict[vol.Required(key_str, default=current_value)] = selector_config
+        
+        return self.async_show_form(
+            step_id="reconfigure_presets_setup",
             data_schema=vol.Schema(schema_dict),
             errors=errors,
         )

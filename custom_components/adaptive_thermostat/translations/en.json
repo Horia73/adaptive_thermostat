@@ -65,7 +65,47 @@
           "sleep_preset": "Sleep Temperature Preset (°C)",
           "away_preset": "Away Temperature Preset (°C)"
         }
-              }
+      },
+      "reconfigure_zone_setup": {
+        "title": "Reconfigure Heating Zone",
+        "description": "Update the entities for this heating zone.",
+        "data": {
+          "heater": "Zone Heater/Valve (Switch, Input Boolean, Climate, or Valve)",
+          "central_heater": "Central System Heater (Optional - for zones using central heating)",
+          "temp_sensor": "Internal Temperature Sensor",
+          "outdoor_sensor": "Outdoor Temperature Sensor / Weather Integration (Mandatory)",
+          "backup_outdoor_sensor": "Backup Outdoor Sensor (Optional)",
+          "humidity_sensor": "Humidity Sensor (Optional)",
+          "door_window_sensor": "Door/Window Sensor(s) (Optional)",
+          "motion_sensor": "Motion Sensor (Optional)"
+        }
+      },
+      "reconfigure_timing_setup": {
+        "title": "Reconfigure Central Heater Timing",
+        "description": "Update the timing delays for central heater coordination.",
+        "data": {
+          "central_heater_turn_on_delay": "Turn On Delay (seconds after valve opens)",
+          "central_heater_turn_off_delay": "Turn Off Delay (seconds to wait before closing valve)"
+        }
+      },
+      "reconfigure_auto_onoff_setup": {
+        "title": "Reconfigure Automatic On/Off",
+        "description": "Update automatic thermostat control settings based on outdoor temperature.",
+        "data": {
+          "auto_on_off_enabled": "Enable Automatic On/Off",
+          "auto_on_temp": "Auto Turn On Temperature (when outdoor temp falls below)",
+          "auto_off_temp": "Auto Turn Off Temperature (when outdoor temp rises above)"
+        }
+      },
+      "reconfigure_presets_setup": {
+        "title": "Reconfigure Temperature Presets",
+        "description": "Update the temperature presets for different scenarios.",
+        "data": {
+          "home_preset": "Home Temperature Preset (°C)",
+          "sleep_preset": "Sleep Temperature Preset (°C)",
+          "away_preset": "Away Temperature Preset (°C)"
+        }
+      }
     },
     "error": {
       "cannot_connect": "[%key:common::config_flow::error::cannot_connect%]",
@@ -75,11 +115,11 @@
       "invalid_input": "Invalid input provided. Please check your entries and try again.",
       "unknown_config_type": "Unknown configuration type selected. Please choose a valid option."
     },
-          "abort": {
-        "already_configured": "[%key:common::config_flow::abort::already_configured_device%]",
-        "reauth_successful": "[%key:common::config_flow::abort::reauth_successful%]"
-      }
-    },
+    "abort": {
+      "already_configured": "[%key:common::config_flow::abort::already_configured_device%]",
+      "reauth_successful": "[%key:common::config_flow::abort::reauth_successful%]"
+    }
+  },
   "options": {
     "step": {
       "init": {
@@ -101,9 +141,9 @@
       }
     },
     "error": {
-        "unknown": "An unknown error occurred while saving options.",
-        "invalid_option_input": "Invalid input provided in options. Please check your entries and try again.",
-        "unknown_options_error": "An unexpected error occurred while saving options. Please try again."
+      "unknown": "An unknown error occurred while saving options.",
+      "invalid_option_input": "Invalid input provided in options. Please check your entries and try again.",
+      "unknown_options_error": "An unexpected error occurred while saving options. Please try again."
     }
   }
 }
