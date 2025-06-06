@@ -336,8 +336,14 @@ class AdaptiveThermostatConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                 validated_input = _validate_input(user_input, STEP_ZONE_DATA_SCHEMA)
                 self._config_data.update(validated_input)
                 
-                # Always continue to timing setup
-                return await self.async_step_reconfigure_timing_setup()
+                # Check if central heater is configured to determine next step
+                central_heater = self._config_data.get(CONF_CENTRAL_HEATER)
+                if central_heater and central_heater.strip():  # Only if central heater is actually selected
+                    _LOGGER.debug(f"[RECONFIGURE] Central heater configured: {central_heater}, showing timing setup")
+                    return await self.async_step_reconfigure_timing_setup()
+                else:
+                    _LOGGER.debug("[RECONFIGURE] No central heater configured, skipping timing setup")
+                    return await self.async_step_reconfigure_auto_onoff_setup()
                 
             except vol.MultipleInvalid as e:
                 _LOGGER.error(f"Validation error in reconfigure zone setup: {e}")
