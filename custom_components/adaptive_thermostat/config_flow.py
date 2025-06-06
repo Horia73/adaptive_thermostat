@@ -47,7 +47,7 @@ STEP_USER_DATA_SCHEMA = vol.Schema(
 STEP_ZONE_DATA_SCHEMA = vol.Schema(
     {
         vol.Required(CONF_HEATER): selector.EntitySelector(
-            selector.EntitySelectorConfig(domain=["switch", "input_boolean", "climate", "valve"])
+            selector.EntitySelectorConfig(domain=["switch", "input_boolean", "climate", "valve"], multiple=True)
         ),
         vol.Optional(CONF_CENTRAL_HEATER): selector.EntitySelector(
             selector.EntitySelectorConfig(domain=["switch", "input_boolean", "climate"])
@@ -169,9 +169,12 @@ class AdaptiveThermostatConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                 self._config_data.update(validated_input)
                 
                 # Check if central heater is configured to determine next step
-                if self._config_data.get(CONF_CENTRAL_HEATER):
+                central_heater = self._config_data.get(CONF_CENTRAL_HEATER)
+                if central_heater and central_heater.strip():  # Only if central heater is actually selected
+                    _LOGGER.debug(f"Central heater configured: {central_heater}, showing timing setup")
                     return await self.async_step_timing_setup()
                 else:
+                    _LOGGER.debug("No central heater configured, skipping timing setup")
                     return await self.async_step_auto_onoff_setup()
                 
             except vol.MultipleInvalid as e:
