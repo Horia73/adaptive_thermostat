@@ -1,73 +1,85 @@
 {
+  "title": "Adaptive Thermostat",
   "config": {
     "step": {
       "user": {
-        "title": "Configure Adaptive Thermostat",
+        "title": "Adaptive Thermostat: Initial Setup",
+        "description": "Choose a name for this thermostat instance and select its operational mode.",
         "data": {
           "name": "Name",
-          "heater": "Heater Entity (switch or input_boolean)",
-          "temp_sensor": "Temperature Sensor",
-          "humidity_sensor": "Humidity Sensor (optional)",
-          "door_window_sensor": "Door/Window Sensor (optional)",
-          "motion_sensor": "Motion Sensor (optional)",
-          "outdoor_sensor": "Outdoor Temperature Sensor (optional)",
-          "weather_sensor": "Weather Entity (required if outdoor sensor not available)",
-          "outside_temp_off": "Outside Temperature Shutoff Threshold",
-          "sleep_preset": "Sleep Mode Temperature",
-          "home_preset": "Home Mode Temperature",
-          "away_preset": "Away Mode Temperature"
+          "config_type": "Configuration Type"
         },
-        "description": "Set up your Adaptive Thermostat with smart temperature control based on indoor and outdoor conditions."
+        "data_description": {
+            "config_type": "Select 'Individual Zone' if this thermostat controls a specific heater/valve for a room. Select 'Central Heater' if this thermostat manages a central heating system."
+        }
+      },
+      "individual_zone_setup": {
+        "title": "Configure Individual Zone",
+        "description": "Set up the entities and temperature presets for this individual heating zone.",
+        "data": {
+          "heater": "Heater Entity (Switch, Input Boolean, or Climate)",
+          "temp_sensor": "Internal Temperature Sensor",
+          "outdoor_sensor": "Outdoor Temperature Sensor / Weather Integration (Mandatory)",
+          "backup_outdoor_sensor": "Backup Outdoor Sensor (Optional)",
+          "humidity_sensor": "Humidity Sensor (Optional)",
+          "door_window_sensor": "Door/Window Sensor(s) (Optional)",
+          "motion_sensor": "Motion Sensor (Optional)",
+          "weather_sensor": "Weather Entity (Optional, for additional weather data like cloudiness, wind)",
+          "home_preset": "Home Temperature Preset (°C)",
+          "sleep_preset": "Sleep Temperature Preset (°C)",
+          "away_preset": "Away Temperature Preset (°C)"
+        }
+      },
+      "central_heater_setup": {
+        "title": "Configure Central Heater",
+        "description": "Set up the main heater entity and temperature presets for the central heating system.",
+        "data": {
+          "heater": "Central Heater Entity (Climate, Switch, or Input Boolean)",
+          "home_preset": "Home Temperature Preset (°C)",
+          "sleep_preset": "Sleep Temperature Preset (°C)",
+          "away_preset": "Away Temperature Preset (°C)"
+        }
       }
     },
     "error": {
-      "missing_heater": "You must select a heater entity (switch or input_boolean)",
-      "missing_temp_sensor": "You must select a temperature sensor",
-      "missing_outdoor_data": "You must provide either an outdoor temperature sensor or a weather entity"
+      "cannot_connect": "[%key:common::config_flow::error::cannot_connect%]",
+      "invalid_auth": "[%key:common::config_flow::error::invalid_auth%]",
+      "unknown": "[%key:common::config_flow::error::unknown%]",
+      "name_exists": "This name is already in use. Please choose a unique name."
     },
     "abort": {
-      "already_configured": "This thermostat is already configured"
+      "already_configured": "[%key:common::config_flow::abort::already_configured_device%]",
+      "reauth_successful": "[%key:common::config_flow::abort::reauth_successful%]"
+    },
+    "select_options": {
+        "config_type": {
+            "individual_zone": "Individual Zone (Heater/Valve)",
+            "central_heater": "Central Heater"
+        }
     }
   },
   "options": {
     "step": {
       "init": {
-        "title": "Edit Adaptive Thermostat",
+        "title": "Adaptive Thermostat Options",
+        "description": "Modify the settings for your Adaptive Thermostat. The 'Configuration Type' cannot be changed after initial setup.",
         "data": {
-          "name": "Name",
-          "heater": "Heater Entity (switch or input_boolean)",
-          "temp_sensor": "Temperature Sensor",
-          "humidity_sensor": "Humidity Sensor (optional)",
-          "door_window_sensor": "Door/Window Sensor (optional)",
-          "motion_sensor": "Motion Sensor (optional)",
-          "outdoor_sensor": "Outdoor Temperature Sensor (optional)",
-          "weather_sensor": "Weather Entity (required if outdoor sensor not available)",
-          "outside_temp_off": "Outside Temperature Shutoff Threshold",
-          "sleep_preset": "Sleep Mode Temperature",
-          "home_preset": "Home Mode Temperature",
-          "away_preset": "Away Mode Temperature"
-        },
-        "description": "Adjust the settings for your Adaptive Thermostat."
+          "heater": "Heater Entity",
+          "temp_sensor": "Internal Temperature Sensor",
+          "outdoor_sensor": "Outdoor Temperature Sensor / Weather Integration",
+          "backup_outdoor_sensor": "Backup Outdoor Sensor (Optional)",
+          "humidity_sensor": "Humidity Sensor (Optional)",
+          "door_window_sensor": "Door/Window Sensor(s) (Optional)",
+          "motion_sensor": "Motion Sensor (Optional)",
+          "weather_sensor": "Weather Entity (Optional)",
+          "home_preset": "Home Temperature Preset (°C)",
+          "sleep_preset": "Sleep Temperature Preset (°C)",
+          "away_preset": "Away Temperature Preset (°C)"
+        }
       }
     },
     "error": {
-      "missing_heater": "You must select a heater entity (switch or input_boolean)",
-      "missing_temp_sensor": "You must select a temperature sensor",
-      "missing_outdoor_data": "You must provide either an outdoor temperature sensor or a weather entity"
+        "unknown": "An unknown error occurred while saving options."
     }
-  },
-  "selector": {
-    "name_desc": "A friendly name for this thermostat",
-    "heater_desc": "The switch or input_boolean entity that controls your heating system",
-    "temp_sensor_desc": "Temperature sensor to measure the current room temperature",
-    "humidity_sensor_desc": "Optional humidity sensor to monitor room humidity",
-    "door_window_sensor_desc": "Optional door/window sensor to detect open windows",
-    "motion_sensor_desc": "Optional motion sensor to detect occupancy",
-    "outdoor_sensor_desc": "Optional outdoor temperature sensor",
-    "weather_sensor_desc": "Weather entity to get outdoor temperature when outdoor sensor is not available",
-    "outside_temp_off_desc": "Outside temperature threshold above which the heater will turn off (energy saving)",
-    "sleep_preset_desc": "Temperature setpoint for sleep mode (°C)",
-    "home_preset_desc": "Temperature setpoint for home mode (°C)",
-    "away_preset_desc": "Temperature setpoint for away mode (°C)"
   }
 }

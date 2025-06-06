@@ -16,6 +16,12 @@ CONF_WEATHER_SENSOR = "weather_sensor"
 CONF_SLEEP_PRESET = "sleep_preset"
 CONF_HOME_PRESET = "home_preset"
 CONF_AWAY_PRESET = "away_preset"
+CONF_BACKUP_OUTDOOR_SENSOR = "backup_outdoor_sensor"
+
+# Configuration Type
+CONF_CONFIG_TYPE = "config_type"
+CONFIG_TYPE_INDIVIDUAL_ZONE = "individual_zone"
+CONFIG_TYPE_CENTRAL_HEATER = "central_heater"
 
 # Default values (optional, can also be handled in config flow)
 DEFAULT_NAME = "Adaptive Thermostat"
