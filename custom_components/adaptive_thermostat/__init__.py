@@ -26,7 +26,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     _LOGGER.info("Setting up Adaptive Thermostat entry %s", entry.entry_id)
 
     # Forward the setup to the climate platform.
-    await hass.config_entries.async_setup_platforms(entry, PLATFORMS)
+    await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
 
     # Listen for options updates.
     entry.async_on_unload(entry.add_update_listener(async_update_options))
