@@ -83,46 +83,84 @@ class AdaptiveThermostat(ClimateEntity):
             return val if val else None
         # --- End Helper ---
 
+        # Configuration type handling
+        self._config_type = config.get(CONF_CONFIG_TYPE, CONFIG_TYPE_INDIVIDUAL_ZONE)
+        _LOGGER.debug("[%s] Configuration type: %s", self._entry_id, self._config_type)
+
         # Required configuration
         self._attr_name = config.get(CONF_NAME, DEFAULT_NAME) # Name from config or default
         self._heater_entity_id = config.get(CONF_HEATER) # Use direct .get() for required
-        self._temp_sensor_entity_id = config.get(CONF_TEMP_SENSOR) # Use direct .get() for required
 
         # Check required fields
         if not self._heater_entity_id:
             _LOGGER.error("[%s] Heater entity ID is missing from configuration", self._entry_id)
-        if not self._temp_sensor_entity_id:
-            _LOGGER.error("[%s] Temperature sensor entity ID is missing from configuration", self._entry_id)
 
-        # --- Use helper for Optional configuration sensors ---
-        self._humidity_sensor_entity_id = get_entity_id(CONF_HUMIDITY_SENSOR)
-        self._door_window_sensor_entity_id = get_entity_id(CONF_DOOR_WINDOW_SENSOR)
-        self._motion_sensor_entity_id = get_entity_id(CONF_MOTION_SENSOR)
-        self._outdoor_sensor_entity_id = get_entity_id(CONF_OUTDOOR_SENSOR)
-        self._backup_outdoor_sensor_entity_id = get_entity_id(CONF_BACKUP_OUTDOOR_SENSOR)
+        # Temperature sensor - required for individual zones, optional for central heater
+        if self._config_type == CONFIG_TYPE_INDIVIDUAL_ZONE:
+            self._temp_sensor_entity_id = config.get(CONF_TEMP_SENSOR) # Required for individual zones
+            if not self._temp_sensor_entity_id:
+                _LOGGER.error("[%s] Temperature sensor entity ID is missing from individual zone configuration", self._entry_id)
+        else:
+            # For central heater, temperature sensor is optional
+            self._temp_sensor_entity_id = get_entity_id(CONF_TEMP_SENSOR)
+            if not self._temp_sensor_entity_id:
+                _LOGGER.info("[%s] No temperature sensor configured for central heater", self._entry_id)
+
+        # --- Use helper for Optional configuration sensors (only for individual zones) ---
+        if self._config_type == CONFIG_TYPE_INDIVIDUAL_ZONE:
+            self._humidity_sensor_entity_id = get_entity_id(CONF_HUMIDITY_SENSOR)
+            self._door_window_sensor_entity_id = get_entity_id(CONF_DOOR_WINDOW_SENSOR)
+            self._motion_sensor_entity_id = get_entity_id(CONF_MOTION_SENSOR)
+            self._outdoor_sensor_entity_id = get_entity_id(CONF_OUTDOOR_SENSOR)
+            self._backup_outdoor_sensor_entity_id = get_entity_id(CONF_BACKUP_OUTDOOR_SENSOR)
+        else:
+            # Central heater doesn't use these sensors
+            self._humidity_sensor_entity_id = None
+            self._door_window_sensor_entity_id = None
+            self._motion_sensor_entity_id = None
+            self._outdoor_sensor_entity_id = None
+            self._backup_outdoor_sensor_entity_id = None
         # --- End Optional Sensor Reading ---
 
-        # Preset temperatures
-        self._presets = {
-            "sleep": config.get(CONF_SLEEP_PRESET, DEFAULT_SLEEP_PRESET),
-            "home": config.get(CONF_HOME_PRESET, DEFAULT_HOME_PRESET),
-            "away": config.get(CONF_AWAY_PRESET, DEFAULT_AWAY_PRESET),
-        }
+        # Preset temperatures - only for individual zones
+        if self._config_type == CONFIG_TYPE_INDIVIDUAL_ZONE:
+            self._presets = {
+                "sleep": config.get(CONF_SLEEP_PRESET, DEFAULT_SLEEP_PRESET),
+                "home": config.get(CONF_HOME_PRESET, DEFAULT_HOME_PRESET),
+                "away": config.get(CONF_AWAY_PRESET, DEFAULT_AWAY_PRESET),
+            }
+        else:
+            # Central heater uses simple on/off without presets
+            self._presets = {}
 
         # Internal state attributes
         self._current_temperature: float | None = None
         self._current_humidity: float | None = None
         self._hvac_mode: HVACMode = HVACMode.OFF
         # _hvac_action is determined by property now, no need to store separately
-        self._target_temperature: float = self._presets["home"] # Default target to home preset
-        self._current_preset: str = "home" # Default preset mode
+        
+        # Target temperature handling
+        if self._config_type == CONFIG_TYPE_INDIVIDUAL_ZONE:
+            self._target_temperature: float = self._presets["home"] # Default target to home preset
+            self._current_preset: str = "home" # Default preset mode
+        else:
+            # Central heater doesn't use target temperature - it's just on/off
+            self._target_temperature: float | None = None
+            self._current_preset: str | None = None
 
         # Climate entity attributes
         self._attr_hvac_modes = [HVACMode.OFF, HVACMode.HEAT]
-        self._attr_preset_modes = list(self._presets.keys())
-        self._attr_supported_features = (
-            ClimateEntityFeature.TARGET_TEMPERATURE | ClimateEntityFeature.PRESET_MODE
-        )
+        
+        if self._config_type == CONFIG_TYPE_INDIVIDUAL_ZONE:
+            self._attr_preset_modes = list(self._presets.keys())
+            self._attr_supported_features = (
+                ClimateEntityFeature.TARGET_TEMPERATURE | ClimateEntityFeature.PRESET_MODE
+            )
+        else:
+            # Central heater only supports on/off
+            self._attr_preset_modes = []
+            self._attr_supported_features = 0  # No additional features for central heater
+            
         self._attr_temperature_unit = self._hass.config.units.temperature_unit
 
         # Extra state attributes for UI card (values are now correctly None if "" was saved)

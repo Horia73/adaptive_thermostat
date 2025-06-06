@@ -4,20 +4,20 @@
     "step": {
       "user": {
         "title": "Adaptive Thermostat: Initial Setup",
-        "description": "Choose a name for this thermostat instance and select its operational mode.",
+        "description": "Choose a name for this thermostat instance and select its operational mode.\n\n**Recommended Setup Order:**\n1. First create a 'Central Heater' to control your main heating system\n2. Then create 'Individual Zones' for each room, using the central heater as the heat source",
         "data": {
           "name": "Name",
           "config_type": "Configuration Type"
         },
         "data_description": {
-            "config_type": "Select 'Individual Zone' if this thermostat controls a specific heater/valve for a room. Select 'Central Heater' if this thermostat manages a central heating system."
+            "config_type": "**Central Heater:** Controls your main heating system (boiler, heat pump, etc.). Create this first.\n\n**Individual Zone:** Controls a specific room/area with its own valve/radiator. Can use a Central Heater as the heat source."
         }
       },
       "individual_zone_setup": {
         "title": "Configure Individual Zone",
-        "description": "Set up the entities and temperature presets for this individual heating zone.",
+        "description": "Set up the entities and temperature presets for this individual heating zone.\n\n**Tip:** If you have a Central Heater configured, you can select it as the 'Heater Entity' to create a zone that uses your central heating system.",
         "data": {
-          "heater": "Heater Entity (Switch, Input Boolean, or Climate)",
+          "heater": "Heater Entity (Switch, Input Boolean, Climate, Valve, or Central Heater)",
           "temp_sensor": "Internal Temperature Sensor",
           "outdoor_sensor": "Outdoor Temperature Sensor / Weather Integration (Mandatory)",
           "backup_outdoor_sensor": "Backup Outdoor Sensor (Optional)",
@@ -31,10 +31,32 @@
       },
       "central_heater_setup": {
         "title": "Configure Central Heater",
-        "description": "Set up the main heater entity and temperature presets for the central heating system.",
+        "description": "Set up the main heater entity for the central heating system. This will create a 'Central Heater' climate entity that can be used by Individual Zones.\n\n**After Setup:** You can create Individual Zones that use this central heater as their heat source.",
         "data": {
-          "heater": "Central Heater Entity (Climate, Switch, or Input Boolean)",
-          "temp_sensor": "Temperature Sensor (for general system reference)"
+          "heater": "Central Heater Entity (Climate, Switch, or Input Boolean)"
+        }
+      },
+      "reconfigure_individual_zone": {
+        "title": "Reconfigure Individual Zone",
+        "description": "Update the configuration for this individual heating zone.\n\n**Tip:** You can select a Central Heater entity as the 'Heater Entity' if you want this zone to use your central heating system.",
+        "data": {
+          "heater": "Heater Entity (Switch, Input Boolean, Climate, Valve, or Central Heater)",
+          "temp_sensor": "Internal Temperature Sensor",
+          "outdoor_sensor": "Outdoor Temperature Sensor / Weather Integration (Mandatory)",
+          "backup_outdoor_sensor": "Backup Outdoor Sensor (Optional)",
+          "humidity_sensor": "Humidity Sensor (Optional)",
+          "door_window_sensor": "Door/Window Sensor(s) (Optional)",
+          "motion_sensor": "Motion Sensor (Optional)",
+          "home_preset": "Home Temperature Preset (°C)",
+          "sleep_preset": "Sleep Temperature Preset (°C)",
+          "away_preset": "Away Temperature Preset (°C)"
+        }
+      },
+      "reconfigure_central_heater": {
+        "title": "Reconfigure Central Heater",
+        "description": "Update the configuration for the central heating system.\n\n**Note:** This central heater can be used by Individual Zones as their heat source.",
+        "data": {
+          "heater": "Central Heater Entity (Climate, Switch, or Input Boolean)"
         }
       }
     },
@@ -61,18 +83,18 @@
     "step": {
       "init": {
         "title": "Adaptive Thermostat Options",
-        "description": "Modify the settings for your Adaptive Thermostat. The 'Configuration Type' cannot be changed after initial setup.",
+        "description": "Modify the settings for your {config_type_name} thermostat. The 'Configuration Type' cannot be changed after initial setup.",
         "data": {
           "heater": "Heater Entity",
-          "temp_sensor": "Internal Temperature Sensor",
-          "outdoor_sensor": "Outdoor Temperature Sensor / Weather Integration",
-          "backup_outdoor_sensor": "Backup Outdoor Sensor (Optional)",
-          "humidity_sensor": "Humidity Sensor (Optional)",
-          "door_window_sensor": "Door/Window Sensor(s) (Optional)",
-          "motion_sensor": "Motion Sensor (Optional)",
-          "home_preset": "Home Temperature Preset (°C)",
-          "sleep_preset": "Sleep Temperature Preset (°C)",
-          "away_preset": "Away Temperature Preset (°C)"
+          "temp_sensor": "Internal Temperature Sensor (Individual Zones only)",
+          "outdoor_sensor": "Outdoor Temperature Sensor / Weather Integration (Individual Zones only)",
+          "backup_outdoor_sensor": "Backup Outdoor Sensor (Optional - Individual Zones only)",
+          "humidity_sensor": "Humidity Sensor (Optional - Individual Zones only)",
+          "door_window_sensor": "Door/Window Sensor(s) (Optional - Individual Zones only)",
+          "motion_sensor": "Motion Sensor (Optional - Individual Zones only)",
+          "home_preset": "Home Temperature Preset (°C - Individual Zones only)",
+          "sleep_preset": "Sleep Temperature Preset (°C - Individual Zones only)",
+          "away_preset": "Away Temperature Preset (°C - Individual Zones only)"
         }
       }
     },
