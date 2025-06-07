@@ -64,14 +64,19 @@ async def async_setup_entry(
     async_add_entities: AddEntitiesCallback,
 ) -> None:
     """Set up the Adaptive Thermostat climate platform."""
-    _LOGGER.debug("Setting up climate entity for entry %s", entry.entry_id)
-    async_add_entities([AdaptiveThermostat(hass, entry)])
+    _LOGGER.info("Setting up climate entity for entry %s with data: %s", entry.entry_id, entry.data)
+    try:
+        thermostat = AdaptiveThermostat(hass, entry)
+        _LOGGER.info("Created thermostat entity: %s (unique_id: %s)", thermostat.name, thermostat.unique_id)
+        async_add_entities([thermostat], True)  # Force immediate update
+        _LOGGER.info("Successfully added thermostat entity to Home Assistant")
+    except Exception as e:
+        _LOGGER.error("Failed to set up climate entity: %s", e, exc_info=True)
+        raise
 
 
 class AdaptiveThermostat(ClimateEntity):
     """Representation of an Adaptive Thermostat zone."""
-
-    _attr_has_entity_name = True
 
     def __init__(self, hass: HomeAssistant, entry: ConfigEntry) -> None:
         """Initialize the thermostat."""
@@ -130,11 +135,13 @@ class AdaptiveThermostat(ClimateEntity):
         self._manual_override = False
         self._last_outdoor_temp = None
 
-        # Check required fields
+        # Check required fields and warn
         if not self._heater_entity_ids:
-            _LOGGER.error("[%s] No heater entities configured", self._entry_id)
+            _LOGGER.warning("[%s] No heater entities configured for zone '%s' - entity will not be functional", self._entry_id, self._attr_name)
         if not self._temp_sensor_entity_id:
-            _LOGGER.error("[%s] Temperature sensor entity ID is missing from configuration", self._entry_id)
+            _LOGGER.warning("[%s] Temperature sensor missing for zone '%s' - using default values", self._entry_id, self._attr_name)
+            # Set a reasonable default temperature to prevent entity from being unavailable
+            self._current_temperature = 20.0
 
         # Optional configuration sensors
         self._humidity_sensor_entity_id = get_entity_id(CONF_HUMIDITY_SENSOR)
@@ -192,14 +199,17 @@ class AdaptiveThermostat(ClimateEntity):
     async def async_added_to_hass(self) -> None:
         """Run when entity about to be added."""
         await super().async_added_to_hass()
-        _LOGGER.info("[%s] *** ZONE '%s' STARTING UP - IMMEDIATE DATA SEND ***", self._entry_id, self._attr_name)
+        _LOGGER.info("[%s] *** ZONE '%s' STARTING UP - Entity: %s ***", self._entry_id, self._attr_name, self.entity_id)
 
-        # CRITICAL: Load all sensor data immediately for card
-        await self.async_update()
-        
-        # CRITICAL: Write state immediately so card gets data on reload
-        self.async_write_ha_state()
-        _LOGGER.info("[%s] *** IMMEDIATE STATE WRITTEN FOR CARD ***", self._entry_id)
+        try:
+            # CRITICAL: Load all sensor data immediately for card
+            await self.async_update()
+            
+            # CRITICAL: Write state immediately so card gets data on reload
+            self.async_write_ha_state()
+            _LOGGER.info("[%s] *** ZONE '%s' ENTITY READY: %s ***", self._entry_id, self._attr_name, self.entity_id)
+        except Exception as e:
+            _LOGGER.error("[%s] Error during entity initialization: %s", self._entry_id, e, exc_info=True)
 
         # Register state change listeners
         entities_to_track = []
@@ -256,6 +266,11 @@ class AdaptiveThermostat(ClimateEntity):
     def name(self) -> str:
         """Return the display name of the thermostat."""
         return self._attr_name
+
+    @property
+    def unique_id(self) -> str:
+        """Return the unique ID of the entity."""
+        return self._attr_unique_id
 
     @property
     def current_temperature(self) -> float | None:
@@ -316,6 +331,12 @@ class AdaptiveThermostat(ClimateEntity):
     def target_temperature_step(self) -> float:
         """Return the supported step of target temperature."""
         return 0.1
+
+    @property
+    def available(self) -> bool:
+        """Return True if entity is available."""
+        # Entity is always available if it has a name - functionality depends on configuration
+        return bool(self._attr_name)
 
     # --- Service calls ---
 
@@ -392,34 +413,42 @@ class AdaptiveThermostat(ClimateEntity):
 
     async def async_update(self) -> None:
         """Update the entity state."""
-        # Update current temperature from sensor
-        if self._temp_sensor_entity_id:
-            temp_state = self.hass.states.get(self._temp_sensor_entity_id)
-            if temp_state and temp_state.state not in ["unknown", "unavailable"]:
-                try:
-                    self._current_temperature = float(temp_state.state)
-                except (ValueError, TypeError):
-                    _LOGGER.warning("[%s] Invalid temperature from sensor: %s", self._entry_id, temp_state.state)
+        try:
+            # Update current temperature from sensor
+            if self._temp_sensor_entity_id:
+                temp_state = self.hass.states.get(self._temp_sensor_entity_id)
+                if temp_state and temp_state.state not in ["unknown", "unavailable"]:
+                    try:
+                        self._current_temperature = float(temp_state.state)
+                        _LOGGER.debug("[%s] Temperature updated: %s°C", self._entry_id, self._current_temperature)
+                    except (ValueError, TypeError):
+                        _LOGGER.warning("[%s] Invalid temperature from sensor: %s", self._entry_id, temp_state.state)
+                else:
+                    _LOGGER.debug("[%s] Temperature sensor not available: %s", self._entry_id, self._temp_sensor_entity_id)
 
-        # Update current humidity from sensor
-        if self._humidity_sensor_entity_id:
-            humidity_state = self.hass.states.get(self._humidity_sensor_entity_id)
-            if humidity_state and humidity_state.state not in ["unknown", "unavailable"]:
-                try:
-                    self._current_humidity = float(humidity_state.state)
-                except (ValueError, TypeError):
-                    _LOGGER.warning("[%s] Invalid humidity from sensor: %s", self._entry_id, humidity_state.state)
+            # Update current humidity from sensor
+            if self._humidity_sensor_entity_id:
+                humidity_state = self.hass.states.get(self._humidity_sensor_entity_id)
+                if humidity_state and humidity_state.state not in ["unknown", "unavailable"]:
+                    try:
+                        self._current_humidity = float(humidity_state.state)
+                        _LOGGER.debug("[%s] Humidity updated: %s%%", self._entry_id, self._current_humidity)
+                    except (ValueError, TypeError):
+                        _LOGGER.warning("[%s] Invalid humidity from sensor: %s", self._entry_id, humidity_state.state)
 
-        # Update extra state attributes with current sensor readings for card
-        self._update_sensor_attributes()
+            # Update extra state attributes with current sensor readings for card
+            self._update_sensor_attributes()
 
-        # Handle auto on/off based on outdoor temperature
-        if self._auto_on_off_enabled and not self._manual_override:
-            await self._async_handle_auto_onoff()
+            # Handle auto on/off based on outdoor temperature
+            if self._auto_on_off_enabled and not self._manual_override:
+                await self._async_handle_auto_onoff()
 
-        # Trigger heating control if in heat mode
-        if self._hvac_mode == HVACMode.HEAT:
-            await self._async_control_heating()
+            # Trigger heating control if in heat mode
+            if self._hvac_mode == HVACMode.HEAT:
+                await self._async_control_heating()
+                
+        except Exception as e:
+            _LOGGER.error("[%s] Error during update: %s", self._entry_id, e, exc_info=True)
 
     def _update_sensor_attributes(self) -> None:
         """Update extra state attributes with current sensor readings."""
