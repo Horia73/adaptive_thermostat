@@ -7,6 +7,7 @@
   "codeowners": ["@Horia73"],
   "requirements": [],
   "config_flow": true,
+  "reconfigure": true,
   "version": "1.0.0",
   "iot_class": "calculated"
 } 

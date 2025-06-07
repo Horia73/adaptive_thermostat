@@ -187,14 +187,7 @@ class AdaptiveThermostat(ClimateEntity):
         # Listener for state changes
         self._remove_listener = None
 
-        # Device information for grouping entities
-        self._attr_device_info = {
-            "identifiers": {(DOMAIN, entry.entry_id)},
-            "name": self._attr_name,
-            "manufacturer": "Adaptive Thermostat",
-            "model": "Smart Zone Controller",
-            "sw_version": "1.0",
-        }
+        # Remove device creation - not needed for single climate entity
 
     async def async_added_to_hass(self) -> None:
         """Run when entity about to be added."""
