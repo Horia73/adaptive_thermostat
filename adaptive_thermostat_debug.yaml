@@ -1,0 +1,69 @@
+# Adaptive Thermostat Debug Configuration
+# Place this file in your Home Assistant config directory for reference
+
+# Step 1: Check if all required entities exist
+# Add these to your configuration.yaml temporarily to verify entities exist:
+
+# Example temperature sensor (replace with your actual sensor)
+# sensor:
+#   - platform: template
+#     sensors:
+#       dormitor_temperature:
+#         friendly_name: "Dormitor Temperature"
+#         unit_of_measurement: "°C"
+#         value_template: "20.5"
+
+# Example heater switch (replace with your actual switch)
+# switch:
+#   - platform: template
+#     switches:
+#       dormitor_heater:
+#         friendly_name: "Dormitor Heater"
+#         value_template: "{{ states('input_boolean.dormitor_heater_dummy') }}"
+#         turn_on:
+#           service: input_boolean.turn_on
+#           target:
+#             entity_id: input_boolean.dormitor_heater_dummy
+#         turn_off:
+#           service: input_boolean.turn_off
+#           target:
+#             entity_id: input_boolean.dormitor_heater_dummy
+
+# Helper input_boolean for testing
+# input_boolean:
+#   dormitor_heater_dummy:
+#     name: "Dormitor Heater Test"
+#     icon: mdi:radiator
+
+# Step 2: Enable debug logging
+# Add this to your configuration.yaml:
+logger:
+  default: info
+  logs:
+    custom_components.adaptive_thermostat: debug
+
+# Step 3: Common troubleshooting steps:
+# 1. Check Developer Tools > States for your configured entities
+# 2. Verify entity IDs match exactly (case sensitive)
+# 3. Check Home Assistant logs for errors
+# 4. Restart Home Assistant after configuration changes
+# 5. Clear browser cache and refresh
+
+# Step 4: Verify integration is loaded
+# Check in Settings > Devices & Services > Integrations
+# You should see "Adaptive Thermostat" listed
+
+# Step 5: Common entity naming issues
+# Entity IDs must follow this pattern:
+# - Only lowercase letters, numbers, and underscores
+# - Must start with a letter
+# - Examples: sensor.dormitor_temp, switch.radiator_bedroom
+
+# Step 6: Check these entity patterns work:
+# climate.dormitor (this is what will be created)
+# sensor.temperature_dormitor (your temp sensor)
+# sensor.outdoor_temperature (your outdoor sensor)
+# switch.radiator_dormitor (your heater)
+
+# If entity is still unavailable, check exact error in logs:
+# grep -i "adaptive_thermostat\|dormitor" home-assistant.log 

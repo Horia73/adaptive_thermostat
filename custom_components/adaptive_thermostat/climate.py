@@ -201,6 +201,9 @@ class AdaptiveThermostat(ClimateEntity):
         await super().async_added_to_hass()
         _LOGGER.info("[%s] *** ZONE '%s' STARTING UP - Entity: %s ***", self._entry_id, self._attr_name, self.entity_id)
 
+        # Validate that configured entities exist
+        await self._validate_entities()
+
         try:
             # CRITICAL: Load all sensor data immediately for card
             await self.async_update()
@@ -244,6 +247,56 @@ class AdaptiveThermostat(ClimateEntity):
 
         # Schedule periodic updates to ensure card stays current
         self.async_schedule_update_ha_state(True)
+
+    async def _validate_entities(self) -> None:
+        """Validate that configured entities exist in Home Assistant."""
+        _LOGGER.info("[%s] Validating configured entities for zone '%s'", self._entry_id, self._attr_name)
+        
+        # Check heater entities
+        missing_heaters = []
+        for heater_id in self._heater_entity_ids:
+            if heater_id and not self.hass.states.get(heater_id):
+                missing_heaters.append(heater_id)
+        
+        if missing_heaters:
+            _LOGGER.error("[%s] Missing heater entities: %s", self._entry_id, missing_heaters)
+        else:
+            _LOGGER.info("[%s] ✅ All heater entities found", self._entry_id)
+        
+        # Check temperature sensor
+        if self._temp_sensor_entity_id:
+            temp_state = self.hass.states.get(self._temp_sensor_entity_id)
+            if not temp_state:
+                _LOGGER.error("[%s] ❌ Temperature sensor not found: %s", self._entry_id, self._temp_sensor_entity_id)
+            else:
+                _LOGGER.info("[%s] ✅ Temperature sensor found: %s (current: %s)", 
+                           self._entry_id, self._temp_sensor_entity_id, temp_state.state)
+        
+        # Check outdoor sensor
+        if self._outdoor_sensor_entity_id:
+            outdoor_state = self.hass.states.get(self._outdoor_sensor_entity_id)
+            if not outdoor_state:
+                _LOGGER.error("[%s] ❌ Outdoor sensor not found: %s", self._entry_id, self._outdoor_sensor_entity_id)
+            else:
+                _LOGGER.info("[%s] ✅ Outdoor sensor found: %s (current: %s)", 
+                           self._entry_id, self._outdoor_sensor_entity_id, outdoor_state.state)
+        
+        # Check optional sensors
+        optional_sensors = [
+            (self._humidity_sensor_entity_id, "Humidity"),
+            (self._motion_sensor_entity_id, "Motion"),
+            (self._door_window_sensor_entity_id, "Door/Window"),
+            (self._backup_outdoor_sensor_entity_id, "Backup Outdoor"),
+            (self._central_heater_entity_id, "Central Heater")
+        ]
+        
+        for entity_id, sensor_type in optional_sensors:
+            if entity_id:
+                state = self.hass.states.get(entity_id)
+                if not state:
+                    _LOGGER.warning("[%s] ⚠️ Optional %s sensor not found: %s", self._entry_id, sensor_type, entity_id)
+                else:
+                    _LOGGER.info("[%s] ✅ %s sensor found: %s", self._entry_id, sensor_type, entity_id)
 
     async def async_will_remove_from_hass(self) -> None:
         """Run when entity will be removed from hass."""
