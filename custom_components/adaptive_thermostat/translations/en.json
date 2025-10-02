@@ -40,6 +40,19 @@
           "auto_off_temp": "Auto Turn Off Temperature (when outdoor temp rises above)"
         }
       },
+      "adaptive_setup": {
+        "title": "Adaptive Control",
+        "description": "Fine-tune the adaptive controller behaviour, including allowable temperature deviation and cycling windows.",
+        "data": {
+          "target_tolerance": "Target Tolerance (±°C)",
+          "control_window": "Control Window Length (seconds)",
+          "min_on_time": "Minimum Heater On Time (seconds)",
+          "min_off_time": "Minimum Heater Off Time (seconds)",
+          "filter_alpha": "Temperature Filter Smoothing Factor",
+          "window_detection_enabled": "Detect Open Window Events",
+          "window_slope_threshold": "Open Window Slope Threshold (°C/min)"
+        }
+      },
       "presets_setup": {
         "title": "Temperature Presets",
         "description": "Configure the temperature presets for different scenarios.",
@@ -67,14 +80,14 @@
         }
       },
       "reconfigure_name_setup": {
-        "title": "Step 1/5: Thermostat Name",
+        "title": "Step 1/6: Thermostat Name",
         "description": "Configure the name for this thermostat.",
         "data": {
           "name": "Thermostat Name"
         }
       },
       "reconfigure_zone_setup": {
-        "title": "Step 2/5: Heating Zone Configuration",
+        "title": "Step 2/6: Heating Zone Configuration",
         "description": "Configure the entities for this heating zone.",
         "data": {
           "heater": "Zone Heater/Valve (Switch, Input Boolean, Climate, or Valve)",
@@ -88,7 +101,7 @@
         }
       },
       "reconfigure_timing_setup": {
-        "title": "Step 3/5: Central Heater Timing",
+        "title": "Step 3/6: Central Heater Timing",
         "description": "Configure the timing delays for central heater coordination. These settings help protect your heating system.",
         "data": {
           "central_heater_turn_on_delay": "Turn On Delay (seconds after valve opens)",
@@ -96,7 +109,7 @@
         }
       },
       "reconfigure_auto_onoff_setup": {
-        "title": "Step 4/5: Automatic On/Off",
+        "title": "Step 4/6: Automatic On/Off",
         "description": "Configure automatic thermostat control based on outdoor temperature. Manual overrides from the thermostat card are always allowed.",
         "data": {
           "auto_on_off_enabled": "Enable Automatic On/Off",
@@ -104,8 +117,21 @@
           "auto_off_temp": "Auto Turn Off Temperature (when outdoor temp rises above)"
         }
       },
+      "reconfigure_adaptive_setup": {
+        "title": "Step 5/6: Adaptive Control",
+        "description": "Fine-tune the adaptive controller behaviour, including allowable temperature deviation and cycling windows.",
+        "data": {
+          "target_tolerance": "Target Tolerance (±°C)",
+          "control_window": "Control Window Length (seconds)",
+          "min_on_time": "Minimum Heater On Time (seconds)",
+          "min_off_time": "Minimum Heater Off Time (seconds)",
+          "filter_alpha": "Temperature Filter Smoothing Factor",
+          "window_detection_enabled": "Detect Open Window Events",
+          "window_slope_threshold": "Open Window Slope Threshold (°C/min)"
+        }
+      },
       "reconfigure_presets_setup": {
-        "title": "Step 5/5: Temperature Presets",
+        "title": "Step 6/6: Temperature Presets",
         "description": "Configure the temperature presets for different scenarios.",
         "data": {
           "home_preset": "Home Temperature Preset (°C)",

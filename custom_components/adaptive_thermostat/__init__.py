@@ -14,7 +14,8 @@ _LOGGER = logging.getLogger(__name__)
 
 async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
     """Set up the Adaptive Thermostat integration."""
-    hass.data.setdefault(DOMAIN, {})
+    domain_data = hass.data.setdefault(DOMAIN, {})
+    domain_data.setdefault("entities", {})
     # No Lovelace registration attempt here anymore.
     # Rely on manifest.json and HACS for card availability,
     # and manual user addition if necessary.
@@ -35,16 +36,14 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         async def reset_manual_override_service(call: ServiceCall) -> None:
             """Service to reset manual override for a thermostat."""
             entity_id = call.data.get("entity_id")
-            
-            # Find the climate entity
-            for climate_entity_id in hass.states.async_entity_ids("climate"):
-                if climate_entity_id == entity_id:
-                    climate_entity = hass.data.get("climate", {}).get(climate_entity_id)
-                    if climate_entity and hasattr(climate_entity, 'reset_manual_override'):
-                        climate_entity.reset_manual_override()
-                        _LOGGER.info("Reset manual override for %s", entity_id)
-                        return
-            
+
+            climate_entities = hass.data.get(DOMAIN, {}).get("entities", {})
+            climate_entity = climate_entities.get(entity_id)
+            if climate_entity and hasattr(climate_entity, "reset_manual_override"):
+                climate_entity.reset_manual_override()
+                _LOGGER.info("Reset manual override for %s", entity_id)
+                return
+
             _LOGGER.warning("Could not find adaptive thermostat entity: %s", entity_id)
 
         hass.services.async_register(

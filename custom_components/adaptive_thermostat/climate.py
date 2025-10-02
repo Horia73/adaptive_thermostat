@@ -2,8 +2,10 @@
 
 import asyncio
 import logging
-import re
-from typing import Any, Dict, List
+import math
+from dataclasses import asdict, dataclass
+from datetime import datetime, timedelta
+from typing import Any, Dict, List, Optional
 
 from homeassistant.components.climate import ( # type: ignore
     ClimateEntity,
@@ -21,7 +23,14 @@ from homeassistant.const import ( # type: ignore
 from homeassistant.config_entries import ConfigEntry # type: ignore
 from homeassistant.core import HomeAssistant, callback # type: ignore
 from homeassistant.helpers.entity_platform import AddEntitiesCallback # type: ignore
-from homeassistant.helpers.event import async_track_state_change_event, Event # type: ignore
+from homeassistant.helpers.event import (
+    async_track_state_change_event,
+    async_track_time_interval,
+    async_call_later,
+    Event,
+) # type: ignore
+from homeassistant.helpers.storage import Store # type: ignore
+from homeassistant.util import dt as dt_util # type: ignore
 
 from . import DOMAIN
 
@@ -38,6 +47,13 @@ from .const import (
     CONF_SLEEP_PRESET,
     CONF_HOME_PRESET,
     CONF_AWAY_PRESET,
+    CONF_TARGET_TOLERANCE,
+    CONF_CONTROL_WINDOW,
+    CONF_MIN_ON_TIME,
+    CONF_MIN_OFF_TIME,
+    CONF_FILTER_ALPHA,
+    CONF_WINDOW_DETECTION_ENABLED,
+    CONF_WINDOW_SLOPE_THRESHOLD,
     CONF_CENTRAL_HEATER_TURN_ON_DELAY,
     CONF_CENTRAL_HEATER_TURN_OFF_DELAY,
     CONF_AUTO_ON_OFF_ENABLED,
@@ -51,12 +67,54 @@ from .const import (
     CENTRAL_HEATER_TURN_OFF_DELAY,
     DEFAULT_AUTO_ON_TEMP,
     DEFAULT_AUTO_OFF_TEMP,
+    DEFAULT_TARGET_TOLERANCE,
+    DEFAULT_CONTROL_WINDOW,
+    DEFAULT_MIN_ON_TIME,
+    DEFAULT_MIN_OFF_TIME,
+    DEFAULT_FILTER_ALPHA,
+    DEFAULT_WINDOW_DETECTION_ENABLED,
+    DEFAULT_WINDOW_SLOPE_THRESHOLD,
+    STORAGE_KEY,
+    STORAGE_VERSION,
 )
 
 _LOGGER = logging.getLogger(__name__)
+MIN_SLOPE_THRESHOLD = 0.0002  # °C per second (~0.012°C per minute)
+DEFAULT_DELAY_SECONDS = 90.0
+CONTROL_KP = 0.6
+CONTROL_KI = 0.0005
 
-# Define the heating threshold offset
-HEATING_ON_OFFSET = 0.1
+
+def _clamp(value: float, low: float, high: float) -> float:
+    """Clamp value within bounds."""
+    return max(low, min(high, value))
+
+
+@dataclass
+class AdaptiveProfile:
+    """Persisted adaptive model for a heating zone."""
+
+    heater_gain: float = 0.0
+    loss_coefficient: float = 0.0
+    delay_seconds: float = DEFAULT_DELAY_SECONDS
+    heating_rate: float = 0.0
+    cooling_rate: float = 0.0
+    overshoot: float = 0.0
+    updated_at: float = 0.0
+
+    @property
+    def is_learned(self) -> bool:
+        return self.heater_gain > 0 and self.loss_coefficient > 0
+
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "AdaptiveProfile":
+        if not data:
+            return cls()
+        base = cls()
+        return cls(**{k: data.get(k, getattr(base, k)) for k in cls.__annotations__.keys()})
 
 async def async_setup_entry(
     hass: HomeAssistant,
@@ -130,10 +188,24 @@ class AdaptiveThermostat(ClimateEntity):
         self._auto_on_off_enabled = config.get(CONF_AUTO_ON_OFF_ENABLED, False)
         self._auto_on_temp = config.get(CONF_AUTO_ON_TEMP, DEFAULT_AUTO_ON_TEMP)
         self._auto_off_temp = config.get(CONF_AUTO_OFF_TEMP, DEFAULT_AUTO_OFF_TEMP)
-        
+
+        # Adaptive control configuration
+        self._target_tolerance = max(0.01, float(config.get(CONF_TARGET_TOLERANCE, DEFAULT_TARGET_TOLERANCE)))
+        self._control_window = max(60.0, float(config.get(CONF_CONTROL_WINDOW, DEFAULT_CONTROL_WINDOW)))
+        self._min_on_time = max(10.0, float(config.get(CONF_MIN_ON_TIME, DEFAULT_MIN_ON_TIME)))
+        self._min_off_time = max(10.0, float(config.get(CONF_MIN_OFF_TIME, DEFAULT_MIN_OFF_TIME)))
+        self._filter_alpha = _clamp(float(config.get(CONF_FILTER_ALPHA, DEFAULT_FILTER_ALPHA)), 0.01, 0.8)
+        self._window_detection_enabled = bool(
+            config.get(CONF_WINDOW_DETECTION_ENABLED, DEFAULT_WINDOW_DETECTION_ENABLED)
+        )
+        self._window_slope_threshold = max(
+            0.1, float(config.get(CONF_WINDOW_SLOPE_THRESHOLD, DEFAULT_WINDOW_SLOPE_THRESHOLD))
+        )
+
         # Manual override state - when user manually controls the thermostat
         self._manual_override = False
         self._last_outdoor_temp = None
+        self._current_outdoor_temp: float | None = None
 
         # Check required fields and warn
         if not self._heater_entity_ids:
@@ -184,6 +256,9 @@ class AdaptiveThermostat(ClimateEntity):
             "outdoor_sensor": self._outdoor_sensor_entity_id,
             "weather_sensor": self._backup_outdoor_sensor_entity_id,  # Renamed for card compatibility
             "manual_override": False,  # Track manual override state for card
+            "window_detection_enabled": self._window_detection_enabled,
+            "window_open_detected": False,
+            "window_slope_threshold": self._window_slope_threshold,
         }
         _LOGGER.debug("[%s] Extra state attributes set: %s", self._entry_id, self._attr_extra_state_attributes)
 
@@ -194,6 +269,31 @@ class AdaptiveThermostat(ClimateEntity):
         # Listener for state changes
         self._remove_listener = None
 
+        # Adaptive control internal state
+        self._filtered_temperature: float | None = None
+        self._last_filtered_temp: float | None = None
+        self._temperature_slope: float = 0.0
+        self._last_measurement_ts: float | None = None
+        self._last_update_ts: float | None = None
+        self._integrator: float = 0.0
+        self._window_start_ts: float | None = None
+        self._window_on_time: float = 0.0
+        self._window_desired_on: float = 0.0
+        self._adaptive_profile: AdaptiveProfile = AdaptiveProfile()
+        self._profile_store: Store | None = None
+        self._profile_cache_ref: Dict[str, Any] | None = None
+        self._profile_dirty: bool = False
+        self._profile_save_unsub = None
+        self._control_tick_unsub = None
+        self._awaiting_delay_timestamp: float | None = None
+        self._awaiting_peak: bool = False
+        self._peak_max_temp: float | None = None
+        self._peak_target: float | None = None
+        self._last_command_timestamp: float | None = None
+        self._last_heater_command: Optional[bool] = None
+        self._open_window_detected: bool = False
+        self._last_window_event_ts: float | None = None
+
         # Remove device creation - not needed for single climate entity
 
     async def async_added_to_hass(self) -> None:
@@ -201,10 +301,26 @@ class AdaptiveThermostat(ClimateEntity):
         await super().async_added_to_hass()
         _LOGGER.info("[%s] *** ZONE '%s' STARTING UP - Entity: %s ***", self._entry_id, self._attr_name, self.entity_id)
 
+        # Track entity instance so services can address it by entity_id
+        domain_data = self.hass.data.setdefault(DOMAIN, {})
+
+        if "profile_store" not in domain_data:
+            domain_data["profile_store"] = Store(self.hass, STORAGE_VERSION, STORAGE_KEY)
+        if "profile_cache" not in domain_data:
+            domain_data["profile_cache"] = {}
+
+        self._profile_store = domain_data["profile_store"]
+        self._profile_cache_ref = domain_data["profile_cache"]
+
+        entities = domain_data.setdefault("entities", {})
+        if self.entity_id:
+            entities[self.entity_id] = self
+
         # Validate that configured entities exist
         await self._validate_entities()
 
         try:
+            await self._async_load_profile()
             # CRITICAL: Load all sensor data immediately for card
             await self.async_update()
             
@@ -244,6 +360,12 @@ class AdaptiveThermostat(ClimateEntity):
                         self._entry_id, len(entities_to_track), self._attr_name, entities_to_track)
         else:
             _LOGGER.warning("[%s] No valid sensors/heater configured for state tracking.", self._entry_id)
+
+        # Periodic control tick to keep adaptive loop active even without sensor state changes
+        control_interval = max(15.0, min(60.0, self._control_window / 4.0))
+        self._control_tick_unsub = async_track_time_interval(
+            self.hass, self._async_control_tick, timedelta(seconds=control_interval)
+        )
 
         # Schedule periodic updates to ensure card stays current
         self.async_schedule_update_ha_state(True)
@@ -301,16 +423,33 @@ class AdaptiveThermostat(ClimateEntity):
     async def async_will_remove_from_hass(self) -> None:
         """Run when entity will be removed from hass."""
         _LOGGER.debug("[%s] Removing adaptive thermostat from Home Assistant", self._entry_id)
-        
+
         # Cancel any pending central heater tasks
         if self._central_heater_task:
             self._central_heater_task.cancel()
             self._central_heater_task = None
-            
+
         if self._remove_listener:
             self._remove_listener()
             self._remove_listener = None
             _LOGGER.debug("[%s] Unsubscribed state listener.", self._entry_id)
+
+        if self._control_tick_unsub:
+            self._control_tick_unsub()
+            self._control_tick_unsub = None
+
+        if self._profile_save_unsub:
+            self._profile_save_unsub()
+            self._profile_save_unsub = None
+
+        if self._profile_dirty:
+            await self._async_persist_profile()
+
+        # Remove entity from tracked instances
+        entities = self.hass.data.get(DOMAIN, {}).get("entities")
+        if entities and self.entity_id in entities:
+            entities.pop(self.entity_id)
+
         await super().async_will_remove_from_hass()
 
     # --- Properties ---
@@ -406,7 +545,7 @@ class AdaptiveThermostat(ClimateEntity):
             self._hvac_mode = HVACMode.OFF
         elif hvac_mode == HVACMode.HEAT:
             self._hvac_mode = HVACMode.HEAT
-            await self._async_control_heating()
+            await self._async_control_heating(dt_util.utcnow().timestamp())
         else:
             _LOGGER.warning("[%s] Unsupported HVAC mode: %s", self._entry_id, hvac_mode)
             return
@@ -430,7 +569,7 @@ class AdaptiveThermostat(ClimateEntity):
         
         # Trigger heating control with new target temperature
         if self._hvac_mode == HVACMode.HEAT:
-            await self._async_control_heating()
+            await self._async_control_heating(dt_util.utcnow().timestamp())
         
         self.async_write_ha_state()
 
@@ -453,7 +592,7 @@ class AdaptiveThermostat(ClimateEntity):
         
         # Trigger heating control with new target temperature
         if self._hvac_mode == HVACMode.HEAT:
-            await self._async_control_heating()
+            await self._async_control_heating(dt_util.utcnow().timestamp())
         
         self.async_write_ha_state()
 
@@ -467,108 +606,188 @@ class AdaptiveThermostat(ClimateEntity):
     async def async_update(self) -> None:
         """Update the entity state."""
         try:
-            # Update current temperature from sensor
-            if self._temp_sensor_entity_id:
-                temp_state = self.hass.states.get(self._temp_sensor_entity_id)
-                if temp_state and temp_state.state not in ["unknown", "unavailable"]:
-                    try:
-                        self._current_temperature = float(temp_state.state)
-                        _LOGGER.debug("[%s] Temperature updated: %s°C", self._entry_id, self._current_temperature)
-                    except (ValueError, TypeError):
-                        _LOGGER.warning("[%s] Invalid temperature from sensor: %s", self._entry_id, temp_state.state)
-                else:
-                    _LOGGER.debug("[%s] Temperature sensor not available: %s", self._entry_id, self._temp_sensor_entity_id)
+            now = dt_util.utcnow()
+            now_ts = dt_util.as_timestamp(now)
+            dt = 0.0 if self._last_update_ts is None else max(0.0, now_ts - self._last_update_ts)
 
-            # Update current humidity from sensor
-            if self._humidity_sensor_entity_id:
-                humidity_state = self.hass.states.get(self._humidity_sensor_entity_id)
-                if humidity_state and humidity_state.state not in ["unknown", "unavailable"]:
-                    try:
-                        self._current_humidity = float(humidity_state.state)
-                        _LOGGER.debug("[%s] Humidity updated: %s%%", self._entry_id, self._current_humidity)
-                    except (ValueError, TypeError):
-                        _LOGGER.warning("[%s] Invalid humidity from sensor: %s", self._entry_id, humidity_state.state)
+            raw_temp, temp_ts = self._read_temperature(now_ts)
+            humidity = self._read_humidity()
+            outdoor_temp, backup_outdoor_temp = self._read_outdoor_temperatures()
+            motion_active = self._read_binary_sensor(self._motion_sensor_entity_id)
+            door_window_open = self._read_binary_sensor(self._door_window_sensor_entity_id)
+            heater_states = self._gather_heater_states()
+            central_state = self._gather_central_state()
 
-            # Update extra state attributes with current sensor readings for card
-            self._update_sensor_attributes()
+            if raw_temp is not None and temp_ts is not None:
+                self._current_temperature = raw_temp
+                self._update_temperature_metrics(raw_temp, temp_ts, outdoor_temp)
+            if humidity is not None:
+                self._current_humidity = humidity
 
-            # Handle auto on/off based on outdoor temperature
+            if outdoor_temp is not None:
+                self._current_outdoor_temp = outdoor_temp
+            elif backup_outdoor_temp is not None and self._current_outdoor_temp is None:
+                self._current_outdoor_temp = backup_outdoor_temp
+
+            filtered_for_control = self._filtered_temperature or self._current_temperature
+            if (
+                self._hvac_mode == HVACMode.HEAT
+                and filtered_for_control is not None
+                and self._target_temperature is not None
+                and dt > 0
+            ):
+                error = self._target_temperature - filtered_for_control
+                self._integrator = _clamp(self._integrator + error * dt, -3600.0, 3600.0)
+
+            self._advance_control_window(now_ts, dt)
+            self._rolling_window_reset(now_ts)
+            await self._async_update_window_detection(now_ts)
+
+            self._update_sensor_attributes(
+                outdoor_temp,
+                backup_outdoor_temp,
+                motion_active,
+                door_window_open,
+                heater_states,
+                central_state,
+                now,
+            )
+
             if self._auto_on_off_enabled and not self._manual_override:
-                await self._async_handle_auto_onoff()
+                await self._async_handle_auto_onoff(outdoor_temp, backup_outdoor_temp)
 
-            # Trigger heating control if in heat mode
             if self._hvac_mode == HVACMode.HEAT:
-                await self._async_control_heating()
-                
-        except Exception as e:
-            _LOGGER.error("[%s] Error during update: %s", self._entry_id, e, exc_info=True)
+                await self._async_control_heating(now_ts)
 
-    def _update_sensor_attributes(self) -> None:
-        """Update extra state attributes with current sensor readings."""
-        # Get current outdoor temperature (primary sensor)
-        outdoor_temp = None
-        if self._outdoor_sensor_entity_id:
-            outdoor_state = self.hass.states.get(self._outdoor_sensor_entity_id)
-            if outdoor_state and outdoor_state.state not in ["unknown", "unavailable"]:
-                try:
-                    outdoor_temp = float(outdoor_state.state)
-                except (ValueError, TypeError):
-                    pass
-        
-        # Get backup outdoor temperature
-        backup_outdoor_temp = None
-        if self._backup_outdoor_sensor_entity_id:
-            backup_state = self.hass.states.get(self._backup_outdoor_sensor_entity_id)
-            if backup_state and backup_state.state not in ["unknown", "unavailable"]:
-                try:
-                    backup_outdoor_temp = float(backup_state.state)
-                except (ValueError, TypeError):
-                    pass
-        
-        # Get motion sensor state
-        motion_active = None
-        if self._motion_sensor_entity_id:
-            motion_state = self.hass.states.get(self._motion_sensor_entity_id)
-            if motion_state:
-                motion_active = motion_state.state == STATE_ON
-        
-        # Get door/window sensor state
-        door_window_open = None
-        if self._door_window_sensor_entity_id:
-            door_window_state = self.hass.states.get(self._door_window_sensor_entity_id)
-            if door_window_state:
-                door_window_open = door_window_state.state == STATE_ON
-        
-        # Get heater states
-        heater_states = []
+            self._last_update_ts = now_ts
+        except Exception as err:
+            _LOGGER.error("[%s] Error during update: %s", self._entry_id, err, exc_info=True)
+
+    def _read_temperature(self, fallback_ts: float) -> tuple[Optional[float], Optional[float]]:
+        """Read the main temperature sensor."""
+        if not self._temp_sensor_entity_id:
+            return self._current_temperature, fallback_ts
+
+        state = self.hass.states.get(self._temp_sensor_entity_id)
+        if not state or state.state in ("unknown", "unavailable"):
+            return None, None
+
+        try:
+            value = float(state.state)
+        except (ValueError, TypeError):
+            _LOGGER.warning("[%s] Invalid temperature from sensor %s: %s", self._entry_id, self._temp_sensor_entity_id, state.state)
+            return None, None
+
+        state_dt = getattr(state, "last_changed", None) or getattr(state, "last_updated", None)
+        measurement_ts = dt_util.as_timestamp(state_dt) if state_dt else fallback_ts
+        return value, measurement_ts
+
+    def _read_humidity(self) -> Optional[float]:
+        """Read humidity sensor value."""
+        if not self._humidity_sensor_entity_id:
+            return None
+
+        state = self.hass.states.get(self._humidity_sensor_entity_id)
+        if not state or state.state in ("unknown", "unavailable"):
+            return None
+
+        try:
+            return float(state.state)
+        except (ValueError, TypeError):
+            _LOGGER.warning(
+                "[%s] Invalid humidity from sensor %s: %s",
+                self._entry_id,
+                self._humidity_sensor_entity_id,
+                state.state,
+            )
+            return None
+
+    def _safe_state_float(self, entity_id: Optional[str]) -> Optional[float]:
+        """Return sensor float value or None."""
+        if not entity_id:
+            return None
+        state = self.hass.states.get(entity_id)
+        if not state or state.state in ("unknown", "unavailable"):
+            return None
+        try:
+            return float(state.state)
+        except (ValueError, TypeError):
+            _LOGGER.warning("[%s] Invalid numeric value from %s: %s", self._entry_id, entity_id, state.state)
+            return None
+
+    def _read_outdoor_temperatures(self) -> tuple[Optional[float], Optional[float]]:
+        """Read outdoor and backup outdoor temperatures."""
+        primary = self._safe_state_float(self._outdoor_sensor_entity_id)
+        backup = self._safe_state_float(self._backup_outdoor_sensor_entity_id)
+        return primary, backup
+
+    def _read_binary_sensor(self, entity_id: Optional[str]) -> Optional[bool]:
+        """Read binary sensor state as boolean."""
+        if not entity_id:
+            return None
+        state = self.hass.states.get(entity_id)
+        if not state or state.state in ("unknown", "unavailable"):
+            return None
+        return state.state == STATE_ON
+
+    def _gather_heater_states(self) -> List[Dict[str, Any]]:
+        """Gather heater entity snapshots for diagnostics."""
+        states: List[Dict[str, Any]] = []
         for heater_id in self._heater_entity_ids:
             heater_state = self.hass.states.get(heater_id)
             if heater_state:
-                heater_states.append({
-                    "entity_id": heater_id,
-                    "state": heater_state.state,
-                    "friendly_name": heater_state.attributes.get("friendly_name", heater_id)
-                })
-        
-        # Get central heater state
-        central_heater_state = None
-        if self._central_heater_entity_id:
-            central_state = self.hass.states.get(self._central_heater_entity_id)
-            if central_state:
-                central_heater_state = {
-                    "entity_id": self._central_heater_entity_id,
-                    "state": central_state.state,
-                    "friendly_name": central_state.attributes.get("friendly_name", self._central_heater_entity_id)
-                }
-        
-        # Update extra state attributes with all current data
+                states.append(
+                    {
+                        "entity_id": heater_id,
+                        "state": heater_state.state,
+                        "friendly_name": heater_state.attributes.get("friendly_name", heater_id),
+                    }
+                )
+        return states
+
+    def _gather_central_state(self) -> Optional[Dict[str, Any]]:
+        """Return central heater state snapshot."""
+        if not self._central_heater_entity_id:
+            return None
+        central_state = self.hass.states.get(self._central_heater_entity_id)
+        if not central_state:
+            return None
+        return {
+            "entity_id": self._central_heater_entity_id,
+            "state": central_state.state,
+            "friendly_name": central_state.attributes.get("friendly_name", self._central_heater_entity_id),
+        }
+
+    def _update_sensor_attributes(
+        self,
+        outdoor_temp: Optional[float],
+        backup_outdoor_temp: Optional[float],
+        motion_active: Optional[bool],
+        door_window_open: Optional[bool],
+        heater_states: List[Dict[str, Any]],
+        central_heater_state: Optional[Dict[str, Any]],
+        now: datetime,
+    ) -> None:
+        """Update extra state attributes with current sensor readings."""
+        sensor_time_state = self.hass.states.get("sensor.time")
+        last_updated = (
+            sensor_time_state.last_updated.isoformat()
+            if sensor_time_state
+            else now.isoformat()
+        )
+
+        last_window_event = (
+            dt_util.utc_from_timestamp(self._last_window_event_ts).isoformat()
+            if self._last_window_event_ts
+            else None
+        )
+
+        slope_per_min = self._temperature_slope * 60.0 if self._temperature_slope else 0.0
+
         self._attr_extra_state_attributes.update({
-            # ZONE IDENTIFICATION (CRITICAL for card uniqueness)
             "zone_name": self._attr_name,
             "zone_id": self._entry_id,
             "zone_unique_id": self._attr_unique_id,
-            
-            # Sensor entity IDs (for card compatibility)
             "heater_entity_id": self._heater_entity_id,
             "heater_entity_ids": self._heater_entity_ids,
             "central_heater_entity_id": self._central_heater_entity_id,
@@ -577,139 +796,441 @@ class AdaptiveThermostat(ClimateEntity):
             "motion_sensor": self._motion_sensor_entity_id,
             "door_window_sensor": self._door_window_sensor_entity_id,
             "outdoor_sensor": self._outdoor_sensor_entity_id,
-            "weather_sensor": self._backup_outdoor_sensor_entity_id,  # Card compatibility
-            
-            # Preset information (critical for card)
+            "weather_sensor": self._backup_outdoor_sensor_entity_id,
             "preset_modes": list(self._presets.keys()),
             "current_preset_mode": self._current_preset,
             "preset_temperatures": self._presets,
-            
-            # Current sensor readings (INDIVIDUAL per zone)
             "current_outdoor_temp": outdoor_temp,
             "current_backup_outdoor_temp": backup_outdoor_temp,
             "current_motion_active": motion_active,
             "current_door_window_open": door_window_open,
-            
-            # HVAC information (INDIVIDUAL per zone)
             "hvac_modes": [mode.value for mode in self._attr_hvac_modes],
             "current_hvac_mode": self._hvac_mode.value,
             "hvac_action": self.hvac_action.value if self.hvac_action else "unknown",
-            
-            # Temperature information (INDIVIDUAL per zone)
             "current_temperature": self._current_temperature,
+            "filtered_temperature": self._filtered_temperature,
+            "temperature_slope_per_min": slope_per_min,
             "target_temperature": self._target_temperature,
+            "target_tolerance": self._target_tolerance,
             "current_humidity": self._current_humidity,
-            
-            # Heater information (INDIVIDUAL per zone)
             "heater_states": heater_states,
             "central_heater_state": central_heater_state,
             "zone_heater_on": self._zone_heater_on,
-            
-            # Auto control status (INDIVIDUAL per zone)
             "auto_on_off_enabled": self._auto_on_off_enabled,
             "auto_on_temp": self._auto_on_temp,
             "auto_off_temp": self._auto_off_temp,
             "manual_override": self._manual_override,
-            
-            # Temperature thresholds and timing (INDIVIDUAL per zone)
             "central_heater_turn_on_delay": self._central_heater_turn_on_delay,
             "central_heater_turn_off_delay": self._central_heater_turn_off_delay,
-            
-            # Entity availability status
+            "control_window_seconds": self._control_window,
+            "desired_on_time_seconds": round(self._window_desired_on, 1),
+            "actual_on_time_seconds": round(self._window_on_time, 1),
+            "integrator_state": round(self._integrator, 3),
+            "adaptive_profile": self._adaptive_profile.to_dict(),
+            "window_detection_enabled": self._window_detection_enabled,
+            "window_open_detected": self._open_window_detected,
+            "window_slope_threshold": self._window_slope_threshold,
+            "last_window_event": last_window_event,
             "entity_available": True,
-            "last_updated": self.hass.states.get('sensor.time', {}).get('last_updated', 'unknown'),
+            "last_updated": last_updated,
         })
-        
-        _LOGGER.debug("[%s] Updated sensor attributes for card - Preset modes: %s, Current preset: %s, HVAC mode: %s", 
-                     self._entry_id, list(self._presets.keys()), self._current_preset, self._hvac_mode.value)
 
-        _LOGGER.info("[%s] *** ZONE '%s' SENSOR UPDATE ***", self._entry_id, self._attr_name)
-        _LOGGER.info("[%s] - Temp Sensor: %s = %s°C", self._entry_id, self._temp_sensor_entity_id, self._current_temperature)
-        _LOGGER.info("[%s] - Outdoor Sensor: %s = %s°C", self._entry_id, self._outdoor_sensor_entity_id, outdoor_temp)
-        _LOGGER.info("[%s] - Humidity Sensor: %s = %s%%", self._entry_id, self._humidity_sensor_entity_id, self._current_humidity)
-        _LOGGER.info("[%s] - Motion Sensor: %s = %s", self._entry_id, self._motion_sensor_entity_id, motion_active)
-        _LOGGER.info("[%s] - Door/Window Sensor: %s = %s", self._entry_id, self._door_window_sensor_entity_id, door_window_open)
-        _LOGGER.info("[%s] *** ZONE '%s' SENDING TO CARD: Entity ID %s ***", 
-                     self._entry_id, self._attr_name, getattr(self, 'entity_id', 'UNKNOWN'))
+        _LOGGER.debug(
+            "[%s] Sensor update: T=%.2f°C (filtered=%.2f°C, slope=%.3f°C/min), target=%.2f°C",
+            self._entry_id,
+            self._current_temperature if self._current_temperature is not None else float("nan"),
+            self._filtered_temperature if self._filtered_temperature is not None else float("nan"),
+            slope_per_min,
+            self._target_temperature if self._target_temperature is not None else float("nan"),
+        )
 
-    async def _async_handle_auto_onoff(self) -> None:
-        """Handle automatic on/off based on outdoor temperature."""
-        outdoor_temp = None
-        
-        # Try primary outdoor sensor first
-        if self._outdoor_sensor_entity_id:
-            outdoor_state = self.hass.states.get(self._outdoor_sensor_entity_id)
-            if outdoor_state and outdoor_state.state not in ["unknown", "unavailable"]:
-                try:
-                    outdoor_temp = float(outdoor_state.state)
-                except (ValueError, TypeError):
-                    _LOGGER.warning("[%s] Invalid outdoor temperature: %s", self._entry_id, outdoor_state.state)
-        
-        # Fallback to backup sensor if primary failed
-        if outdoor_temp is None and self._backup_outdoor_sensor_entity_id:
-            backup_state = self.hass.states.get(self._backup_outdoor_sensor_entity_id)
-            if backup_state and backup_state.state not in ["unknown", "unavailable"]:
-                try:
-                    outdoor_temp = float(backup_state.state)
-                except (ValueError, TypeError):
-                    _LOGGER.warning("[%s] Invalid backup outdoor temperature: %s", self._entry_id, backup_state.state)
-        
-        if outdoor_temp is None:
-            return  # No valid outdoor temperature available
-        
-        # Only process if temperature changed significantly (0.5°C hysteresis)
-        if self._last_outdoor_temp is not None and abs(outdoor_temp - self._last_outdoor_temp) < 0.5:
+    def _advance_control_window(self, now_ts: float, dt: float) -> None:
+        """Advance the duty window accounting for elapsed time."""
+        if self._window_start_ts is None:
+            self._window_start_ts = now_ts
+            self._window_on_time = 0.0
+            self._window_desired_on = self._compute_desired_on_duration()
             return
-        
-        self._last_outdoor_temp = outdoor_temp
-        
-        _LOGGER.debug("[%s] Auto on/off check - Outdoor temp: %s°C, Current mode: %s", 
-                     self._entry_id, outdoor_temp, self._hvac_mode)
-        
+
+        if dt > 0 and self._zone_heater_on:
+            self._window_on_time += dt
+
+    def _rolling_window_reset(self, now_ts: float) -> None:
+        """Reset duty window when elapsed time exceeds window length."""
+        if self._window_start_ts is None:
+            return
+        elapsed = now_ts - self._window_start_ts
+        if elapsed >= self._control_window:
+            cycles = max(1, int(elapsed // self._control_window))
+            self._window_start_ts += cycles * self._control_window
+            self._window_on_time = 0.0
+            self._window_desired_on = self._compute_desired_on_duration()
+
+    async def _async_update_window_detection(self, now_ts: float) -> None:
+        """Detect rapid cooling indicative of an open window."""
+        if not self._window_detection_enabled:
+            if self._open_window_detected:
+                self._open_window_detected = False
+                self._last_window_event_ts = now_ts
+            return
+
+        if self._filtered_temperature is None:
+            return
+
+        slope_per_min = (self._temperature_slope or 0.0) * 60.0
+        threshold = self._window_slope_threshold
+        release_threshold = threshold * 0.4
+
+        if not self._open_window_detected:
+            if slope_per_min <= -threshold:
+                self._open_window_detected = True
+                self._last_window_event_ts = now_ts
+                self._integrator = 0.0
+                _LOGGER.warning(
+                    "[%s] Rapid cooling detected (%.2f°C/min). Assuming open window and disabling heating.",
+                    self._entry_id,
+                    slope_per_min,
+                )
+                if self._zone_heater_on:
+                    await self._async_turn_heater_off()
+                    self._zone_heater_on = False
+        else:
+            if slope_per_min >= -release_threshold:
+                self._open_window_detected = False
+                self._last_window_event_ts = now_ts
+                _LOGGER.info(
+                    "[%s] Temperature drop resolved (%.2f°C/min). Resuming adaptive control.",
+                    self._entry_id,
+                    slope_per_min,
+                )
+
+    def _compute_desired_on_duration(self) -> float:
+        """Compute target heat time for the current duty window."""
+        if self._target_temperature is None:
+            return 0.0
+
+        target = self._target_temperature
+        filtered = self._filtered_temperature or self._current_temperature
+        outdoor = self._current_outdoor_temp
+
+        duty = 0.0
+        if self._adaptive_profile.is_learned and outdoor is not None:
+            delta = target - outdoor
+            if delta > 0:
+                duty = _clamp(
+                    (self._adaptive_profile.loss_coefficient * delta)
+                    / max(self._adaptive_profile.heater_gain, 1e-6),
+                    0.0,
+                    1.0,
+                )
+
+        if filtered is not None:
+            error = target - filtered
+            duty += CONTROL_KP * error
+            duty += CONTROL_KI * self._integrator
+
+        return _clamp(duty, 0.0, 1.0) * self._control_window
+
+    def _update_temperature_metrics(
+        self,
+        raw_temp: float,
+        measurement_ts: float,
+        outdoor_temp: Optional[float],
+    ) -> None:
+        """Update filtered temperature, slope, and adaptive learning."""
+        prev_ts = self._last_measurement_ts or measurement_ts
+        dt = max(0.0, measurement_ts - prev_ts)
+        self._last_measurement_ts = measurement_ts
+
+        prev_filtered = self._filtered_temperature
+        if prev_filtered is None:
+            self._filtered_temperature = raw_temp
+            slope = 0.0
+        else:
+            alpha = self._filter_alpha
+            self._filtered_temperature = alpha * raw_temp + (1 - alpha) * prev_filtered
+            slope = (self._filtered_temperature - prev_filtered) / dt if dt > 0 else 0.0
+
+        self._temperature_slope = slope
+        self._last_filtered_temp = self._filtered_temperature
+
+        self._update_adaptive_learning(measurement_ts, slope, outdoor_temp, self._zone_heater_on, dt)
+
+    def _update_adaptive_learning(
+        self,
+        now_ts: float,
+        slope: float,
+        outdoor_temp: Optional[float],
+        heater_on: bool,
+        dt: float,
+    ) -> None:
+        """Continuously update adaptive model parameters."""
+        if dt <= 0:
+            return
+
+        if heater_on and slope > MIN_SLOPE_THRESHOLD:
+            alpha = 0.2
+            heating_rate = self._adaptive_profile.heating_rate or slope
+            new_heating = (1 - alpha) * heating_rate + alpha * slope
+            self._set_profile_field("heating_rate", max(new_heating, MIN_SLOPE_THRESHOLD))
+
+            if (
+                outdoor_temp is not None
+                and self._filtered_temperature is not None
+                and self._adaptive_profile.loss_coefficient > 0
+            ):
+                a_est = slope + self._adaptive_profile.loss_coefficient * (
+                    self._filtered_temperature - outdoor_temp
+                )
+                if a_est > 0:
+                    new_gain = (1 - alpha) * (self._adaptive_profile.heater_gain or a_est) + alpha * a_est
+                    self._set_profile_field("heater_gain", max(new_gain, MIN_SLOPE_THRESHOLD))
+
+        elif not heater_on and slope < -MIN_SLOPE_THRESHOLD:
+            alpha = 0.2
+            cooling_sample = -slope
+            new_cooling = (1 - alpha) * (self._adaptive_profile.cooling_rate or cooling_sample) + alpha * cooling_sample
+            self._set_profile_field("cooling_rate", max(new_cooling, MIN_SLOPE_THRESHOLD))
+
+            if (
+                outdoor_temp is not None
+                and self._filtered_temperature is not None
+                and abs(self._filtered_temperature - outdoor_temp) > 0.05
+            ):
+                denominator = self._filtered_temperature - outdoor_temp
+                if denominator != 0:
+                    b_est = -slope / denominator
+                    if 0 < b_est < 0.01:
+                        new_loss = (1 - alpha) * (self._adaptive_profile.loss_coefficient or b_est) + alpha * b_est
+                        self._set_profile_field("loss_coefficient", max(new_loss, MIN_SLOPE_THRESHOLD / 10.0))
+
+        # Delay estimation
+        if heater_on and self._awaiting_delay_timestamp is not None and slope > MIN_SLOPE_THRESHOLD:
+            delay = max(0.0, now_ts - self._awaiting_delay_timestamp)
+            if delay > 0:
+                smoothed = (0.8 * self._adaptive_profile.delay_seconds) + (0.2 * delay)
+                self._set_profile_field("delay_seconds", _clamp(smoothed, 20.0, 900.0))
+            self._awaiting_delay_timestamp = None
+
+        # Overshoot tracking after heater turned off
+        if self._awaiting_peak:
+            if self._filtered_temperature is not None:
+                if self._peak_max_temp is None or self._filtered_temperature > self._peak_max_temp:
+                    self._peak_max_temp = self._filtered_temperature
+            if (
+                slope < -MIN_SLOPE_THRESHOLD
+                or (self._last_command_timestamp and now_ts - self._last_command_timestamp > self._control_window)
+            ):
+                self._finalize_peak_tracking()
+
+    def _finalize_peak_tracking(self) -> None:
+        """Finalize overshoot estimation after heater off."""
+        if not self._awaiting_peak:
+            return
+
+        peak_temp = self._peak_max_temp
+        target = self._peak_target or self._target_temperature
+
+        if peak_temp is not None and target is not None:
+            overshoot = peak_temp - target
+            beta = 0.3
+            if overshoot >= 0:
+                new_overshoot = (1 - beta) * self._adaptive_profile.overshoot + beta * overshoot
+            else:
+                new_overshoot = (1 - beta) * self._adaptive_profile.overshoot + beta * 0.0
+            self._set_profile_field("overshoot", max(new_overshoot, 0.0))
+
+        self._awaiting_peak = False
+        self._peak_target = None
+        self._peak_max_temp = None
+
+    def _set_profile_field(self, field: str, value: float) -> None:
+        """Set adaptive profile field and schedule persistence if changed."""
+        if math.isnan(value) or math.isinf(value):
+            return
+        current = getattr(self._adaptive_profile, field)
+        if abs(value - current) < 1e-6:
+            return
+        setattr(self._adaptive_profile, field, value)
+        self._adaptive_profile.updated_at = dt_util.utcnow().timestamp()
+        self._mark_profile_dirty()
+
+    def _mark_profile_dirty(self) -> None:
+        """Schedule persistence of the adaptive profile."""
+        if not self._profile_store:
+            return
+        self._profile_dirty = True
+        if self._profile_save_unsub is None:
+            self._profile_save_unsub = async_call_later(self.hass, 5.0, self._async_persist_profile)
+
+    async def _async_persist_profile(self, _now: Optional[datetime] = None) -> None:
+        """Persist adaptive profile to storage."""
+        self._profile_save_unsub = None
+        if not self._profile_store or not self._profile_dirty:
+            return
+
+        cache = self._profile_cache_ref
+        if cache is None:
+            cache = {}
+            self._profile_cache_ref = cache
+
+        cache[self._entry_id] = self._adaptive_profile.to_dict()
+        await self._profile_store.async_save(cache)
+        self._profile_dirty = False
+
+    async def _async_load_profile(self) -> None:
+        """Load adaptive profile from storage."""
+        if not self._profile_store:
+            self._adaptive_profile = AdaptiveProfile()
+            return
+
+        cache = self._profile_cache_ref
+        if cache is None or not cache:
+            stored = await self._profile_store.async_load()
+            if stored is None:
+                stored = {}
+            cache = stored
+            self._profile_cache_ref = cache
+
+        data = cache.get(self._entry_id)
+        self._adaptive_profile = AdaptiveProfile.from_dict(data or {})
+        self._adaptive_profile.delay_seconds = _clamp(
+            self._adaptive_profile.delay_seconds or DEFAULT_DELAY_SECONDS,
+            20.0,
+            900.0,
+        )
+
+    async def _async_control_tick(self, _now: datetime) -> None:
+        """Periodic control tick to keep regulation active."""
+        self._rolling_window_reset(dt_util.as_timestamp(_now))
+        self.async_schedule_update_ha_state(True)
+
+    def _evaluate_should_heat(self, now_ts: float) -> bool:
+        """Decide whether heating should be active."""
+        if self._open_window_detected:
+            return False
+
+        if self._target_temperature is None:
+            return False
+
+        filtered = self._filtered_temperature or self._current_temperature
+        if filtered is None:
+            return False
+
+        target = self._target_temperature
+        tolerance = self._target_tolerance
+
+        if filtered <= target - tolerance:
+            if not self._zone_heater_on and self._last_command_timestamp is not None:
+                if now_ts - self._last_command_timestamp < self._min_off_time:
+                    return False
+            return True
+
+        if filtered >= target + tolerance:
+            if self._zone_heater_on and self._last_command_timestamp is not None:
+                if now_ts - self._last_command_timestamp < self._min_on_time:
+                    return True
+            return False
+
+        delay = _clamp(self._adaptive_profile.delay_seconds, 20.0, 900.0)
+        overshoot = max(self._adaptive_profile.overshoot, 0.0)
+        heating_rate = max(self._adaptive_profile.heating_rate, MIN_SLOPE_THRESHOLD)
+        cooling_rate = max(self._adaptive_profile.cooling_rate, MIN_SLOPE_THRESHOLD)
+
+        if self._zone_heater_on:
+            predicted_peak = filtered + heating_rate * delay + overshoot
+            if predicted_peak >= target + tolerance:
+                return False
+            if self._window_desired_on > 0 and self._window_on_time >= self._window_desired_on and filtered >= target:
+                return False
+            return True
+
+        predicted_floor = filtered - cooling_rate * delay
+        if predicted_floor <= target - tolerance:
+            return True
+
+        if self._window_desired_on > 0 and self._window_on_time < self._window_desired_on:
+            return True
+
+        return False
+
+    async def _async_handle_auto_onoff(
+        self,
+        outdoor_temp: Optional[float],
+        backup_outdoor_temp: Optional[float],
+    ) -> None:
+        """Handle automatic on/off based on outdoor temperature."""
+        temp = outdoor_temp if outdoor_temp is not None else backup_outdoor_temp
+        if temp is None:
+            return
+
+        # Only process if temperature changed significantly (0.5°C hysteresis)
+        if self._last_outdoor_temp is not None and abs(temp - self._last_outdoor_temp) < 0.5:
+            return
+
+        self._last_outdoor_temp = temp
+        self._current_outdoor_temp = temp
+
+        _LOGGER.debug(
+            "[%s] Auto on/off check - Outdoor temp: %.2f°C, Current mode: %s",
+            self._entry_id,
+            temp,
+            self._hvac_mode,
+        )
+
         # Auto turn on when outdoor temp drops below threshold
-        if outdoor_temp < self._auto_on_temp and self._hvac_mode == HVACMode.OFF:
-            _LOGGER.info("[%s] Auto turning ON - Outdoor temp %s°C < %s°C", 
-                        self._entry_id, outdoor_temp, self._auto_on_temp)
+        if temp < self._auto_on_temp and self._hvac_mode == HVACMode.OFF:
+            _LOGGER.info(
+                "[%s] Auto turning ON - Outdoor temp %.2f°C < %.2f°C",
+                self._entry_id,
+                temp,
+                self._auto_on_temp,
+            )
             self._hvac_mode = HVACMode.HEAT
-            await self._async_control_heating()
-            
+            await self._async_control_heating(dt_util.utcnow().timestamp())
+
         # Auto turn off when outdoor temp rises above threshold
-        elif outdoor_temp > self._auto_off_temp and self._hvac_mode == HVACMode.HEAT:
-            _LOGGER.info("[%s] Auto turning OFF - Outdoor temp %s°C > %s°C", 
-                        self._entry_id, outdoor_temp, self._auto_off_temp)
+        elif temp > self._auto_off_temp and self._hvac_mode == HVACMode.HEAT:
+            _LOGGER.info(
+                "[%s] Auto turning OFF - Outdoor temp %.2f°C > %.2f°C",
+                self._entry_id,
+                temp,
+                self._auto_off_temp,
+            )
             await self._async_turn_heater_off()
             self._hvac_mode = HVACMode.OFF
-            
+
         # Clear manual override if auto conditions would naturally change state
-        # This allows auto mode to resume after user's manual intervention has become obsolete
-        if ((outdoor_temp < self._auto_on_temp and self._hvac_mode == HVACMode.HEAT) or 
-            (outdoor_temp > self._auto_off_temp and self._hvac_mode == HVACMode.OFF)):
+        if (
+            (temp < self._auto_on_temp and self._hvac_mode == HVACMode.HEAT)
+            or (temp > self._auto_off_temp and self._hvac_mode == HVACMode.OFF)
+        ):
             self._manual_override = False
             self._attr_extra_state_attributes["manual_override"] = False
 
-    async def _async_control_heating(self) -> None:
-        """Control heating based on current vs target temperature."""
-        should_heat = await self._async_should_heat()
-        
-        # If we need to heat and heater is off, turn it on
+    async def _async_control_heating(self, now_ts: float) -> None:
+        """Control heating based on adaptive model."""
+        should_heat = self._evaluate_should_heat(now_ts)
+
         if should_heat and not self._zone_heater_on:
-            _LOGGER.debug("[%s] Need to heat: current=%s°C, target=%s°C", self._entry_id, self._current_temperature, self._target_temperature)
+            _LOGGER.debug(
+                "[%s] Turning heater ON (current=%.2f°C, target=%.2f°C)",
+                self._entry_id,
+                self._current_temperature if self._current_temperature is not None else float("nan"),
+                self._target_temperature if self._target_temperature is not None else float("nan"),
+            )
             await self._async_turn_heater_on()
             self._zone_heater_on = True
-            
-        # If we don't need to heat and heater is on, turn it off
+
         elif not should_heat and self._zone_heater_on:
-            _LOGGER.debug("[%s] Don't need to heat: current=%s°C, target=%s°C", self._entry_id, self._current_temperature, self._target_temperature)
+            _LOGGER.debug(
+                "[%s] Turning heater OFF (current=%.2f°C, target=%.2f°C)",
+                self._entry_id,
+                self._current_temperature if self._current_temperature is not None else float("nan"),
+                self._target_temperature if self._target_temperature is not None else float("nan"),
+            )
             await self._async_turn_heater_off()
             self._zone_heater_on = False
-
-    async def _async_should_heat(self) -> bool:
-        """Determine if heating is needed based on temperature difference."""
-        if self._current_temperature is None or self._target_temperature is None:
-            return False
-        
-        temp_diff = self._target_temperature - self._current_temperature
-        return temp_diff > HEATING_ON_OFFSET
 
     async def _async_turn_on_entity(self, entity_id: str, entity_name: str) -> None:
         """Turn on an entity (switch or climate)."""
@@ -769,6 +1290,14 @@ class AdaptiveThermostat(ClimateEntity):
         if self._central_heater_entity_id:
             await self._async_coordinate_central_heater_on()
 
+        now_ts = dt_util.utcnow().timestamp()
+        self._awaiting_delay_timestamp = now_ts
+        self._awaiting_peak = False
+        self._peak_max_temp = None
+        self._peak_target = None
+        self._last_command_timestamp = now_ts
+        self._last_heater_command = True
+
     async def _async_turn_heater_off(self) -> None:
         """Turn off zone heaters and coordinate with central heater."""
         # Turn off all zone heaters first
@@ -778,6 +1307,14 @@ class AdaptiveThermostat(ClimateEntity):
         # Coordinate with central heater if configured
         if self._central_heater_entity_id:
             await self._async_coordinate_central_heater_off()
+
+        now_ts = dt_util.utcnow().timestamp()
+        self._awaiting_delay_timestamp = None
+        self._awaiting_peak = True
+        self._peak_target = self._target_temperature
+        self._peak_max_temp = self._filtered_temperature or self._current_temperature
+        self._last_command_timestamp = now_ts
+        self._last_heater_command = False
 
     async def _async_coordinate_central_heater_on(self) -> None:
         """Coordinate turning on central heater after zone valves."""

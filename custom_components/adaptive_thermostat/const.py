@@ -17,6 +17,13 @@ CONF_BACKUP_OUTDOOR_SENSOR = "backup_outdoor_sensor"
 CONF_SLEEP_PRESET = "sleep_preset"
 CONF_HOME_PRESET = "home_preset"
 CONF_AWAY_PRESET = "away_preset"
+CONF_TARGET_TOLERANCE = "target_tolerance"
+CONF_CONTROL_WINDOW = "control_window"
+CONF_MIN_ON_TIME = "min_on_time"
+CONF_MIN_OFF_TIME = "min_off_time"
+CONF_FILTER_ALPHA = "filter_alpha"
+CONF_WINDOW_DETECTION_ENABLED = "window_detection_enabled"
+CONF_WINDOW_SLOPE_THRESHOLD = "window_slope_threshold"
 
 # Advanced configuration keys
 CONF_CENTRAL_HEATER_TURN_ON_DELAY = "central_heater_turn_on_delay"
@@ -30,6 +37,13 @@ DEFAULT_NAME = "Adaptive Thermostat"
 DEFAULT_HOME_PRESET = 23.0
 DEFAULT_SLEEP_PRESET = 21.0
 DEFAULT_AWAY_PRESET = 18.0
+DEFAULT_TARGET_TOLERANCE = 0.05
+DEFAULT_CONTROL_WINDOW = 300  # seconds
+DEFAULT_MIN_ON_TIME = 90      # seconds
+DEFAULT_MIN_OFF_TIME = 90     # seconds
+DEFAULT_FILTER_ALPHA = 0.2
+DEFAULT_WINDOW_DETECTION_ENABLED = False
+DEFAULT_WINDOW_SLOPE_THRESHOLD = 0.6  # °C per minute
 
 # Timing constants for central heater coordination
 CENTRAL_HEATER_TURN_ON_DELAY = 10  # seconds - delay before turning on central heater after valve
@@ -38,3 +52,7 @@ CENTRAL_HEATER_TURN_OFF_DELAY = 120  # seconds - delay before turning off valve 
 # Auto on/off defaults
 DEFAULT_AUTO_ON_TEMP = 10.0  # °C - turn on when outdoor temp is below this
 DEFAULT_AUTO_OFF_TEMP = 18.0  # °C - turn off when outdoor temp is above this
+
+# Persistent storage
+STORAGE_KEY = "adaptive_thermostat_models"
+STORAGE_VERSION = 1

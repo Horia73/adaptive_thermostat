@@ -22,6 +22,13 @@ from .const import (
     CONF_HOME_PRESET,
     CONF_SLEEP_PRESET,
     CONF_AWAY_PRESET,
+    CONF_TARGET_TOLERANCE,
+    CONF_CONTROL_WINDOW,
+    CONF_MIN_ON_TIME,
+    CONF_MIN_OFF_TIME,
+    CONF_FILTER_ALPHA,
+    CONF_WINDOW_DETECTION_ENABLED,
+    CONF_WINDOW_SLOPE_THRESHOLD,
     CONF_CENTRAL_HEATER_TURN_ON_DELAY,
     CONF_CENTRAL_HEATER_TURN_OFF_DELAY,
     CONF_AUTO_ON_OFF_ENABLED,
@@ -34,6 +41,13 @@ from .const import (
     CENTRAL_HEATER_TURN_OFF_DELAY,
     DEFAULT_AUTO_ON_TEMP,
     DEFAULT_AUTO_OFF_TEMP,
+    DEFAULT_TARGET_TOLERANCE,
+    DEFAULT_CONTROL_WINDOW,
+    DEFAULT_MIN_ON_TIME,
+    DEFAULT_MIN_OFF_TIME,
+    DEFAULT_FILTER_ALPHA,
+    DEFAULT_WINDOW_DETECTION_ENABLED,
+    DEFAULT_WINDOW_SLOPE_THRESHOLD,
 )
 
 _LOGGER = logging.getLogger(__name__)
@@ -92,6 +106,30 @@ STEP_AUTO_ONOFF_SCHEMA = vol.Schema(
         ),
         vol.Required(CONF_AUTO_OFF_TEMP, default=DEFAULT_AUTO_OFF_TEMP): selector.NumberSelector(
             selector.NumberSelectorConfig(min=10, max=35, step=0.5, mode="box", unit_of_measurement="°C")
+        ),
+    }
+)
+
+STEP_ADAPTIVE_SCHEMA = vol.Schema(
+    {
+        vol.Required(CONF_TARGET_TOLERANCE, default=DEFAULT_TARGET_TOLERANCE): selector.NumberSelector(
+            selector.NumberSelectorConfig(min=0.02, max=0.5, step=0.01, mode="box", unit_of_measurement="°C")
+        ),
+        vol.Required(CONF_CONTROL_WINDOW, default=DEFAULT_CONTROL_WINDOW): selector.NumberSelector(
+            selector.NumberSelectorConfig(min=120, max=900, step=30, mode="box", unit_of_measurement="seconds")
+        ),
+        vol.Required(CONF_MIN_ON_TIME, default=DEFAULT_MIN_ON_TIME): selector.NumberSelector(
+            selector.NumberSelectorConfig(min=30, max=300, step=10, mode="box", unit_of_measurement="seconds")
+        ),
+        vol.Required(CONF_MIN_OFF_TIME, default=DEFAULT_MIN_OFF_TIME): selector.NumberSelector(
+            selector.NumberSelectorConfig(min=30, max=300, step=10, mode="box", unit_of_measurement="seconds")
+        ),
+        vol.Required(CONF_FILTER_ALPHA, default=DEFAULT_FILTER_ALPHA): selector.NumberSelector(
+            selector.NumberSelectorConfig(min=0.05, max=0.5, step=0.05, mode="box")
+        ),
+        vol.Required(CONF_WINDOW_DETECTION_ENABLED, default=DEFAULT_WINDOW_DETECTION_ENABLED): selector.BooleanSelector(),
+        vol.Required(CONF_WINDOW_SLOPE_THRESHOLD, default=DEFAULT_WINDOW_SLOPE_THRESHOLD): selector.NumberSelector(
+            selector.NumberSelectorConfig(min=0.2, max=2.0, step=0.1, mode="box", unit_of_measurement="°C/min")
         ),
     }
 )
@@ -222,7 +260,7 @@ class AdaptiveThermostatConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             try:
                 validated_input = _validate_input(user_input, STEP_AUTO_ONOFF_SCHEMA)
                 self._config_data.update(validated_input)
-                return await self.async_step_presets_setup()
+                return await self.async_step_adaptive_setup()
             except vol.MultipleInvalid as e:
                 _LOGGER.error(f"Validation error in auto on/off setup: {e}")
                 for error in e.errors:
@@ -235,6 +273,29 @@ class AdaptiveThermostatConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         return self.async_show_form(
             step_id="auto_onoff_setup",
             data_schema=STEP_AUTO_ONOFF_SCHEMA,
+            errors=errors,
+        )
+
+    async def async_step_adaptive_setup(self, user_input: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        """Handle adaptive control configuration."""
+        errors: Dict[str, str] = {}
+        if user_input is not None:
+            try:
+                validated_input = _validate_input(user_input, STEP_ADAPTIVE_SCHEMA)
+                self._config_data.update(validated_input)
+                return await self.async_step_presets_setup()
+            except vol.MultipleInvalid as e:
+                _LOGGER.error(f"Validation error in adaptive control setup: {e}")
+                for error in e.errors:
+                    path = error.path[0] if error.path else "base"
+                    errors[path if isinstance(path, str) else "base"] = "invalid_input"
+            except Exception:  # pylint: disable=broad-except
+                _LOGGER.exception("Unexpected exception in adaptive_setup")
+                errors["base"] = "unknown"
+
+        return self.async_show_form(
+            step_id="adaptive_setup",
+            data_schema=STEP_ADAPTIVE_SCHEMA,
             errors=errors,
         )
 
@@ -423,7 +484,7 @@ class AdaptiveThermostatConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             try:
                 validated_input = _validate_input(user_input, STEP_AUTO_ONOFF_SCHEMA)
                 self._config_data.update(validated_input)
-                return await self.async_step_reconfigure_presets_setup()
+                return await self.async_step_reconfigure_adaptive_setup()
             except vol.MultipleInvalid as e:
                 _LOGGER.error(f"Validation error in reconfigure auto on/off setup: {e}")
                 for error in e.errors:
@@ -448,6 +509,42 @@ class AdaptiveThermostatConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         
         return self.async_show_form(
             step_id="reconfigure_auto_onoff_setup",
+            data_schema=vol.Schema(schema_dict),
+            errors=errors,
+        )
+
+    async def async_step_reconfigure_adaptive_setup(self, user_input: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        """Handle reconfiguration of adaptive control settings."""
+        config_entry = self._get_reconfigure_entry()
+        errors: Dict[str, str] = {}
+
+        if user_input is not None:
+            try:
+                validated_input = _validate_input(user_input, STEP_ADAPTIVE_SCHEMA)
+                self._config_data.update(validated_input)
+                return await self.async_step_reconfigure_presets_setup()
+            except vol.MultipleInvalid as e:
+                _LOGGER.error(f"Validation error in reconfigure adaptive setup: {e}")
+                for error in e.errors:
+                    path = error.path[0] if error.path else "base"
+                    errors[path if isinstance(path, str) else "base"] = "invalid_input"
+            except Exception:  # pylint: disable=broad-except
+                _LOGGER.exception("Unexpected exception in reconfigure adaptive setup")
+                errors["base"] = "unknown"
+
+        current_data = config_entry.data
+        schema_dict = {}
+        for key_obj, selector_config in STEP_ADAPTIVE_SCHEMA.schema.items():
+            key_str = key_obj.schema if isinstance(key_obj, vol.Marker) else key_obj
+            current_value = current_data.get(key_str)
+
+            if current_value is None and hasattr(key_obj, "default") and key_obj.default is not vol.UNDEFINED:
+                current_value = key_obj.default() if callable(key_obj.default) else key_obj.default
+
+            schema_dict[vol.Required(key_str, default=current_value)] = selector_config
+
+        return self.async_show_form(
+            step_id="reconfigure_adaptive_setup",
             data_schema=vol.Schema(schema_dict),
             errors=errors,
         )
