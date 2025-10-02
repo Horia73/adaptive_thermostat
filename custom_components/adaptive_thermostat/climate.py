@@ -534,18 +534,22 @@ class AdaptiveThermostat(ClimateEntity):
 
     async def async_set_hvac_mode(self, hvac_mode: HVACMode) -> None:
         """Set new target hvac mode."""
-        _LOGGER.debug("[%s] Setting HVAC mode to: %s", self._entry_id, hvac_mode)
+        _LOGGER.info("[%s] User manually setting HVAC mode to: %s", self._entry_id, hvac_mode)
         
         # Mark as manual override when user manually changes HVAC mode
         self._manual_override = True
         self._attr_extra_state_attributes["manual_override"] = True
         
         if hvac_mode == HVACMode.OFF:
+            # Turn off heaters and update state
             await self._async_turn_heater_off()
+            self._zone_heater_on = False
             self._hvac_mode = HVACMode.OFF
+            _LOGGER.info("[%s] Heaters turned OFF by user", self._entry_id)
         elif hvac_mode == HVACMode.HEAT:
             self._hvac_mode = HVACMode.HEAT
             await self._async_control_heating(dt_util.utcnow().timestamp())
+            _LOGGER.info("[%s] Heating mode enabled by user", self._entry_id)
         else:
             _LOGGER.warning("[%s] Unsupported HVAC mode: %s", self._entry_id, hvac_mode)
             return
@@ -653,8 +657,12 @@ class AdaptiveThermostat(ClimateEntity):
                 now,
             )
 
-            if self._auto_on_off_enabled and not self._manual_override:
-                await self._async_handle_auto_onoff(outdoor_temp, backup_outdoor_temp)
+            # Run auto_on_off only when manual override is not active
+            if self._auto_on_off_enabled:
+                if self._manual_override:
+                    _LOGGER.debug("[%s] Auto on/off skipped - manual override is active", self._entry_id)
+                else:
+                    await self._async_handle_auto_onoff(outdoor_temp, backup_outdoor_temp)
 
             if self._hvac_mode == HVACMode.HEAT:
                 await self._async_control_heating(now_ts)
@@ -1200,14 +1208,6 @@ class AdaptiveThermostat(ClimateEntity):
             await self._async_turn_heater_off()
             self._hvac_mode = HVACMode.OFF
 
-        # Clear manual override if auto conditions would naturally change state
-        if (
-            (temp < self._auto_on_temp and self._hvac_mode == HVACMode.HEAT)
-            or (temp > self._auto_off_temp and self._hvac_mode == HVACMode.OFF)
-        ):
-            self._manual_override = False
-            self._attr_extra_state_attributes["manual_override"] = False
-
     async def _async_control_heating(self, now_ts: float) -> None:
         """Control heating based on adaptive model."""
         should_heat = self._evaluate_should_heat(now_ts)
@@ -1383,8 +1383,13 @@ class AdaptiveThermostat(ClimateEntity):
             self._central_heater_task = None
 
     def reset_manual_override(self) -> None:
-        """Reset manual override to allow auto on/off to resume."""
-        _LOGGER.info("[%s] Manual override reset - auto on/off will resume", self._entry_id)
+        """Reset manual override to allow auto on/off to resume.
+        
+        This service allows you to clear the manual override flag that is set
+        when you manually control the thermostat via the UI. Once cleared,
+        the auto_on_off feature will resume automatic control based on outdoor temperature.
+        """
+        _LOGGER.info("[%s] Manual override reset by service call - auto on/off will resume", self._entry_id)
         self._manual_override = False
         self._attr_extra_state_attributes["manual_override"] = False
         self.async_write_ha_state()
