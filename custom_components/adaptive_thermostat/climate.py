@@ -534,22 +534,29 @@ class AdaptiveThermostat(ClimateEntity):
 
     async def async_set_hvac_mode(self, hvac_mode: HVACMode) -> None:
         """Set new target hvac mode."""
-        _LOGGER.info("[%s] User manually setting HVAC mode to: %s", self._entry_id, hvac_mode)
+        _LOGGER.info("[%s] 👤 USER ACTION: Setting HVAC mode from %s to %s", 
+                    self._entry_id, self._hvac_mode, hvac_mode)
         
         # Mark as manual override when user manually changes HVAC mode
         self._manual_override = True
         self._attr_extra_state_attributes["manual_override"] = True
         
         if hvac_mode == HVACMode.OFF:
-            # Turn off heaters and update state
-            await self._async_turn_heater_off()
-            self._zone_heater_on = False
+            # First set HVAC mode to OFF to prevent control loop from running
             self._hvac_mode = HVACMode.OFF
-            _LOGGER.info("[%s] Heaters turned OFF by user", self._entry_id)
+            
+            # Turn off heaters and update state
+            if self._zone_heater_on:
+                _LOGGER.info("[%s] 🛑 User turned OFF - shutting down zone heaters", self._entry_id)
+                await self._async_turn_heater_off()
+            self._zone_heater_on = False
+            
+            _LOGGER.info("[%s] ✅ Zone is now OFF (manual override active)", self._entry_id)
+            
         elif hvac_mode == HVACMode.HEAT:
             self._hvac_mode = HVACMode.HEAT
+            _LOGGER.info("[%s] 🔥 User enabled HEAT mode - starting adaptive control", self._entry_id)
             await self._async_control_heating(dt_util.utcnow().timestamp())
-            _LOGGER.info("[%s] Heating mode enabled by user", self._entry_id)
         else:
             _LOGGER.warning("[%s] Unsupported HVAC mode: %s", self._entry_id, hvac_mode)
             return
@@ -1210,11 +1217,16 @@ class AdaptiveThermostat(ClimateEntity):
 
     async def _async_control_heating(self, now_ts: float) -> None:
         """Control heating based on adaptive model."""
+        # Don't control if HVAC mode is OFF
+        if self._hvac_mode != HVACMode.HEAT:
+            _LOGGER.debug("[%s] Control heating skipped - HVAC mode is %s", self._entry_id, self._hvac_mode)
+            return
+            
         should_heat = self._evaluate_should_heat(now_ts)
 
         if should_heat and not self._zone_heater_on:
-            _LOGGER.debug(
-                "[%s] Turning heater ON (current=%.2f°C, target=%.2f°C)",
+            _LOGGER.info(
+                "[%s] 🔥 Control: Turning heater ON (current=%.2f°C, target=%.2f°C)",
                 self._entry_id,
                 self._current_temperature if self._current_temperature is not None else float("nan"),
                 self._target_temperature if self._target_temperature is not None else float("nan"),
@@ -1223,8 +1235,8 @@ class AdaptiveThermostat(ClimateEntity):
             self._zone_heater_on = True
 
         elif not should_heat and self._zone_heater_on:
-            _LOGGER.debug(
-                "[%s] Turning heater OFF (current=%.2f°C, target=%.2f°C)",
+            _LOGGER.info(
+                "[%s] ❄️  Control: Turning heater OFF (current=%.2f°C, target=%.2f°C)",
                 self._entry_id,
                 self._current_temperature if self._current_temperature is not None else float("nan"),
                 self._target_temperature if self._target_temperature is not None else float("nan"),
@@ -1238,11 +1250,15 @@ class AdaptiveThermostat(ClimateEntity):
             return
             
         domain = "climate" if entity_id.startswith("climate.") else "switch"
-        _LOGGER.info("[%s] Turning on %s: %s", self._entry_id, entity_name, entity_id)
+        _LOGGER.info("[%s] 🟢 Turning ON %s: %s (domain: %s)", self._entry_id, entity_name, entity_id, domain)
         
-        await self.hass.services.async_call(
-            domain, "turn_on", {"entity_id": entity_id}, blocking=True
-        )
+        try:
+            await self.hass.services.async_call(
+                domain, "turn_on", {"entity_id": entity_id}, blocking=True
+            )
+            _LOGGER.info("[%s] ✅ Successfully turned ON %s: %s", self._entry_id, entity_name, entity_id)
+        except Exception as e:
+            _LOGGER.error("[%s] ❌ Failed to turn ON %s: %s - Error: %s", self._entry_id, entity_name, entity_id, e)
 
     async def _async_turn_off_entity(self, entity_id: str, entity_name: str) -> None:
         """Turn off an entity (switch or climate)."""
@@ -1250,45 +1266,55 @@ class AdaptiveThermostat(ClimateEntity):
             return
             
         domain = "climate" if entity_id.startswith("climate.") else "switch"
-        _LOGGER.info("[%s] Turning off %s: %s", self._entry_id, entity_name, entity_id)
+        _LOGGER.info("[%s] 🔴 Turning OFF %s: %s (domain: %s)", self._entry_id, entity_name, entity_id, domain)
         
-        await self.hass.services.async_call(
-            domain, "turn_off", {"entity_id": entity_id}, blocking=True
-        )
+        try:
+            await self.hass.services.async_call(
+                domain, "turn_off", {"entity_id": entity_id}, blocking=True
+            )
+            _LOGGER.info("[%s] ✅ Successfully turned OFF %s: %s", self._entry_id, entity_name, entity_id)
+        except Exception as e:
+            _LOGGER.error("[%s] ❌ Failed to turn OFF %s: %s - Error: %s", self._entry_id, entity_name, entity_id, e)
 
     async def _async_check_other_zones_need_heat(self) -> bool:
         """Check if other zones using the same central heater need heat."""
         if not self._central_heater_entity_id:
             return False
             
-        # Get all adaptive thermostat entities in HA
-        all_entities = []
-        for entity_id in self.hass.states.async_entity_ids("climate"):
-            if entity_id.startswith("climate.adaptive_thermostat"):
-                entity = self.hass.data.get("climate", {}).get(entity_id)
-                if entity and hasattr(entity, '_central_heater_entity_id'):
-                    all_entities.append(entity)
+        # Get all adaptive thermostat entities from domain data
+        domain_data = self.hass.data.get(DOMAIN, {})
+        all_entities = domain_data.get("entities", {})
         
         # Check entities with same central heater
-        for entity in all_entities:
+        for entity_id, entity in all_entities.items():
             if (entity != self and 
+                hasattr(entity, '_central_heater_entity_id') and
                 entity._central_heater_entity_id == self._central_heater_entity_id and
-                entity._zone_heater_on):
-                _LOGGER.debug("[%s] Other zone %s still needs heat", self._entry_id, entity.entity_id)
+                hasattr(entity, '_zone_heater_on') and
+                entity._zone_heater_on and
+                hasattr(entity, '_hvac_mode') and
+                entity._hvac_mode == HVACMode.HEAT):
+                _LOGGER.debug("[%s] Other zone %s still needs heat (heater_on=%s, hvac_mode=%s)", 
+                            self._entry_id, entity_id, entity._zone_heater_on, entity._hvac_mode)
                 return True
                 
-        _LOGGER.debug("[%s] No other zones need heat from central heater", self._entry_id)
+        _LOGGER.info("[%s] No other zones need heat from central heater - all zones OFF", self._entry_id)
         return False
 
     async def _async_turn_heater_on(self) -> None:
         """Turn on zone heaters and coordinate with central heater."""
-        # Turn on all zone heaters
+        _LOGGER.info("[%s] 📍 Starting heater turn-on sequence for %d valves", 
+                    self._entry_id, len(self._heater_entity_ids))
+        
+        # Turn on all zone heaters (valves)
         for heater_id in self._heater_entity_ids:
-            await self._async_turn_on_entity(heater_id, "zone heater")
+            await self._async_turn_on_entity(heater_id, "zone heater/valve")
         
         # Coordinate with central heater if configured
         if self._central_heater_entity_id:
             await self._async_coordinate_central_heater_on()
+        else:
+            _LOGGER.debug("[%s] No central heater configured - only zone valves controlled", self._entry_id)
 
         now_ts = dt_util.utcnow().timestamp()
         self._awaiting_delay_timestamp = now_ts
@@ -1300,13 +1326,18 @@ class AdaptiveThermostat(ClimateEntity):
 
     async def _async_turn_heater_off(self) -> None:
         """Turn off zone heaters and coordinate with central heater."""
-        # Turn off all zone heaters first
+        _LOGGER.info("[%s] 📍 Starting heater turn-off sequence for %d valves", 
+                    self._entry_id, len(self._heater_entity_ids))
+        
+        # Turn off all zone heaters (valves) first
         for heater_id in self._heater_entity_ids:
-            await self._async_turn_off_entity(heater_id, "zone heater")
+            await self._async_turn_off_entity(heater_id, "zone heater/valve")
         
         # Coordinate with central heater if configured
         if self._central_heater_entity_id:
             await self._async_coordinate_central_heater_off()
+        else:
+            _LOGGER.debug("[%s] No central heater configured - only zone valves controlled", self._entry_id)
 
         now_ts = dt_util.utcnow().timestamp()
         self._awaiting_delay_timestamp = None
@@ -1368,15 +1399,26 @@ class AdaptiveThermostat(ClimateEntity):
     async def _async_delayed_central_heater_off(self) -> None:
         """Turn off central heater after configured delay for pump protection."""
         try:
-            _LOGGER.debug("[%s] Waiting %s seconds before turning off central heater (pump protection)", 
+            # First wait a short time to allow other zones to update their state
+            _LOGGER.debug("[%s] Checking if other zones need heat before turning off central heater", self._entry_id)
+            await asyncio.sleep(2)  # Short delay to allow other zones to sync
+            
+            # Check if any other zone needs heat
+            if await self._async_check_other_zones_need_heat():
+                _LOGGER.info("[%s] Other zones need heat - keeping central heater ON", self._entry_id)
+                return
+            
+            # No other zones need heat - proceed with pump protection delay
+            _LOGGER.info("[%s] All zones OFF - waiting %s seconds for pump protection before turning off central heater", 
                          self._entry_id, self._central_heater_turn_off_delay)
             await asyncio.sleep(self._central_heater_turn_off_delay)
             
-            # Double-check no other zones need heat before turning off
+            # Final check before turning off
             if not await self._async_check_other_zones_need_heat():
                 await self._async_turn_off_entity(self._central_heater_entity_id, "central heater")
-                _LOGGER.info("[%s] Central heater turned off after %s second delay", 
-                            self._entry_id, self._central_heater_turn_off_delay)
+                _LOGGER.info("[%s] Central heater turned OFF - all zones are OFF", self._entry_id)
+            else:
+                _LOGGER.info("[%s] A zone turned back on during delay - keeping central heater ON", self._entry_id)
         except asyncio.CancelledError:
             _LOGGER.debug("[%s] Central heater turn-off task cancelled", self._entry_id)
         finally:
