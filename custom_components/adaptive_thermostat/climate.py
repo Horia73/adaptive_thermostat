@@ -1269,7 +1269,7 @@ class AdaptiveThermostat(ClimateEntity):
         domain = entity_id.split(".", 1)[0]
 
         if domain == "valve":
-            service = "open" if turn_on else "close"
+            service = "open_valve" if turn_on else "close_valve"
         elif domain in {"switch", "input_boolean", "climate"}:
             service = "turn_on" if turn_on else "turn_off"
         else:
@@ -1279,7 +1279,7 @@ class AdaptiveThermostat(ClimateEntity):
         return domain, service
 
     async def _async_turn_on_entity(self, entity_id: str, entity_name: str) -> None:
-        """Turn on an entity (switch or climate)."""
+        """Turn on an entity (switch, climate, or valve)."""
         if not entity_id:
             return
 
@@ -1305,7 +1305,7 @@ class AdaptiveThermostat(ClimateEntity):
             _LOGGER.error("[%s] ❌ Failed to turn ON %s: %s - Error: %s", self._entry_id, entity_name, entity_id, e)
 
     async def _async_turn_off_entity(self, entity_id: str, entity_name: str) -> None:
-        """Turn off an entity (switch or climate)."""
+        """Turn off an entity (switch, climate, or valve)."""
         if not entity_id:
             return
             
