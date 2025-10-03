@@ -179,10 +179,22 @@ class AdaptiveThermostat(ClimateEntity):
 
         # Central heater configuration (optional)
         self._central_heater_entity_id = get_entity_id(CONF_CENTRAL_HEATER)
-        
+
         # Central heater timing configuration
-        self._central_heater_turn_on_delay = config.get(CONF_CENTRAL_HEATER_TURN_ON_DELAY, CENTRAL_HEATER_TURN_ON_DELAY)
-        self._central_heater_turn_off_delay = config.get(CONF_CENTRAL_HEATER_TURN_OFF_DELAY, CENTRAL_HEATER_TURN_OFF_DELAY)
+        self._central_heater_turn_on_delay = config.get(
+            CONF_CENTRAL_HEATER_TURN_ON_DELAY, CENTRAL_HEATER_TURN_ON_DELAY
+        )
+        self._central_heater_turn_off_delay = config.get(
+            CONF_CENTRAL_HEATER_TURN_OFF_DELAY, CENTRAL_HEATER_TURN_OFF_DELAY
+        )
+
+        # Ensure the central heater is not also treated as a zone valve
+        if self._central_heater_entity_id:
+            self._heater_entity_ids = [
+                heater_id
+                for heater_id in self._heater_entity_ids
+                if heater_id != self._central_heater_entity_id
+            ]
         
         # Auto on/off configuration
         self._auto_on_off_enabled = config.get(CONF_AUTO_ON_OFF_ENABLED, False)
@@ -265,6 +277,7 @@ class AdaptiveThermostat(ClimateEntity):
         # Central heater coordination state
         self._zone_heater_on = False
         self._central_heater_task = None
+        self._delayed_valve_off_task = None
 
         # Listener for state changes
         self._remove_listener = None
@@ -428,6 +441,10 @@ class AdaptiveThermostat(ClimateEntity):
         if self._central_heater_task:
             self._central_heater_task.cancel()
             self._central_heater_task = None
+
+        if self._delayed_valve_off_task:
+            self._delayed_valve_off_task.cancel()
+            self._delayed_valve_off_task = None
 
         if self._remove_listener:
             self._remove_listener()
@@ -1221,7 +1238,7 @@ class AdaptiveThermostat(ClimateEntity):
         if self._hvac_mode != HVACMode.HEAT:
             _LOGGER.debug("[%s] Control heating skipped - HVAC mode is %s", self._entry_id, self._hvac_mode)
             return
-            
+
         should_heat = self._evaluate_should_heat(now_ts)
 
         if should_heat and not self._zone_heater_on:
@@ -1244,17 +1261,44 @@ class AdaptiveThermostat(ClimateEntity):
             await self._async_turn_heater_off()
             self._zone_heater_on = False
 
+    def _resolve_domain_and_service(self, entity_id: str, turn_on: bool) -> tuple[str, str]:
+        """Return the target domain and service for an entity action."""
+        if not entity_id or "." not in entity_id:
+            return "switch", "turn_on" if turn_on else "turn_off"
+
+        domain = entity_id.split(".", 1)[0]
+
+        if domain == "valve":
+            service = "open" if turn_on else "close"
+        elif domain in {"switch", "input_boolean", "climate"}:
+            service = "turn_on" if turn_on else "turn_off"
+        else:
+            # Default to generic turn_on/turn_off
+            service = "turn_on" if turn_on else "turn_off"
+
+        return domain, service
+
     async def _async_turn_on_entity(self, entity_id: str, entity_name: str) -> None:
         """Turn on an entity (switch or climate)."""
         if not entity_id:
             return
-            
-        domain = "climate" if entity_id.startswith("climate.") else "switch"
-        _LOGGER.info("[%s] 🟢 Turning ON %s: %s (domain: %s)", self._entry_id, entity_name, entity_id, domain)
-        
+
+        domain, service = self._resolve_domain_and_service(entity_id, True)
+        _LOGGER.info(
+            "[%s] 🟢 Turning ON %s: %s (domain: %s, service: %s)",
+            self._entry_id,
+            entity_name,
+            entity_id,
+            domain,
+            service,
+        )
+
         try:
             await self.hass.services.async_call(
-                domain, "turn_on", {"entity_id": entity_id}, blocking=True
+                domain,
+                service,
+                {"entity_id": entity_id},
+                blocking=True,
             )
             _LOGGER.info("[%s] ✅ Successfully turned ON %s: %s", self._entry_id, entity_name, entity_id)
         except Exception as e:
@@ -1265,12 +1309,22 @@ class AdaptiveThermostat(ClimateEntity):
         if not entity_id:
             return
             
-        domain = "climate" if entity_id.startswith("climate.") else "switch"
-        _LOGGER.info("[%s] 🔴 Turning OFF %s: %s (domain: %s)", self._entry_id, entity_name, entity_id, domain)
-        
+        domain, service = self._resolve_domain_and_service(entity_id, False)
+        _LOGGER.info(
+            "[%s] 🔴 Turning OFF %s: %s (domain: %s, service: %s)",
+            self._entry_id,
+            entity_name,
+            entity_id,
+            domain,
+            service,
+        )
+
         try:
             await self.hass.services.async_call(
-                domain, "turn_off", {"entity_id": entity_id}, blocking=True
+                domain,
+                service,
+                {"entity_id": entity_id},
+                blocking=True,
             )
             _LOGGER.info("[%s] ✅ Successfully turned OFF %s: %s", self._entry_id, entity_name, entity_id)
         except Exception as e:
@@ -1303,13 +1357,18 @@ class AdaptiveThermostat(ClimateEntity):
 
     async def _async_turn_heater_on(self) -> None:
         """Turn on zone heaters and coordinate with central heater."""
-        _LOGGER.info("[%s] 📍 Starting heater turn-on sequence for %d valves", 
+        _LOGGER.info("[%s] 📍 Starting heater turn-on sequence for %d valves",
                     self._entry_id, len(self._heater_entity_ids))
-        
+
+        # Cancel any pending delayed valve close tasks
+        if self._delayed_valve_off_task:
+            self._delayed_valve_off_task.cancel()
+            self._delayed_valve_off_task = None
+
         # Turn on all zone heaters (valves)
         for heater_id in self._heater_entity_ids:
             await self._async_turn_on_entity(heater_id, "zone heater/valve")
-        
+
         # Coordinate with central heater if configured
         if self._central_heater_entity_id:
             await self._async_coordinate_central_heater_on()
@@ -1324,18 +1383,62 @@ class AdaptiveThermostat(ClimateEntity):
         self._last_command_timestamp = now_ts
         self._last_heater_command = True
 
-    async def _async_turn_heater_off(self) -> None:
-        """Turn off zone heaters and coordinate with central heater."""
-        _LOGGER.info("[%s] 📍 Starting heater turn-off sequence for %d valves", 
-                    self._entry_id, len(self._heater_entity_ids))
-        
-        # Turn off all zone heaters (valves) first
+    async def _async_close_zone_valves(self) -> None:
+        """Helper to close all configured zone valves."""
         for heater_id in self._heater_entity_ids:
             await self._async_turn_off_entity(heater_id, "zone heater/valve")
-        
+
+    async def _async_delayed_close_zone_valves(self, delay: float) -> None:
+        """Close valves after a delay, unless cancelled by a new heat request."""
+        try:
+            if delay > 0:
+                _LOGGER.info(
+                    "[%s] Waiting %s seconds before closing zone valves to protect the pump",
+                    self._entry_id,
+                    delay,
+                )
+                await asyncio.sleep(delay)
+
+            if not self._zone_heater_on:
+                await self._async_close_zone_valves()
+        except asyncio.CancelledError:
+            _LOGGER.debug("[%s] Delayed valve close task cancelled", self._entry_id)
+        finally:
+            self._delayed_valve_off_task = None
+
+    async def _async_turn_heater_off(self) -> None:
+        """Turn off zone heaters and coordinate with central heater."""
+        _LOGGER.info("[%s] 📍 Starting heater turn-off sequence for %d valves",
+                    self._entry_id, len(self._heater_entity_ids))
+
+        # Cancel any existing delayed valve close task
+        if self._delayed_valve_off_task:
+            self._delayed_valve_off_task.cancel()
+            self._delayed_valve_off_task = None
+
+        # Determine if any other zones sharing the central heater still need heat
+        other_zones_need_heat = False
+        if self._central_heater_entity_id:
+            other_zones_need_heat = await self._async_check_other_zones_need_heat()
+
+        if other_zones_need_heat:
+            _LOGGER.info(
+                "[%s] Other zones still need heat - closing this zone's valves immediately",
+                self._entry_id,
+            )
+            await self._async_close_zone_valves()
+        else:
+            delay = max(0, float(self._central_heater_turn_off_delay or 0))
+            if delay > 0:
+                self._delayed_valve_off_task = asyncio.create_task(
+                    self._async_delayed_close_zone_valves(delay)
+                )
+            else:
+                await self._async_close_zone_valves()
+
         # Coordinate with central heater if configured
         if self._central_heater_entity_id:
-            await self._async_coordinate_central_heater_off()
+            await self._async_coordinate_central_heater_off(other_zones_need_heat)
         else:
             _LOGGER.debug("[%s] No central heater configured - only zone valves controlled", self._entry_id)
 
@@ -1362,22 +1465,28 @@ class AdaptiveThermostat(ClimateEntity):
             self._async_delayed_central_heater_on()
         )
 
-    async def _async_coordinate_central_heater_off(self) -> None:
-        """Coordinate turning off central heater after checking other zones."""
+    async def _async_coordinate_central_heater_off(self, other_zones_need_heat: bool) -> None:
+        """Coordinate turning off central heater considering other zones."""
         if not self._central_heater_entity_id:
             return
-            
-        # Cancel any existing task
+
+        # Cancel any pending on/off coordination task
         if self._central_heater_task:
             self._central_heater_task.cancel()
             self._central_heater_task = None
-        
-        # Check if other zones still need heat
-        if not await self._async_check_other_zones_need_heat():
-            # Create task to turn off central heater after delay
-            self._central_heater_task = asyncio.create_task(
-                self._async_delayed_central_heater_off()
+
+        if other_zones_need_heat:
+            _LOGGER.info(
+                "[%s] Keeping central heater ON because another zone still requires heat",
+                self._entry_id,
             )
+            return
+
+        await self._async_turn_off_entity(self._central_heater_entity_id, "central heater")
+        _LOGGER.info(
+            "[%s] Central heater turned OFF immediately - no other zones require heat",
+            self._entry_id,
+        )
 
     async def _async_delayed_central_heater_on(self) -> None:
         """Turn on central heater after configured delay."""
@@ -1393,34 +1502,6 @@ class AdaptiveThermostat(ClimateEntity):
                             self._entry_id, self._central_heater_turn_on_delay)
         except asyncio.CancelledError:
             _LOGGER.debug("[%s] Central heater turn-on task cancelled", self._entry_id)
-        finally:
-            self._central_heater_task = None
-
-    async def _async_delayed_central_heater_off(self) -> None:
-        """Turn off central heater after configured delay for pump protection."""
-        try:
-            # First wait a short time to allow other zones to update their state
-            _LOGGER.debug("[%s] Checking if other zones need heat before turning off central heater", self._entry_id)
-            await asyncio.sleep(2)  # Short delay to allow other zones to sync
-            
-            # Check if any other zone needs heat
-            if await self._async_check_other_zones_need_heat():
-                _LOGGER.info("[%s] Other zones need heat - keeping central heater ON", self._entry_id)
-                return
-            
-            # No other zones need heat - proceed with pump protection delay
-            _LOGGER.info("[%s] All zones OFF - waiting %s seconds for pump protection before turning off central heater", 
-                         self._entry_id, self._central_heater_turn_off_delay)
-            await asyncio.sleep(self._central_heater_turn_off_delay)
-            
-            # Final check before turning off
-            if not await self._async_check_other_zones_need_heat():
-                await self._async_turn_off_entity(self._central_heater_entity_id, "central heater")
-                _LOGGER.info("[%s] Central heater turned OFF - all zones are OFF", self._entry_id)
-            else:
-                _LOGGER.info("[%s] A zone turned back on during delay - keeping central heater ON", self._entry_id)
-        except asyncio.CancelledError:
-            _LOGGER.debug("[%s] Central heater turn-off task cancelled", self._entry_id)
         finally:
             self._central_heater_task = None
 
