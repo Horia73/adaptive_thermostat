@@ -3,7 +3,7 @@
 import asyncio
 import logging
 import math
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional
 
@@ -74,6 +74,8 @@ from .const import (
     DEFAULT_FILTER_ALPHA,
     DEFAULT_WINDOW_DETECTION_ENABLED,
     DEFAULT_WINDOW_SLOPE_THRESHOLD,
+    MIN_TARGET_TEMP,
+    MAX_TARGET_TEMP,
     STORAGE_KEY,
     STORAGE_VERSION,
 )
@@ -83,6 +85,9 @@ MIN_SLOPE_THRESHOLD = 0.0002  # °C per second (~0.012°C per minute)
 DEFAULT_DELAY_SECONDS = 90.0
 CONTROL_KP = 0.6
 CONTROL_KI = 0.0005
+CYCLE_ENTRY_DELTA = 0.1  # °C below target where duty cycling kicks in
+CYCLE_EXIT_DELTA = 0.2  # °C below target required to leave cycling mode
+MAX_PROFILE_HISTORY = 60
 
 
 def _clamp(value: float, low: float, high: float) -> float:
@@ -101,6 +106,11 @@ class AdaptiveProfile:
     cooling_rate: float = 0.0
     overshoot: float = 0.0
     updated_at: float = 0.0
+    heating_samples: int = 0
+    cooling_samples: int = 0
+    delay_samples: int = 0
+    overshoot_samples: int = 0
+    history: list[dict[str, Any]] = field(default_factory=list)
 
     @property
     def is_learned(self) -> bool:
@@ -114,7 +124,24 @@ class AdaptiveProfile:
         if not data:
             return cls()
         base = cls()
-        return cls(**{k: data.get(k, getattr(base, k)) for k in cls.__annotations__.keys()})
+        cleaned: Dict[str, Any] = {}
+        for key in cls.__annotations__.keys():
+            default_value = getattr(base, key)
+            value = data.get(key, default_value)
+            if key == "history":
+                if isinstance(value, list):
+                    value = [dict(item) for item in value if isinstance(item, dict)]
+                else:
+                    value = list(default_value)
+            cleaned[key] = value
+
+        profile = cls(**cleaned)
+        profile.heating_samples = int(profile.heating_samples or 0)
+        profile.cooling_samples = int(profile.cooling_samples or 0)
+        profile.delay_samples = int(profile.delay_samples or 0)
+        profile.overshoot_samples = int(profile.overshoot_samples or 0)
+        profile.history = list(profile.history or [])[-MAX_PROFILE_HISTORY:]
+        return profile
 
 async def async_setup_entry(
     hass: HomeAssistant,
@@ -152,6 +179,26 @@ class AdaptiveThermostat(ClimateEntity):
             val = config.get(key)
             return val if val else None
         # --- End Helper ---
+
+        def clamp_temp(value: Any, fallback: float) -> float:
+            """Clamp configuration temperatures to supported range."""
+            try:
+                numeric = float(value)
+            except (TypeError, ValueError):
+                numeric = fallback
+            return _clamp(numeric, MIN_TARGET_TEMP, MAX_TARGET_TEMP)
+
+        def coerce_bool(value: Any, default: bool = False) -> bool:
+            """Convert config values that may be strings/ints into booleans."""
+            if isinstance(value, bool):
+                return value
+            if value is None:
+                return default
+            if isinstance(value, (int, float)):
+                return bool(value)
+            if isinstance(value, str):
+                return value.strip().lower() in {"1", "true", "yes", "on"}
+            return default
 
         # Required configuration
         self._attr_name = config.get(CONF_NAME, DEFAULT_NAME)
@@ -204,11 +251,14 @@ class AdaptiveThermostat(ClimateEntity):
         # Adaptive control configuration
         self._target_tolerance = max(0.01, float(config.get(CONF_TARGET_TOLERANCE, DEFAULT_TARGET_TOLERANCE)))
         self._control_window = max(60.0, float(config.get(CONF_CONTROL_WINDOW, DEFAULT_CONTROL_WINDOW)))
+        self._configured_control_window = self._control_window
+        self._dynamic_control_window: float | None = None
         self._min_on_time = max(10.0, float(config.get(CONF_MIN_ON_TIME, DEFAULT_MIN_ON_TIME)))
         self._min_off_time = max(10.0, float(config.get(CONF_MIN_OFF_TIME, DEFAULT_MIN_OFF_TIME)))
         self._filter_alpha = _clamp(float(config.get(CONF_FILTER_ALPHA, DEFAULT_FILTER_ALPHA)), 0.01, 0.8)
-        self._window_detection_enabled = bool(
-            config.get(CONF_WINDOW_DETECTION_ENABLED, DEFAULT_WINDOW_DETECTION_ENABLED)
+        self._window_detection_enabled = coerce_bool(
+            config.get(CONF_WINDOW_DETECTION_ENABLED, DEFAULT_WINDOW_DETECTION_ENABLED),
+            DEFAULT_WINDOW_DETECTION_ENABLED,
         )
         self._window_slope_threshold = max(
             0.1, float(config.get(CONF_WINDOW_SLOPE_THRESHOLD, DEFAULT_WINDOW_SLOPE_THRESHOLD))
@@ -236,9 +286,9 @@ class AdaptiveThermostat(ClimateEntity):
 
         # Preset temperatures
         self._presets = {
-            "sleep": config.get(CONF_SLEEP_PRESET, DEFAULT_SLEEP_PRESET),
-            "home": config.get(CONF_HOME_PRESET, DEFAULT_HOME_PRESET),
-            "away": config.get(CONF_AWAY_PRESET, DEFAULT_AWAY_PRESET),
+            "sleep": clamp_temp(config.get(CONF_SLEEP_PRESET, DEFAULT_SLEEP_PRESET), DEFAULT_SLEEP_PRESET),
+            "home": clamp_temp(config.get(CONF_HOME_PRESET, DEFAULT_HOME_PRESET), DEFAULT_HOME_PRESET),
+            "away": clamp_temp(config.get(CONF_AWAY_PRESET, DEFAULT_AWAY_PRESET), DEFAULT_AWAY_PRESET),
         }
 
         # Internal state attributes
@@ -271,6 +321,11 @@ class AdaptiveThermostat(ClimateEntity):
             "window_detection_enabled": self._window_detection_enabled,
             "window_open_detected": False,
             "window_slope_threshold": self._window_slope_threshold,
+            "cycle_mode_active": False,
+            "cycle_entry_delta": CYCLE_ENTRY_DELTA,
+            "cycle_exit_delta": CYCLE_EXIT_DELTA,
+            "min_target_temp": MIN_TARGET_TEMP,
+            "max_target_temp": MAX_TARGET_TEMP,
         }
         _LOGGER.debug("[%s] Extra state attributes set: %s", self._entry_id, self._attr_extra_state_attributes)
 
@@ -304,6 +359,7 @@ class AdaptiveThermostat(ClimateEntity):
         self._peak_target: float | None = None
         self._last_command_timestamp: float | None = None
         self._last_heater_command: Optional[bool] = None
+        self._cycle_mode_active: bool = False
         self._open_window_detected: bool = False
         self._last_window_event_ts: float | None = None
 
@@ -529,12 +585,12 @@ class AdaptiveThermostat(ClimateEntity):
     @property
     def min_temp(self) -> float:
         """Return the minimum temperature."""
-        return 5.0
+        return MIN_TARGET_TEMP
 
     @property
     def max_temp(self) -> float:
         """Return the maximum temperature."""
-        return 35.0
+        return MAX_TARGET_TEMP
 
     @property
     def target_temperature_step(self) -> float:
@@ -593,7 +649,17 @@ class AdaptiveThermostat(ClimateEntity):
         self._attr_extra_state_attributes["manual_override"] = True
         
         self._current_preset = preset_mode
-        self._target_temperature = self._presets[preset_mode]
+        target = self._presets[preset_mode]
+        clamped_target = _clamp(target, MIN_TARGET_TEMP, MAX_TARGET_TEMP)
+        if clamped_target != target:
+            _LOGGER.warning(
+                "[%s] Preset '%s' temperature %.2f°C is outside supported range; clamped to %.2f°C",
+                self._entry_id,
+                preset_mode,
+                target,
+                clamped_target,
+            )
+        self._target_temperature = clamped_target
         
         # Trigger heating control with new target temperature
         if self._hvac_mode == HVACMode.HEAT:
@@ -613,7 +679,17 @@ class AdaptiveThermostat(ClimateEntity):
         self._manual_override = True
         self._attr_extra_state_attributes["manual_override"] = True
         
-        self._target_temperature = float(temperature)
+        requested = float(temperature)
+        clamped = _clamp(requested, MIN_TARGET_TEMP, MAX_TARGET_TEMP)
+        if clamped != requested:
+            _LOGGER.warning(
+                "[%s] Requested target %.2f°C is outside supported range; clamped to %.2f°C",
+                self._entry_id,
+                requested,
+                clamped,
+            )
+
+        self._target_temperature = clamped
         
         # Clear preset mode when manually setting temperature
         self._current_preset = None
@@ -848,17 +924,29 @@ class AdaptiveThermostat(ClimateEntity):
             "heater_states": heater_states,
             "central_heater_state": central_heater_state,
             "zone_heater_on": self._zone_heater_on,
+            "cycle_mode_active": self._cycle_mode_active,
             "auto_on_off_enabled": self._auto_on_off_enabled,
             "auto_on_temp": self._auto_on_temp,
             "auto_off_temp": self._auto_off_temp,
             "manual_override": self._manual_override,
             "central_heater_turn_on_delay": self._central_heater_turn_on_delay,
             "central_heater_turn_off_delay": self._central_heater_turn_off_delay,
-            "control_window_seconds": self._control_window,
+            "control_window_seconds": round(self._control_window, 1),
+            "control_window_configured_seconds": round(self._configured_control_window, 1),
+            "control_window_adaptive_seconds": round(self._dynamic_control_window, 1)
+            if self._dynamic_control_window is not None
+            else None,
             "desired_on_time_seconds": round(self._window_desired_on, 1),
             "actual_on_time_seconds": round(self._window_on_time, 1),
             "integrator_state": round(self._integrator, 3),
             "adaptive_profile": self._adaptive_profile.to_dict(),
+            "adaptive_history": self._adaptive_profile.history[-10:],
+            "adaptive_learning_samples": {
+                "heating": self._adaptive_profile.heating_samples,
+                "cooling": self._adaptive_profile.cooling_samples,
+                "delay": self._adaptive_profile.delay_samples,
+                "overshoot": self._adaptive_profile.overshoot_samples,
+            },
             "window_detection_enabled": self._window_detection_enabled,
             "window_open_detected": self._open_window_detected,
             "window_slope_threshold": self._window_slope_threshold,
@@ -1001,28 +1089,62 @@ class AdaptiveThermostat(ClimateEntity):
             return
 
         if heater_on and slope > MIN_SLOPE_THRESHOLD:
-            alpha = 0.2
+            alpha = self._compute_learning_alpha(self._adaptive_profile.heating_samples)
             heating_rate = self._adaptive_profile.heating_rate or slope
             new_heating = (1 - alpha) * heating_rate + alpha * slope
-            self._set_profile_field("heating_rate", max(new_heating, MIN_SLOPE_THRESHOLD))
+            new_heating = max(new_heating, MIN_SLOPE_THRESHOLD)
+            changed_heating = self._set_profile_field("heating_rate", new_heating)
+            self._record_learning_event(
+                "heating_rate",
+                self._adaptive_profile.heating_rate,
+                {
+                    "sample_slope": round(slope, 5),
+                    "alpha": round(alpha, 4),
+                    "sample_dt": round(dt, 2),
+                    "changed": changed_heating,
+                },
+                sample_field="heating_samples",
+            )
 
             if (
                 outdoor_temp is not None
                 and self._filtered_temperature is not None
                 and self._adaptive_profile.loss_coefficient > 0
             ):
-                a_est = slope + self._adaptive_profile.loss_coefficient * (
-                    self._filtered_temperature - outdoor_temp
-                )
+                temp_delta = self._filtered_temperature - outdoor_temp
+                a_est = slope + self._adaptive_profile.loss_coefficient * temp_delta
                 if a_est > 0:
                     new_gain = (1 - alpha) * (self._adaptive_profile.heater_gain or a_est) + alpha * a_est
-                    self._set_profile_field("heater_gain", max(new_gain, MIN_SLOPE_THRESHOLD))
+                    new_gain = max(new_gain, MIN_SLOPE_THRESHOLD)
+                    changed_gain = self._set_profile_field("heater_gain", new_gain)
+                    self._record_learning_event(
+                        "heater_gain",
+                        self._adaptive_profile.heater_gain,
+                        {
+                            "sample_gain": round(a_est, 5),
+                            "alpha": round(alpha, 4),
+                            "temp_delta": round(temp_delta, 3),
+                            "changed": changed_gain,
+                        },
+                    )
 
         elif not heater_on and slope < -MIN_SLOPE_THRESHOLD:
-            alpha = 0.2
+            alpha = self._compute_learning_alpha(self._adaptive_profile.cooling_samples)
             cooling_sample = -slope
             new_cooling = (1 - alpha) * (self._adaptive_profile.cooling_rate or cooling_sample) + alpha * cooling_sample
-            self._set_profile_field("cooling_rate", max(new_cooling, MIN_SLOPE_THRESHOLD))
+            new_cooling = max(new_cooling, MIN_SLOPE_THRESHOLD)
+            changed_cooling = self._set_profile_field("cooling_rate", new_cooling)
+            self._record_learning_event(
+                "cooling_rate",
+                self._adaptive_profile.cooling_rate,
+                {
+                    "sample_slope": round(slope, 5),
+                    "alpha": round(alpha, 4),
+                    "sample_dt": round(dt, 2),
+                    "changed": changed_cooling,
+                },
+                sample_field="cooling_samples",
+            )
 
             if (
                 outdoor_temp is not None
@@ -1034,15 +1156,41 @@ class AdaptiveThermostat(ClimateEntity):
                     b_est = -slope / denominator
                     if 0 < b_est < 0.01:
                         new_loss = (1 - alpha) * (self._adaptive_profile.loss_coefficient or b_est) + alpha * b_est
-                        self._set_profile_field("loss_coefficient", max(new_loss, MIN_SLOPE_THRESHOLD / 10.0))
+                        new_loss = max(new_loss, MIN_SLOPE_THRESHOLD / 10.0)
+                        changed_loss = self._set_profile_field("loss_coefficient", new_loss)
+                        self._record_learning_event(
+                            "loss_coefficient",
+                            self._adaptive_profile.loss_coefficient,
+                            {
+                                "sample_loss": round(b_est, 6),
+                                "alpha": round(alpha, 4),
+                                "temp_delta": round(denominator, 3),
+                                "changed": changed_loss,
+                            },
+                        )
 
         # Delay estimation
         if heater_on and self._awaiting_delay_timestamp is not None and slope > MIN_SLOPE_THRESHOLD:
             delay = max(0.0, now_ts - self._awaiting_delay_timestamp)
             if delay > 0:
-                smoothed = (0.8 * self._adaptive_profile.delay_seconds) + (0.2 * delay)
-                self._set_profile_field("delay_seconds", _clamp(smoothed, 20.0, 900.0))
+                alpha_delay = self._compute_learning_alpha(self._adaptive_profile.delay_samples)
+                current_delay = self._adaptive_profile.delay_seconds or DEFAULT_DELAY_SECONDS
+                smoothed = (1 - alpha_delay) * current_delay + alpha_delay * delay
+                new_delay = _clamp(smoothed, 20.0, 900.0)
+                changed_delay = self._set_profile_field("delay_seconds", new_delay)
+                self._record_learning_event(
+                    "delay_seconds",
+                    self._adaptive_profile.delay_seconds,
+                    {
+                        "sample_delay": round(delay, 2),
+                        "alpha": round(alpha_delay, 4),
+                        "changed": changed_delay,
+                    },
+                    sample_field="delay_samples",
+                )
             self._awaiting_delay_timestamp = None
+
+        self._maybe_update_control_window()
 
         # Overshoot tracking after heater turned off
         if self._awaiting_peak:
@@ -1065,27 +1213,103 @@ class AdaptiveThermostat(ClimateEntity):
 
         if peak_temp is not None and target is not None:
             overshoot = peak_temp - target
-            beta = 0.3
-            if overshoot >= 0:
-                new_overshoot = (1 - beta) * self._adaptive_profile.overshoot + beta * overshoot
-            else:
-                new_overshoot = (1 - beta) * self._adaptive_profile.overshoot + beta * 0.0
-            self._set_profile_field("overshoot", max(new_overshoot, 0.0))
+            beta = self._compute_learning_alpha(
+                self._adaptive_profile.overshoot_samples,
+                min_alpha=0.05,
+                max_alpha=0.4,
+            )
+            target_sample = max(overshoot, 0.0)
+            new_overshoot = (1 - beta) * self._adaptive_profile.overshoot + beta * target_sample
+            new_overshoot = max(new_overshoot, 0.0)
+            changed_overshoot = self._set_profile_field("overshoot", new_overshoot)
+            self._record_learning_event(
+                "overshoot",
+                self._adaptive_profile.overshoot,
+                {
+                    "sample_overshoot": round(overshoot, 4),
+                    "alpha": round(beta, 4),
+                    "changed": changed_overshoot,
+                },
+                sample_field="overshoot_samples",
+            )
 
         self._awaiting_peak = False
         self._peak_target = None
         self._peak_max_temp = None
 
-    def _set_profile_field(self, field: str, value: float) -> None:
+    def _set_profile_field(self, field: str, value: float) -> bool:
         """Set adaptive profile field and schedule persistence if changed."""
         if math.isnan(value) or math.isinf(value):
-            return
+            return False
         current = getattr(self._adaptive_profile, field)
         if abs(value - current) < 1e-6:
-            return
+            return False
         setattr(self._adaptive_profile, field, value)
         self._adaptive_profile.updated_at = dt_util.utcnow().timestamp()
         self._mark_profile_dirty()
+        return True
+
+    def _compute_learning_alpha(self, samples: int, *, min_alpha: float = 0.05, max_alpha: float = 0.3) -> float:
+        """Return smoothing coefficient based on how many samples we have."""
+        samples = max(0, samples)
+        dynamic = 1.0 / (samples + 1)
+        return max(min_alpha, min(max_alpha, dynamic))
+
+    def _record_learning_event(
+        self,
+        kind: str,
+        value: float,
+        extra: Optional[Dict[str, Any]] = None,
+        sample_field: Optional[str] = None,
+    ) -> None:
+        """Append a learning event to history and persist counters."""
+        if sample_field:
+            current_samples = getattr(self._adaptive_profile, sample_field, 0) or 0
+            setattr(self._adaptive_profile, sample_field, current_samples + 1)
+
+        history = self._adaptive_profile.history
+        if not isinstance(history, list):
+            history = []
+            self._adaptive_profile.history = history
+
+        event: Dict[str, Any] = {
+            "timestamp": dt_util.utcnow().isoformat(),
+            "kind": kind,
+            "value": round(float(value), 5),
+        }
+        if extra:
+            event.update(extra)
+
+        history.append(event)
+        if len(history) > MAX_PROFILE_HISTORY:
+            del history[: len(history) - MAX_PROFILE_HISTORY]
+
+        self._mark_profile_dirty()
+
+    def _maybe_update_control_window(self) -> None:
+        """Adapt control window length based on learned dynamics."""
+        if self._adaptive_profile.heating_samples < 3 or self._adaptive_profile.cooling_samples < 3:
+            return
+
+        heating_rate = max(self._adaptive_profile.heating_rate, MIN_SLOPE_THRESHOLD)
+        cooling_rate = max(self._adaptive_profile.cooling_rate, MIN_SLOPE_THRESHOLD)
+        tolerance = max(self._target_tolerance, 0.05)
+        delay = max(self._adaptive_profile.delay_seconds, 20.0)
+
+        heating_time = tolerance / heating_rate
+        cooling_time = tolerance / cooling_rate
+
+        target_window = delay + heating_time + cooling_time
+        min_window = max(60.0, self._min_on_time + self._min_off_time, self._configured_control_window * 0.5)
+        max_window = min(900.0, self._configured_control_window * 1.5)
+        target_window = _clamp(target_window, min_window, max_window)
+
+        blend = 0.2
+        new_window = (1 - blend) * self._control_window + blend * target_window
+        if abs(new_window - self._control_window) > 0.5:
+            self._control_window = new_window
+            self._dynamic_control_window = new_window
+            self._window_desired_on = self._compute_desired_on_duration()
 
     def _mark_profile_dirty(self) -> None:
         """Schedule persistence of the adaptive profile."""
@@ -1152,7 +1376,34 @@ class AdaptiveThermostat(ClimateEntity):
         target = self._target_temperature
         tolerance = self._target_tolerance
 
-        if filtered <= target - tolerance:
+        delta_below_target = target - filtered
+        cycle_active = self._cycle_mode_active
+
+        if cycle_active:
+            if delta_below_target >= CYCLE_EXIT_DELTA:
+                cycle_active = False
+        else:
+            if delta_below_target <= CYCLE_ENTRY_DELTA:
+                cycle_active = True
+
+        if cycle_active != self._cycle_mode_active:
+            if cycle_active:
+                _LOGGER.debug(
+                    "[%s] Entering duty cycling (temperature %.2f°C below target)",
+                    self._entry_id,
+                    delta_below_target,
+                )
+            else:
+                _LOGGER.debug(
+                    "[%s] Exiting duty cycling (temperature %.2f°C below target)",
+                    self._entry_id,
+                    delta_below_target,
+                )
+            self._cycle_mode_active = cycle_active
+
+        self._attr_extra_state_attributes["cycle_mode_active"] = self._cycle_mode_active
+
+        if not self._cycle_mode_active and filtered <= target - tolerance:
             if not self._zone_heater_on and self._last_command_timestamp is not None:
                 if now_ts - self._last_command_timestamp < self._min_off_time:
                     return False
@@ -1173,12 +1424,20 @@ class AdaptiveThermostat(ClimateEntity):
             predicted_peak = filtered + heating_rate * delay + overshoot
             if predicted_peak >= target + tolerance:
                 return False
-            if self._window_desired_on > 0 and self._window_on_time >= self._window_desired_on and filtered >= target:
+            if (
+                self._window_desired_on > 0
+                and self._window_on_time >= self._window_desired_on
+                and (
+                    (not self._cycle_mode_active and filtered >= target)
+                    or (self._cycle_mode_active and filtered >= target - CYCLE_ENTRY_DELTA)
+                )
+            ):
                 return False
             return True
 
         predicted_floor = filtered - cooling_rate * delay
-        if predicted_floor <= target - tolerance:
+        floor_threshold = target - (CYCLE_ENTRY_DELTA if self._cycle_mode_active else tolerance)
+        if predicted_floor <= floor_threshold:
             return True
 
         if self._window_desired_on > 0 and self._window_on_time < self._window_desired_on:

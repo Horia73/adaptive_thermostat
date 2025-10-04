@@ -38,12 +38,16 @@ DEFAULT_HOME_PRESET = 23.0
 DEFAULT_SLEEP_PRESET = 21.0
 DEFAULT_AWAY_PRESET = 18.0
 DEFAULT_TARGET_TOLERANCE = 0.05
-DEFAULT_CONTROL_WINDOW = 300  # seconds
-DEFAULT_MIN_ON_TIME = 90      # seconds
-DEFAULT_MIN_OFF_TIME = 90     # seconds
+DEFAULT_CONTROL_WINDOW = 180  # seconds
+DEFAULT_MIN_ON_TIME = 45      # seconds
+DEFAULT_MIN_OFF_TIME = 45     # seconds
 DEFAULT_FILTER_ALPHA = 0.2
 DEFAULT_WINDOW_DETECTION_ENABLED = False
 DEFAULT_WINDOW_SLOPE_THRESHOLD = 0.6  # °C per minute
+
+# Temperature limits applied to presets and manual setpoints
+MIN_TARGET_TEMP = 5.0
+MAX_TARGET_TEMP = 30.0
 
 # Timing constants for central heater coordination
 CENTRAL_HEATER_TURN_ON_DELAY = 10  # seconds - delay before turning on central heater after valve

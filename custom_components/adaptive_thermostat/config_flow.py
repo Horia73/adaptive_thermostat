@@ -116,13 +116,13 @@ STEP_ADAPTIVE_SCHEMA = vol.Schema(
             selector.NumberSelectorConfig(min=0.02, max=0.5, step=0.01, mode="box", unit_of_measurement="°C")
         ),
         vol.Required(CONF_CONTROL_WINDOW, default=DEFAULT_CONTROL_WINDOW): selector.NumberSelector(
-            selector.NumberSelectorConfig(min=120, max=900, step=30, mode="box", unit_of_measurement="seconds")
+            selector.NumberSelectorConfig(min=60, max=900, step=30, mode="box", unit_of_measurement="seconds")
         ),
         vol.Required(CONF_MIN_ON_TIME, default=DEFAULT_MIN_ON_TIME): selector.NumberSelector(
-            selector.NumberSelectorConfig(min=30, max=300, step=10, mode="box", unit_of_measurement="seconds")
+            selector.NumberSelectorConfig(min=10, max=300, step=5, mode="box", unit_of_measurement="seconds")
         ),
         vol.Required(CONF_MIN_OFF_TIME, default=DEFAULT_MIN_OFF_TIME): selector.NumberSelector(
-            selector.NumberSelectorConfig(min=30, max=300, step=10, mode="box", unit_of_measurement="seconds")
+            selector.NumberSelectorConfig(min=10, max=300, step=5, mode="box", unit_of_measurement="seconds")
         ),
         vol.Required(CONF_FILTER_ALPHA, default=DEFAULT_FILTER_ALPHA): selector.NumberSelector(
             selector.NumberSelectorConfig(min=0.05, max=0.5, step=0.05, mode="box")
