@@ -326,6 +326,9 @@ class AdaptiveThermostat(ClimateEntity):
             "cycle_exit_delta": CYCLE_EXIT_DELTA,
             "min_target_temp": MIN_TARGET_TEMP,
             "max_target_temp": MAX_TARGET_TEMP,
+            "control_temperature": None,
+            "last_run_duration_seconds": None,
+            "last_overshoot_capture": None,
         }
         _LOGGER.debug("[%s] Extra state attributes set: %s", self._entry_id, self._attr_extra_state_attributes)
 
@@ -357,11 +360,13 @@ class AdaptiveThermostat(ClimateEntity):
         self._awaiting_peak: bool = False
         self._peak_max_temp: float | None = None
         self._peak_target: float | None = None
+        self._peak_run_duration: float | None = None
         self._last_command_timestamp: float | None = None
         self._last_heater_command: Optional[bool] = None
         self._cycle_mode_active: bool = False
         self._open_window_detected: bool = False
         self._last_window_event_ts: float | None = None
+        self._last_run_duration: float | None = None
 
         # Remove device creation - not needed for single climate entity
 
@@ -892,6 +897,13 @@ class AdaptiveThermostat(ClimateEntity):
 
         slope_per_min = self._temperature_slope * 60.0 if self._temperature_slope else 0.0
 
+        if self._filtered_temperature is None:
+            control_temperature = self._current_temperature
+        elif self._current_temperature is None:
+            control_temperature = self._filtered_temperature
+        else:
+            control_temperature = min(self._filtered_temperature, self._current_temperature)
+
         self._attr_extra_state_attributes.update({
             "zone_name": self._attr_name,
             "zone_id": self._entry_id,
@@ -917,6 +929,7 @@ class AdaptiveThermostat(ClimateEntity):
             "hvac_action": self.hvac_action.value if self.hvac_action else "unknown",
             "current_temperature": self._current_temperature,
             "filtered_temperature": self._filtered_temperature,
+            "control_temperature": control_temperature,
             "temperature_slope_per_min": slope_per_min,
             "target_temperature": self._target_temperature,
             "target_tolerance": self._target_tolerance,
@@ -925,6 +938,9 @@ class AdaptiveThermostat(ClimateEntity):
             "central_heater_state": central_heater_state,
             "zone_heater_on": self._zone_heater_on,
             "cycle_mode_active": self._cycle_mode_active,
+            "last_run_duration_seconds": round(self._last_run_duration, 1)
+            if self._last_run_duration is not None
+            else None,
             "auto_on_off_enabled": self._auto_on_off_enabled,
             "auto_on_temp": self._auto_on_temp,
             "auto_off_temp": self._auto_off_temp,
@@ -1194,9 +1210,14 @@ class AdaptiveThermostat(ClimateEntity):
 
         # Overshoot tracking after heater turned off
         if self._awaiting_peak:
-            if self._filtered_temperature is not None:
-                if self._peak_max_temp is None or self._filtered_temperature > self._peak_max_temp:
-                    self._peak_max_temp = self._filtered_temperature
+            peak_candidate = None
+            for temp in (self._current_temperature, self._filtered_temperature):
+                if temp is None:
+                    continue
+                peak_candidate = temp if peak_candidate is None else max(peak_candidate, temp)
+            if peak_candidate is not None:
+                if self._peak_max_temp is None or peak_candidate > self._peak_max_temp:
+                    self._peak_max_temp = peak_candidate
             if (
                 slope < -MIN_SLOPE_THRESHOLD
                 or (self._last_command_timestamp and now_ts - self._last_command_timestamp > self._control_window)
@@ -1221,6 +1242,8 @@ class AdaptiveThermostat(ClimateEntity):
             target_sample = max(overshoot, 0.0)
             new_overshoot = (1 - beta) * self._adaptive_profile.overshoot + beta * target_sample
             new_overshoot = max(new_overshoot, 0.0)
+            run_duration = self._peak_run_duration
+            run_duration_rounded = round(run_duration, 1) if run_duration is not None else None
             changed_overshoot = self._set_profile_field("overshoot", new_overshoot)
             self._record_learning_event(
                 "overshoot",
@@ -1228,14 +1251,24 @@ class AdaptiveThermostat(ClimateEntity):
                 {
                     "sample_overshoot": round(overshoot, 4),
                     "alpha": round(beta, 4),
+                    "run_duration": run_duration_rounded,
                     "changed": changed_overshoot,
                 },
                 sample_field="overshoot_samples",
             )
+            self._attr_extra_state_attributes["last_overshoot_capture"] = {
+                "peak_temp": round(peak_temp, 3),
+                "target": round(target, 3),
+                "overshoot": round(target_sample, 3),
+                "run_duration": run_duration_rounded,
+            }
+        else:
+            self._attr_extra_state_attributes["last_overshoot_capture"] = None
 
         self._awaiting_peak = False
         self._peak_target = None
         self._peak_max_temp = None
+        self._peak_run_duration = None
 
     def _set_profile_field(self, field: str, value: float) -> bool:
         """Set adaptive profile field and schedule persistence if changed."""
@@ -1293,7 +1326,7 @@ class AdaptiveThermostat(ClimateEntity):
 
         heating_rate = max(self._adaptive_profile.heating_rate, MIN_SLOPE_THRESHOLD)
         cooling_rate = max(self._adaptive_profile.cooling_rate, MIN_SLOPE_THRESHOLD)
-        tolerance = max(self._target_tolerance, 0.05)
+        tolerance = max(self._target_tolerance, 0.1)
         delay = max(self._adaptive_profile.delay_seconds, 20.0)
 
         heating_time = tolerance / heating_rate
@@ -1369,14 +1402,52 @@ class AdaptiveThermostat(ClimateEntity):
         if self._target_temperature is None:
             return False
 
-        filtered = self._filtered_temperature or self._current_temperature
-        if filtered is None:
+        raw_temp = self._current_temperature
+        filtered_temp = self._filtered_temperature
+
+        if filtered_temp is None and raw_temp is None:
+            return False
+
+        if filtered_temp is None:
+            filtered_temp = raw_temp
+
+        if raw_temp is None:
+            comparison_temp = filtered_temp
+        else:
+            comparison_temp = min(filtered_temp, raw_temp)
+
+        if comparison_temp is None:
             return False
 
         target = self._target_temperature
         tolerance = self._target_tolerance
 
-        delta_below_target = target - filtered
+        # Basic hysteresis guard outside comfort band to guarantee heat starts early enough
+        if comparison_temp <= target - tolerance:
+            if (
+                not self._zone_heater_on
+                and self._last_command_timestamp is not None
+                and now_ts - self._last_command_timestamp < self._min_off_time
+            ):
+                return False
+            if self._cycle_mode_active:
+                self._cycle_mode_active = False
+            self._attr_extra_state_attributes["cycle_mode_active"] = False
+            return True
+
+        if comparison_temp >= target + tolerance:
+            if (
+                self._zone_heater_on
+                and self._last_command_timestamp is not None
+                and now_ts - self._last_command_timestamp < self._min_on_time
+            ):
+                return True
+            if self._cycle_mode_active:
+                self._cycle_mode_active = False
+            self._attr_extra_state_attributes["cycle_mode_active"] = False
+            return False
+
+        delta_below_target = target - comparison_temp
         cycle_active = self._cycle_mode_active
 
         if cycle_active:
@@ -1389,13 +1460,13 @@ class AdaptiveThermostat(ClimateEntity):
         if cycle_active != self._cycle_mode_active:
             if cycle_active:
                 _LOGGER.debug(
-                    "[%s] Entering duty cycling (temperature %.2f°C below target)",
+                    "[%s] Entering duty cycling (effective temp %.2f°C below target)",
                     self._entry_id,
                     delta_below_target,
                 )
             else:
                 _LOGGER.debug(
-                    "[%s] Exiting duty cycling (temperature %.2f°C below target)",
+                    "[%s] Exiting duty cycling (effective temp %.2f°C below target)",
                     self._entry_id,
                     delta_below_target,
                 )
@@ -1403,39 +1474,44 @@ class AdaptiveThermostat(ClimateEntity):
 
         self._attr_extra_state_attributes["cycle_mode_active"] = self._cycle_mode_active
 
-        if not self._cycle_mode_active and filtered <= target - tolerance:
-            if not self._zone_heater_on and self._last_command_timestamp is not None:
-                if now_ts - self._last_command_timestamp < self._min_off_time:
-                    return False
-            return True
-
-        if filtered >= target + tolerance:
-            if self._zone_heater_on and self._last_command_timestamp is not None:
-                if now_ts - self._last_command_timestamp < self._min_on_time:
-                    return True
-            return False
-
         delay = _clamp(self._adaptive_profile.delay_seconds, 20.0, 900.0)
         overshoot = max(self._adaptive_profile.overshoot, 0.0)
         heating_rate = max(self._adaptive_profile.heating_rate, MIN_SLOPE_THRESHOLD)
         cooling_rate = max(self._adaptive_profile.cooling_rate, MIN_SLOPE_THRESHOLD)
 
+        in_min_on = (
+            self._zone_heater_on
+            and self._last_command_timestamp is not None
+            and now_ts - self._last_command_timestamp < self._min_on_time
+        )
+        in_min_off = (
+            not self._zone_heater_on
+            and self._last_command_timestamp is not None
+            and now_ts - self._last_command_timestamp < self._min_off_time
+        )
+
+        effective_filtered = filtered_temp if filtered_temp is not None else comparison_temp
+
         if self._zone_heater_on:
-            predicted_peak = filtered + heating_rate * delay + overshoot
-            if predicted_peak >= target + tolerance:
+            predicted_peak = effective_filtered + heating_rate * delay + overshoot
+            if predicted_peak >= target + tolerance and not in_min_on:
                 return False
             if (
                 self._window_desired_on > 0
                 and self._window_on_time >= self._window_desired_on
                 and (
-                    (not self._cycle_mode_active and filtered >= target)
-                    or (self._cycle_mode_active and filtered >= target - CYCLE_ENTRY_DELTA)
+                    (not self._cycle_mode_active and effective_filtered >= target)
+                    or (self._cycle_mode_active and comparison_temp >= target - CYCLE_ENTRY_DELTA)
                 )
+                and not in_min_on
             ):
                 return False
             return True
 
-        predicted_floor = filtered - cooling_rate * delay
+        if in_min_off:
+            return False
+
+        predicted_floor = comparison_temp - cooling_rate * delay
         floor_threshold = target - (CYCLE_ENTRY_DELTA if self._cycle_mode_active else tolerance)
         if predicted_floor <= floor_threshold:
             return True
@@ -1639,6 +1715,8 @@ class AdaptiveThermostat(ClimateEntity):
         self._awaiting_peak = False
         self._peak_max_temp = None
         self._peak_target = None
+        self._peak_run_duration = None
+        self._last_run_duration = None
         self._last_command_timestamp = now_ts
         self._last_heater_command = True
 
@@ -1702,10 +1780,17 @@ class AdaptiveThermostat(ClimateEntity):
             _LOGGER.debug("[%s] No central heater configured - only zone valves controlled", self._entry_id)
 
         now_ts = dt_util.utcnow().timestamp()
+        if self._last_heater_command and self._last_command_timestamp is not None:
+            run_duration = max(0.0, now_ts - self._last_command_timestamp)
+        else:
+            run_duration = None
+        self._last_run_duration = run_duration
         self._awaiting_delay_timestamp = None
         self._awaiting_peak = True
         self._peak_target = self._target_temperature
-        self._peak_max_temp = self._filtered_temperature or self._current_temperature
+        peak_candidate = [temp for temp in (self._current_temperature, self._filtered_temperature) if temp is not None]
+        self._peak_max_temp = max(peak_candidate) if peak_candidate else None
+        self._peak_run_duration = run_duration
         self._last_command_timestamp = now_ts
         self._last_heater_command = False
 
