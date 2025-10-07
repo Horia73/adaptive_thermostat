@@ -190,6 +190,16 @@
           "description": "The adaptive thermostat entity to reset"
         }
       }
+    },
+    "reset_adaptive_profile": {
+      "name": "Reset Adaptive Profile",
+      "description": "Clear learned calibration data so the thermostat can relearn from scratch",
+      "fields": {
+        "entity_id": {
+          "name": "Entity",
+          "description": "The adaptive thermostat entity to reset"
+        }
+      }
     }
   }
 }

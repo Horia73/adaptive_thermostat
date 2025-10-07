@@ -54,6 +54,28 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                 vol.Required("entity_id"): cv.entity_id,
             }),
         )
+    if not hass.services.has_service(DOMAIN, "reset_adaptive_profile"):
+        async def reset_adaptive_profile_service(call: ServiceCall) -> None:
+            """Service to clear the learned adaptive profile for a thermostat."""
+            entity_id = call.data.get("entity_id")
+
+            climate_entities = hass.data.get(DOMAIN, {}).get("entities", {})
+            climate_entity = climate_entities.get(entity_id)
+            if climate_entity and hasattr(climate_entity, "async_reset_adaptive_profile"):
+                await climate_entity.async_reset_adaptive_profile()
+                _LOGGER.info("Reset adaptive profile for %s", entity_id)
+                return
+
+            _LOGGER.warning("Could not find adaptive thermostat entity: %s", entity_id)
+
+        hass.services.async_register(
+            DOMAIN,
+            "reset_adaptive_profile",
+            reset_adaptive_profile_service,
+            schema=vol.Schema({
+                vol.Required("entity_id"): cv.entity_id,
+            }),
+        )
 
     # Listen for options updates.
     entry.async_on_unload(entry.add_update_listener(async_update_options))

@@ -87,7 +87,8 @@ CONTROL_KP = 0.6
 CONTROL_KI = 0.0005
 CYCLE_ENTRY_DELTA = 0.1  # °C below target where duty cycling kicks in
 CYCLE_EXIT_DELTA = 0.2  # °C below target required to leave cycling mode
-MAX_PROFILE_HISTORY = 60
+MAX_PROFILE_HISTORY = 1000
+COMFORT_EPSILON = 0.01  # Minimum meaningful delta when comparing to target
 
 
 def _clamp(value: float, low: float, high: float) -> float:
@@ -746,6 +747,12 @@ class AdaptiveThermostat(ClimateEntity):
                 and dt > 0
             ):
                 error = self._target_temperature - filtered_for_control
+                tolerance = self._target_tolerance if self._target_tolerance is not None else DEFAULT_TARGET_TOLERANCE
+                tolerance = max(tolerance, COMFORT_EPSILON)
+                if error <= -tolerance:
+                    self._integrator = min(self._integrator, 0.0)
+                elif error >= tolerance:
+                    self._integrator = max(self._integrator, 0.0)
                 self._integrator = _clamp(self._integrator + error * dt, -3600.0, 3600.0)
 
             self._advance_control_window(now_ts, dt)
@@ -1451,10 +1458,10 @@ class AdaptiveThermostat(ClimateEntity):
         cycle_active = self._cycle_mode_active
 
         if cycle_active:
-            if delta_below_target >= CYCLE_EXIT_DELTA:
+            if delta_below_target < 0 or delta_below_target >= CYCLE_EXIT_DELTA:
                 cycle_active = False
         else:
-            if delta_below_target <= CYCLE_ENTRY_DELTA:
+            if 0 <= delta_below_target <= CYCLE_ENTRY_DELTA:
                 cycle_active = True
 
         if cycle_active != self._cycle_mode_active:
@@ -1516,7 +1523,11 @@ class AdaptiveThermostat(ClimateEntity):
         if predicted_floor <= floor_threshold:
             return True
 
-        if self._window_desired_on > 0 and self._window_on_time < self._window_desired_on:
+        if (
+            self._window_desired_on > 0
+            and self._window_on_time < self._window_desired_on
+            and comparison_temp <= target - COMFORT_EPSILON
+        ):
             return True
 
         return False
@@ -1793,6 +1804,7 @@ class AdaptiveThermostat(ClimateEntity):
         self._peak_run_duration = run_duration
         self._last_command_timestamp = now_ts
         self._last_heater_command = False
+        self._integrator = min(self._integrator, 0.0)
 
     async def _async_coordinate_central_heater_on(self) -> None:
         """Coordinate turning on central heater after zone valves."""
@@ -1859,4 +1871,29 @@ class AdaptiveThermostat(ClimateEntity):
         _LOGGER.info("[%s] Manual override reset by service call - auto on/off will resume", self._entry_id)
         self._manual_override = False
         self._attr_extra_state_attributes["manual_override"] = False
+        self.async_write_ha_state()
+
+    async def async_reset_adaptive_profile(self) -> None:
+        """Reset the learned adaptive profile and persist the cleared state."""
+        _LOGGER.warning("[%s] Adaptive profile reset requested - learning will restart", self._entry_id)
+        self._adaptive_profile = AdaptiveProfile()
+        self._adaptive_profile.updated_at = dt_util.utcnow().timestamp()
+        self._integrator = 0.0
+        self._window_desired_on = 0.0
+        self._window_on_time = 0.0
+        self._cycle_mode_active = False
+        self._attr_extra_state_attributes["cycle_mode_active"] = False
+        self._attr_extra_state_attributes["adaptive_profile"] = self._adaptive_profile.to_dict()
+        self._attr_extra_state_attributes["adaptive_history"] = []
+        self._attr_extra_state_attributes["adaptive_learning_samples"] = {
+            "heating": 0,
+            "cooling": 0,
+            "delay": 0,
+            "overshoot": 0,
+        }
+        if self._profile_save_unsub:
+            self._profile_save_unsub()
+            self._profile_save_unsub = None
+        self._mark_profile_dirty()
+        await self._async_persist_profile()
         self.async_write_ha_state()

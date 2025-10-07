@@ -8,4 +8,15 @@ reset_manual_override:
       required: true
       selector:
         entity:
-          domain: climate 
+          domain: climate
+reset_adaptive_profile:
+  name: Reset Adaptive Profile
+  description: Clear learned heating and cooling calibration data so the controller can relearn from scratch
+  fields:
+    entity_id:
+      name: Entity
+      description: The adaptive thermostat entity to reset
+      required: true
+      selector:
+        entity:
+          domain: climate
