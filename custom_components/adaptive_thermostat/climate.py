@@ -1738,22 +1738,6 @@ class AdaptiveThermostat(ClimateEntity):
         should_heat = self._evaluate_should_heat(now_ts)
 
         if should_heat and not self._zone_heater_on:
-            if self._target_temperature is not None:
-                tolerance = self._target_tolerance if self._target_tolerance is not None else DEFAULT_TARGET_TOLERANCE
-                tolerance = max(tolerance, COMFORT_EPSILON)
-                candidate_temps = [
-                    temp for temp in (self._current_temperature, self._filtered_temperature) if temp is not None
-                ]
-                if candidate_temps:
-                    max_temp = max(candidate_temps)
-                    if max_temp >= self._target_temperature + tolerance:
-                        _LOGGER.debug(
-                            "[%s] Heat request suppressed - measured %.2f°C exceeds target+tolerance %.2f°C",
-                            self._entry_id,
-                            max_temp,
-                            self._target_temperature + tolerance,
-                        )
-                        return
             _LOGGER.info(
                 "[%s] 🔥 Control: Turning heater ON (current=%.2f°C, target=%.2f°C)",
                 self._entry_id,
