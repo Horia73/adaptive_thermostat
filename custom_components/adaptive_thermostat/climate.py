@@ -92,6 +92,7 @@ CYCLE_ENTRY_DELTA = 0.1  # °C below target where duty cycling kicks in
 CYCLE_EXIT_DELTA = 0.2  # °C below target required to leave cycling mode
 MAX_PROFILE_HISTORY = 1000
 COMFORT_EPSILON = 0.01  # Minimum meaningful delta when comparing to target
+LEARNING_RETENTION = timedelta(days=10)
 OVERSHOOT_MIN_TRACK_SECONDS = 300.0  # Keep tracking at least 5 minutes
 OVERSHOOT_MAX_TRACK_SECONDS = 1800.0  # Safety cap ~30 minutes
 RUN_LOG_LENGTH = 20
@@ -767,9 +768,9 @@ class AdaptiveThermostat(ClimateEntity):
             heater_states = self._gather_heater_states()
             central_state = self._gather_central_state()
 
-            if raw_temp is not None and temp_ts is not None:
+            if raw_temp is not None:
                 self._current_temperature = raw_temp
-                self._update_temperature_metrics(raw_temp, temp_ts, outdoor_temp)
+                self._update_temperature_metrics(raw_temp, temp_ts, outdoor_temp, now_ts)
             if humidity is not None:
                 self._current_humidity = humidity
 
@@ -1153,22 +1154,33 @@ class AdaptiveThermostat(ClimateEntity):
     def _update_temperature_metrics(
         self,
         raw_temp: float,
-        measurement_ts: float,
+        measurement_ts: Optional[float],
         outdoor_temp: Optional[float],
+        now_ts: float,
     ) -> None:
         """Update filtered temperature, slope, and adaptive learning."""
-        prev_ts = self._last_measurement_ts or measurement_ts
-        dt = max(0.0, measurement_ts - prev_ts)
-        self._last_measurement_ts = measurement_ts
+        sample_ts = measurement_ts if measurement_ts is not None else now_ts
 
-        prev_raw_ts = self._last_raw_ts or measurement_ts
-        raw_dt = max(0.0, measurement_ts - prev_raw_ts)
+        prev_ts = self._last_measurement_ts or sample_ts
+        dt = max(0.0, sample_ts - prev_ts)
+        if dt <= 0.0:
+            dt = max(0.0, now_ts - prev_ts)
+        if dt <= 0.0:
+            dt = 1e-6
+        self._last_measurement_ts = sample_ts
+
+        prev_raw_ts = self._last_raw_ts or sample_ts
+        raw_dt = sample_ts - prev_raw_ts
+        if raw_dt <= 0.0:
+            raw_dt = now_ts - prev_raw_ts
+        if raw_dt <= 0.0:
+            raw_dt = 1e-6
         if raw_dt > 0 and self._last_raw_temp is not None:
             self._raw_temperature_slope = (raw_temp - self._last_raw_temp) / raw_dt
         else:
             self._raw_temperature_slope = 0.0
         self._last_raw_temp = raw_temp
-        self._last_raw_ts = measurement_ts
+        self._last_raw_ts = sample_ts
 
         prev_filtered = self._filtered_temperature
         if prev_filtered is None:
@@ -1182,7 +1194,7 @@ class AdaptiveThermostat(ClimateEntity):
         self._temperature_slope = slope
         self._last_filtered_temp = self._filtered_temperature
 
-        self._update_adaptive_learning(measurement_ts, slope, outdoor_temp, self._zone_heater_on, dt)
+        self._update_adaptive_learning(sample_ts, slope, outdoor_temp, self._zone_heater_on, dt)
 
     def _update_adaptive_learning(
         self,
@@ -1236,7 +1248,7 @@ class AdaptiveThermostat(ClimateEntity):
                         },
                     )
 
-        elif not heater_on and slope < -MIN_SLOPE_THRESHOLD:
+        elif not heater_on and slope < -MIN_SLOPE_THRESHOLD and not self._open_window_detected:
             alpha = self._compute_learning_alpha(self._adaptive_profile.cooling_samples)
             cooling_sample = -slope
             new_cooling = (1 - alpha) * (self._adaptive_profile.cooling_rate or cooling_sample) + alpha * cooling_sample
@@ -1387,6 +1399,45 @@ class AdaptiveThermostat(ClimateEntity):
         self._peak_run_duration = None
         self._peak_track_start_ts = None
 
+    def _apply_learning_retention(self) -> None:
+        """Prune old adaptive learning events and sync sample counters."""
+        history = self._adaptive_profile.history
+        if not history:
+            return
+
+        cutoff_dt = dt_util.utcnow() - LEARNING_RETENTION
+        cutoff_ts = cutoff_dt.timestamp()
+        pruned_history: list[Dict[str, Any]] = []
+        for event in history:
+            ts_str = event.get("timestamp")
+            event_ts = None
+            if isinstance(ts_str, str):
+                parsed = dt_util.parse_datetime(ts_str)
+                if parsed is not None:
+                    event_ts = parsed.timestamp()
+            if event_ts is None:
+                # Keep malformed entries but don't rely on them for counts
+                pruned_history.append(event)
+                continue
+            if event_ts >= cutoff_ts:
+                pruned_history.append(event)
+
+        if len(pruned_history) > MAX_PROFILE_HISTORY:
+            pruned_history = pruned_history[-MAX_PROFILE_HISTORY:]
+
+        if pruned_history is not history:
+            history[:] = pruned_history
+
+        heating = sum(1 for e in history if e.get("kind") == "heating_rate")
+        cooling = sum(1 for e in history if e.get("kind") == "cooling_rate")
+        delay = sum(1 for e in history if e.get("kind") == "delay_seconds")
+        overshoot = sum(1 for e in history if e.get("kind") == "overshoot")
+
+        self._adaptive_profile.heating_samples = heating
+        self._adaptive_profile.cooling_samples = cooling
+        self._adaptive_profile.delay_samples = delay
+        self._adaptive_profile.overshoot_samples = overshoot
+
     def _record_run_start(self, start_ts: float) -> None:
         """Track the beginning of a heating run for diagnostics."""
         if self._current_run_record is not None:
@@ -1477,6 +1528,7 @@ class AdaptiveThermostat(ClimateEntity):
         if len(history) > MAX_PROFILE_HISTORY:
             del history[: len(history) - MAX_PROFILE_HISTORY]
 
+        self._apply_learning_retention()
         self._mark_profile_dirty()
 
     def _maybe_update_control_window(self) -> None:
