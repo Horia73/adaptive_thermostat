@@ -21,7 +21,6 @@ CONF_TARGET_TOLERANCE = "target_tolerance"
 CONF_CONTROL_WINDOW = "control_window"
 CONF_MIN_ON_TIME = "min_on_time"
 CONF_MIN_OFF_TIME = "min_off_time"
-CONF_FILTER_ALPHA = "filter_alpha"
 CONF_WINDOW_DETECTION_ENABLED = "window_detection_enabled"
 CONF_WINDOW_SLOPE_THRESHOLD = "window_slope_threshold"
 
@@ -41,9 +40,8 @@ DEFAULT_TARGET_TOLERANCE = 0.1
 DEFAULT_CONTROL_WINDOW = 180  # seconds
 DEFAULT_MIN_ON_TIME = 45      # seconds
 DEFAULT_MIN_OFF_TIME = 45     # seconds
-DEFAULT_FILTER_ALPHA = 0.2
 DEFAULT_WINDOW_DETECTION_ENABLED = False
-DEFAULT_WINDOW_SLOPE_THRESHOLD = 0.3  # °C per minute
+DEFAULT_WINDOW_SLOPE_THRESHOLD = 2.5  # °C per hour
 
 # Temperature limits applied to presets and manual setpoints
 MIN_TARGET_TEMP = 5.0

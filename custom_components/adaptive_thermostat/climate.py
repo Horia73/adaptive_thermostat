@@ -53,7 +53,6 @@ from .const import (
     CONF_CONTROL_WINDOW,
     CONF_MIN_ON_TIME,
     CONF_MIN_OFF_TIME,
-    CONF_FILTER_ALPHA,
     CONF_WINDOW_DETECTION_ENABLED,
     CONF_WINDOW_SLOPE_THRESHOLD,
     CONF_CENTRAL_HEATER_TURN_ON_DELAY,
@@ -73,7 +72,6 @@ from .const import (
     DEFAULT_CONTROL_WINDOW,
     DEFAULT_MIN_ON_TIME,
     DEFAULT_MIN_OFF_TIME,
-    DEFAULT_FILTER_ALPHA,
     DEFAULT_WINDOW_DETECTION_ENABLED,
     DEFAULT_WINDOW_SLOPE_THRESHOLD,
     MIN_TARGET_TEMP,
@@ -264,13 +262,12 @@ class AdaptiveThermostat(ClimateEntity):
         self._dynamic_control_window: float | None = None
         self._min_on_time = max(10.0, float(config.get(CONF_MIN_ON_TIME, DEFAULT_MIN_ON_TIME)))
         self._min_off_time = max(10.0, float(config.get(CONF_MIN_OFF_TIME, DEFAULT_MIN_OFF_TIME)))
-        self._filter_alpha = _clamp(float(config.get(CONF_FILTER_ALPHA, DEFAULT_FILTER_ALPHA)), 0.01, 0.8)
         self._window_detection_enabled = coerce_bool(
             config.get(CONF_WINDOW_DETECTION_ENABLED, DEFAULT_WINDOW_DETECTION_ENABLED),
             DEFAULT_WINDOW_DETECTION_ENABLED,
         )
         self._window_slope_threshold = max(
-            0.1, float(config.get(CONF_WINDOW_SLOPE_THRESHOLD, DEFAULT_WINDOW_SLOPE_THRESHOLD))
+            0.5, float(config.get(CONF_WINDOW_SLOPE_THRESHOLD, DEFAULT_WINDOW_SLOPE_THRESHOLD))
         )
 
         # Manual override state - when user manually controls the thermostat
@@ -356,12 +353,11 @@ class AdaptiveThermostat(ClimateEntity):
 
         # Adaptive control internal state
         self._filtered_temperature: float | None = None
-        self._last_filtered_temp: float | None = None
         self._temperature_slope: float = 0.0
         self._raw_temperature_slope: float = 0.0
         self._last_measurement_ts: float | None = None
-        self._last_raw_temp: float | None = None
-        self._last_raw_ts: float | None = None
+        self._last_measurement_temp: float | None = None
+        self._display_temperature_slope: float = 0.0
         self._last_update_ts: float | None = None
         self._integrator: float = 0.0
         self._window_start_ts: float | None = None
@@ -963,7 +959,10 @@ class AdaptiveThermostat(ClimateEntity):
             else None
         )
 
-        slope_per_min = self._temperature_slope * 60.0 if self._temperature_slope else 0.0
+        slope_per_sec = self._display_temperature_slope
+        slope_per_hour = slope_per_sec * 3600.0
+        raw_slope_per_sec = self._raw_temperature_slope or 0.0
+        raw_slope_per_hour = raw_slope_per_sec * 3600.0
         window_alert = self._attr_extra_state_attributes.get("window_alert")
 
         if self._filtered_temperature is None:
@@ -1002,8 +1001,8 @@ class AdaptiveThermostat(ClimateEntity):
             "current_temperature": self._current_temperature,
             "filtered_temperature": self._filtered_temperature,
             "control_temperature": control_temperature,
-            "temperature_slope_per_min": slope_per_min,
-            "raw_temperature_slope_per_min": (self._raw_temperature_slope or 0.0) * 60.0,
+            "temperature_slope_per_hour": slope_per_hour,
+            "raw_temperature_slope_per_hour": raw_slope_per_hour,
             "target_temperature": self._target_temperature,
             "target_tolerance": self._target_tolerance,
             "current_humidity": self._current_humidity,
@@ -1057,11 +1056,12 @@ class AdaptiveThermostat(ClimateEntity):
         })
 
         _LOGGER.debug(
-            "[%s] Sensor update: T=%.2f°C (filtered=%.2f°C, slope=%.3f°C/min), target=%.2f°C",
+            "[%s] Sensor update: T=%.2f°C (filtered=%.2f°C, slope=%.3f°C/h, instant=%.3f°C/h), target=%.2f°C",
             self._entry_id,
             self._current_temperature if self._current_temperature is not None else float("nan"),
             self._filtered_temperature if self._filtered_temperature is not None else float("nan"),
-            slope_per_min,
+            slope_per_hour,
+            raw_slope_per_hour,
             self._target_temperature if self._target_temperature is not None else float("nan"),
         )
 
@@ -1107,38 +1107,38 @@ class AdaptiveThermostat(ClimateEntity):
             return
 
         slope_base = self._raw_temperature_slope if self._raw_temperature_slope is not None else self._temperature_slope
-        slope_per_min = (slope_base or 0.0) * 60.0
+        slope_per_hour = (slope_base or 0.0) * 3600.0
         threshold = self._window_slope_threshold
         release_threshold = threshold * 0.4
 
         if not self._open_window_detected:
-            if slope_per_min <= -threshold:
+            if slope_per_hour <= -threshold:
                 self._open_window_detected = True
                 self._last_window_event_ts = now_ts
                 self._integrator = 0.0
-                message = f"Open window detected (drop {abs(slope_per_min):.2f}°C/min)"
+                message = f"Open window detected (drop {abs(slope_per_hour):.2f}°C/h)"
                 self._attr_extra_state_attributes["window_alert"] = message
                 _LOGGER.warning(
-                    "[%s] Rapid cooling detected (%.2f°C/min). Assuming open window and disabling heating.",
+                    "[%s] Rapid cooling detected (%.2f°C/h). Assuming open window and disabling heating.",
                     self._entry_id,
-                    slope_per_min,
+                    slope_per_hour,
                 )
                 if self._zone_heater_on:
                     await self._async_turn_heater_off()
                     self._zone_heater_on = False
         else:
-            if slope_per_min >= -release_threshold:
+            if slope_per_hour >= -release_threshold:
                 self._open_window_detected = False
                 self._last_window_event_ts = now_ts
                 self._attr_extra_state_attributes["window_alert"] = None
                 _LOGGER.info(
-                    "[%s] Temperature drop resolved (%.2f°C/min). Resuming adaptive control.",
+                    "[%s] Temperature drop resolved (%.2f°C/h). Resuming adaptive control.",
                     self._entry_id,
-                    slope_per_min,
+                    slope_per_hour,
                 )
             else:
                 self._attr_extra_state_attributes["window_alert"] = (
-                    f"Open window detected (drop {abs(slope_per_min):.2f}°C/min)"
+                    f"Open window detected (drop {abs(slope_per_hour):.2f}°C/h)"
                 )
 
     def _compute_desired_on_duration(self) -> float:
@@ -1193,30 +1193,23 @@ class AdaptiveThermostat(ClimateEntity):
             dt = 1e-6
         self._last_measurement_ts = sample_ts
 
-        prev_raw_ts = self._last_raw_ts or sample_ts
-        raw_dt = sample_ts - prev_raw_ts
-        if raw_dt <= 0.0:
-            raw_dt = now_ts - prev_raw_ts
-        if raw_dt <= 0.0:
-            raw_dt = 1e-6
-        if raw_dt > 0 and self._last_raw_temp is not None:
-            self._raw_temperature_slope = (raw_temp - self._last_raw_temp) / raw_dt
-        else:
-            self._raw_temperature_slope = 0.0
-        self._last_raw_temp = raw_temp
-        self._last_raw_ts = sample_ts
-
-        prev_filtered = self._filtered_temperature
-        if prev_filtered is None:
-            self._filtered_temperature = raw_temp
+        prev_temp = self._last_measurement_temp
+        temp_delta = 0.0
+        if prev_temp is None:
             slope = 0.0
         else:
-            alpha = self._filter_alpha
-            self._filtered_temperature = alpha * raw_temp + (1 - alpha) * prev_filtered
-            slope = (self._filtered_temperature - prev_filtered) / dt if dt > 0 else 0.0
+            temp_delta = raw_temp - prev_temp
+            slope = temp_delta / dt if dt > 0 else 0.0
 
+        self._last_measurement_temp = raw_temp
+        self._filtered_temperature = raw_temp
+        self._raw_temperature_slope = slope
         self._temperature_slope = slope
-        self._last_filtered_temp = self._filtered_temperature
+
+        if prev_temp is None:
+            self._display_temperature_slope = slope
+        elif abs(temp_delta) >= 0.001 and dt > 0:
+            self._display_temperature_slope = slope
 
         self._update_adaptive_learning(sample_ts, slope, outdoor_temp, self._zone_heater_on, dt)
 

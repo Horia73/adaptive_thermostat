@@ -33,7 +33,7 @@ class AdaptiveThermostatSlopeSensor(SensorEntity):
     _attr_has_entity_name = True
     _attr_should_poll = False
     _attr_icon = "mdi:chart-line"
-    _attr_native_unit_of_measurement = "°C/min"
+    _attr_native_unit_of_measurement = "°C/h"
     _attr_state_class = SensorStateClass.MEASUREMENT
 
     def __init__(self, hass: HomeAssistant, entry: ConfigEntry) -> None:
@@ -137,18 +137,30 @@ class AdaptiveThermostatSlopeSensor(SensorEntity):
         self._attr_available = True
 
         attrs = state.attributes or {}
-        slope_per_min = attrs.get("raw_temperature_slope_per_min")
-        if slope_per_min is None:
-            slope_per_min = attrs.get("temperature_slope_per_min")
+        slope_per_hour = attrs.get("raw_temperature_slope_per_hour")
+
+        if slope_per_hour is None:
+            raw_per_min = attrs.get("raw_temperature_slope_per_min")
+            if raw_per_min is not None:
+                slope_per_hour = raw_per_min * 60.0
+
+        if slope_per_hour is None:
+            slope_per_hour = attrs.get("temperature_slope_per_hour")
+
+        if slope_per_hour is None:
+            display_per_min = attrs.get("temperature_slope_per_min")
+            if display_per_min is not None:
+                slope_per_hour = display_per_min * 60.0
 
         native_value: Optional[float]
-        if slope_per_min is None:
+        if slope_per_hour is None:
             native_value = None
         else:
-            native_value = round(slope_per_min, 3)
+            native_value = round(slope_per_hour, 3)
 
         self._attr_native_value = native_value
         self._attr_extra_state_attributes = {
-            "slope_per_min": slope_per_min,
+            "slope_per_hour": slope_per_hour,
+            "raw_slope_per_hour": attrs.get("raw_temperature_slope_per_hour"),
             "linked_entity_id": state.entity_id,
         }

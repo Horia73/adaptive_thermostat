@@ -26,7 +26,6 @@ from .const import (
     CONF_CONTROL_WINDOW,
     CONF_MIN_ON_TIME,
     CONF_MIN_OFF_TIME,
-    CONF_FILTER_ALPHA,
     CONF_WINDOW_DETECTION_ENABLED,
     CONF_WINDOW_SLOPE_THRESHOLD,
     CONF_CENTRAL_HEATER_TURN_ON_DELAY,
@@ -45,7 +44,6 @@ from .const import (
     DEFAULT_CONTROL_WINDOW,
     DEFAULT_MIN_ON_TIME,
     DEFAULT_MIN_OFF_TIME,
-    DEFAULT_FILTER_ALPHA,
     DEFAULT_WINDOW_DETECTION_ENABLED,
     DEFAULT_WINDOW_SLOPE_THRESHOLD,
 )
@@ -124,12 +122,9 @@ STEP_ADAPTIVE_SCHEMA = vol.Schema(
         vol.Required(CONF_MIN_OFF_TIME, default=DEFAULT_MIN_OFF_TIME): selector.NumberSelector(
             selector.NumberSelectorConfig(min=10, max=300, step=5, mode="box", unit_of_measurement="seconds")
         ),
-        vol.Required(CONF_FILTER_ALPHA, default=DEFAULT_FILTER_ALPHA): selector.NumberSelector(
-            selector.NumberSelectorConfig(min=0.05, max=0.5, step=0.05, mode="box")
-        ),
         vol.Required(CONF_WINDOW_DETECTION_ENABLED, default=DEFAULT_WINDOW_DETECTION_ENABLED): selector.BooleanSelector(),
         vol.Required(CONF_WINDOW_SLOPE_THRESHOLD, default=DEFAULT_WINDOW_SLOPE_THRESHOLD): selector.NumberSelector(
-            selector.NumberSelectorConfig(min=0.2, max=2.0, step=0.1, mode="box", unit_of_measurement="°C/min")
+            selector.NumberSelectorConfig(min=0.5, max=15.0, step=0.5, mode="box", unit_of_measurement="°C/h")
         ),
     }
 )
