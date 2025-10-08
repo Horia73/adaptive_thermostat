@@ -83,6 +83,7 @@ from .const import (
 
 _LOGGER = logging.getLogger(__name__)
 MIN_SLOPE_THRESHOLD = 0.0002  # °C per second (~0.012°C per minute)
+SLOPE_CHANGE_EPSILON = 0.001  # °C change required to treat as a new slope sample
 DEFAULT_DELAY_SECONDS = 90.0
 CONTROL_KP = 0.6
 CONTROL_KI = 0.0005
@@ -1002,7 +1003,6 @@ class AdaptiveThermostat(ClimateEntity):
             "filtered_temperature": self._filtered_temperature,
             "control_temperature": control_temperature,
             "temperature_slope_per_hour": slope_per_hour,
-            "raw_temperature_slope_per_hour": raw_slope_per_hour,
             "target_temperature": self._target_temperature,
             "target_tolerance": self._target_tolerance,
             "current_humidity": self._current_humidity,
@@ -1195,10 +1195,12 @@ class AdaptiveThermostat(ClimateEntity):
 
         prev_temp = self._last_measurement_temp
         temp_delta = 0.0
+        meaningful_change = False
         if prev_temp is None:
             slope = 0.0
         else:
             temp_delta = raw_temp - prev_temp
+            meaningful_change = abs(temp_delta) >= SLOPE_CHANGE_EPSILON
             slope = temp_delta / dt if dt > 0 else 0.0
 
         self._last_measurement_temp = raw_temp
@@ -1208,10 +1210,11 @@ class AdaptiveThermostat(ClimateEntity):
 
         if prev_temp is None:
             self._display_temperature_slope = slope
-        elif abs(temp_delta) >= 0.001 and dt > 0:
+        elif meaningful_change and dt > 0:
             self._display_temperature_slope = slope
 
-        self._update_adaptive_learning(sample_ts, slope, outdoor_temp, self._zone_heater_on, dt)
+        if meaningful_change:
+            self._update_adaptive_learning(sample_ts, slope, outdoor_temp, self._zone_heater_on, dt)
 
     def _update_adaptive_learning(
         self,
