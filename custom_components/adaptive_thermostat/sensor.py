@@ -33,7 +33,7 @@ class AdaptiveThermostatSlopeSensor(SensorEntity):
     _attr_has_entity_name = True
     _attr_should_poll = False
     _attr_icon = "mdi:chart-line"
-    _attr_native_unit_of_measurement = "°C/h"
+    _attr_native_unit_of_measurement = "°C/min"
     _attr_state_class = SensorStateClass.MEASUREMENT
 
     def __init__(self, hass: HomeAssistant, entry: ConfigEntry) -> None:
@@ -145,7 +145,7 @@ class AdaptiveThermostatSlopeSensor(SensorEntity):
         if slope_per_min is None:
             native_value = None
         else:
-            native_value = round(slope_per_min * 60.0, 3)
+            native_value = round(slope_per_min, 3)
 
         self._attr_native_value = native_value
         self._attr_extra_state_attributes = {

@@ -96,6 +96,7 @@ LEARNING_RETENTION = timedelta(days=10)
 OVERSHOOT_MIN_TRACK_SECONDS = 300.0  # Keep tracking at least 5 minutes
 OVERSHOOT_MAX_TRACK_SECONDS = 1800.0  # Safety cap ~30 minutes
 RUN_LOG_LENGTH = 20
+PROFILE_HISTORY_ATTR_LIMIT = 5
 
 
 def _clamp(value: float, low: float, high: float) -> float:
@@ -918,6 +919,26 @@ class AdaptiveThermostat(ClimateEntity):
             "friendly_name": central_state.attributes.get("friendly_name", self._central_heater_entity_id),
         }
 
+    def _summarize_adaptive_profile(self) -> Dict[str, Any]:
+        """Return compact adaptive profile details for state attributes."""
+        profile = self._adaptive_profile
+        history_tail = profile.history[-PROFILE_HISTORY_ATTR_LIMIT:] if profile.history else []
+        return {
+            "heater_gain": round(profile.heater_gain, 6),
+            "loss_coefficient": round(profile.loss_coefficient, 6),
+            "delay_seconds": round(profile.delay_seconds, 2),
+            "heating_rate": round(profile.heating_rate, 6),
+            "cooling_rate": round(profile.cooling_rate, 6),
+            "overshoot": round(profile.overshoot, 6),
+            "updated_at": profile.updated_at,
+            "heating_samples": profile.heating_samples,
+            "cooling_samples": profile.cooling_samples,
+            "delay_samples": profile.delay_samples,
+            "overshoot_samples": profile.overshoot_samples,
+            "history_length": len(profile.history),
+            "history": history_tail,
+        }
+
     def _update_sensor_attributes(
         self,
         outdoor_temp: Optional[float],
@@ -951,6 +972,9 @@ class AdaptiveThermostat(ClimateEntity):
             control_temperature = self._filtered_temperature
         else:
             control_temperature = min(self._filtered_temperature, self._current_temperature)
+
+        adaptive_profile_state = self._summarize_adaptive_profile()
+        adaptive_history = list(adaptive_profile_state.get("history", []))
 
         self._attr_extra_state_attributes.update({
             "zone_name": self._attr_name,
@@ -1015,8 +1039,8 @@ class AdaptiveThermostat(ClimateEntity):
             "desired_on_time_seconds": round(self._window_desired_on, 1),
             "actual_on_time_seconds": round(self._window_on_time, 1),
             "integrator_state": round(self._integrator, 3),
-            "adaptive_profile": self._adaptive_profile.to_dict(),
-            "adaptive_history": self._adaptive_profile.history[-10:],
+            "adaptive_profile": adaptive_profile_state,
+            "adaptive_history": adaptive_history,
             "adaptive_learning_samples": {
                 "heating": self._adaptive_profile.heating_samples,
                 "cooling": self._adaptive_profile.cooling_samples,
@@ -2115,8 +2139,9 @@ class AdaptiveThermostat(ClimateEntity):
         self._window_on_time = 0.0
         self._cycle_mode_active = False
         self._attr_extra_state_attributes["cycle_mode_active"] = False
-        self._attr_extra_state_attributes["adaptive_profile"] = self._adaptive_profile.to_dict()
-        self._attr_extra_state_attributes["adaptive_history"] = []
+        adaptive_profile_state = self._summarize_adaptive_profile()
+        self._attr_extra_state_attributes["adaptive_profile"] = adaptive_profile_state
+        self._attr_extra_state_attributes["adaptive_history"] = list(adaptive_profile_state.get("history", []))
         self._attr_extra_state_attributes["adaptive_learning_samples"] = {
             "heating": 0,
             "cooling": 0,
