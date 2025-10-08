@@ -328,6 +328,7 @@ class AdaptiveThermostat(ClimateEntity):
             "window_detection_enabled": self._window_detection_enabled,
             "window_open_detected": False,
             "window_slope_threshold": self._window_slope_threshold,
+            "window_alert": None,
             "cycle_mode_active": False,
             "cycle_entry_delta": CYCLE_ENTRY_DELTA,
             "cycle_exit_delta": CYCLE_EXIT_DELTA,
@@ -941,6 +942,7 @@ class AdaptiveThermostat(ClimateEntity):
         )
 
         slope_per_min = self._temperature_slope * 60.0 if self._temperature_slope else 0.0
+        window_alert = self._attr_extra_state_attributes.get("window_alert")
 
         if self._filtered_temperature is None:
             control_temperature = self._current_temperature
@@ -1023,6 +1025,7 @@ class AdaptiveThermostat(ClimateEntity):
             "window_detection_enabled": self._window_detection_enabled,
             "window_open_detected": self._open_window_detected,
             "window_slope_threshold": self._window_slope_threshold,
+            "window_alert": window_alert,
             "last_window_event": last_window_event,
             "entity_available": True,
             "last_updated": last_updated,
@@ -1072,6 +1075,7 @@ class AdaptiveThermostat(ClimateEntity):
             if self._open_window_detected:
                 self._open_window_detected = False
                 self._last_window_event_ts = now_ts
+            self._attr_extra_state_attributes["window_alert"] = None
             return
 
         if self._filtered_temperature is None and self._current_temperature is None:
@@ -1087,6 +1091,8 @@ class AdaptiveThermostat(ClimateEntity):
                 self._open_window_detected = True
                 self._last_window_event_ts = now_ts
                 self._integrator = 0.0
+                message = f"Open window detected (drop {abs(slope_per_min):.2f}°C/min)"
+                self._attr_extra_state_attributes["window_alert"] = message
                 _LOGGER.warning(
                     "[%s] Rapid cooling detected (%.2f°C/min). Assuming open window and disabling heating.",
                     self._entry_id,
@@ -1099,10 +1105,15 @@ class AdaptiveThermostat(ClimateEntity):
             if slope_per_min >= -release_threshold:
                 self._open_window_detected = False
                 self._last_window_event_ts = now_ts
+                self._attr_extra_state_attributes["window_alert"] = None
                 _LOGGER.info(
                     "[%s] Temperature drop resolved (%.2f°C/min). Resuming adaptive control.",
                     self._entry_id,
                     slope_per_min,
+                )
+            else:
+                self._attr_extra_state_attributes["window_alert"] = (
+                    f"Open window detected (drop {abs(slope_per_min):.2f}°C/min)"
                 )
 
     def _compute_desired_on_duration(self) -> float:
@@ -1738,6 +1749,22 @@ class AdaptiveThermostat(ClimateEntity):
         should_heat = self._evaluate_should_heat(now_ts)
 
         if should_heat and not self._zone_heater_on:
+            if self._target_temperature is not None:
+                tolerance = self._target_tolerance if self._target_tolerance is not None else DEFAULT_TARGET_TOLERANCE
+                tolerance = max(tolerance, COMFORT_EPSILON)
+                candidate_temps = [
+                    temp for temp in (self._current_temperature, self._filtered_temperature) if temp is not None
+                ]
+                if candidate_temps:
+                    max_temp = max(candidate_temps)
+                    if max_temp >= self._target_temperature + tolerance:
+                        _LOGGER.debug(
+                            "[%s] Heat request suppressed - measured %.2f°C exceeds target+tolerance %.2f°C",
+                            self._entry_id,
+                            max_temp,
+                            self._target_temperature + tolerance,
+                        )
+                        return
             _LOGGER.info(
                 "[%s] 🔥 Control: Turning heater ON (current=%.2f°C, target=%.2f°C)",
                 self._entry_id,
