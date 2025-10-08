@@ -30,6 +30,8 @@ from homeassistant.helpers.event import (
     Event,
 ) # type: ignore
 from homeassistant.helpers.storage import Store # type: ignore
+from homeassistant.helpers.dispatcher import async_dispatcher_send # type: ignore
+from homeassistant.helpers.device_registry import DeviceInfo # type: ignore
 from homeassistant.util import dt as dt_util # type: ignore
 
 from . import DOMAIN
@@ -78,6 +80,7 @@ from .const import (
     MAX_TARGET_TEMP,
     STORAGE_KEY,
     STORAGE_VERSION,
+    SIGNAL_THERMOSTAT_READY,
 )
 
 _LOGGER = logging.getLogger(__name__)
@@ -89,6 +92,9 @@ CYCLE_ENTRY_DELTA = 0.1  # °C below target where duty cycling kicks in
 CYCLE_EXIT_DELTA = 0.2  # °C below target required to leave cycling mode
 MAX_PROFILE_HISTORY = 1000
 COMFORT_EPSILON = 0.01  # Minimum meaningful delta when comparing to target
+OVERSHOOT_MIN_TRACK_SECONDS = 300.0  # Keep tracking at least 5 minutes
+OVERSHOOT_MAX_TRACK_SECONDS = 1800.0  # Safety cap ~30 minutes
+RUN_LOG_LENGTH = 20
 
 
 def _clamp(value: float, low: float, high: float) -> float:
@@ -330,6 +336,10 @@ class AdaptiveThermostat(ClimateEntity):
             "control_temperature": None,
             "last_run_duration_seconds": None,
             "last_overshoot_capture": None,
+            "run_history": [],
+            "total_run_count": 0,
+            "cycle_entries": 0,
+            "current_run": None,
         }
         _LOGGER.debug("[%s] Extra state attributes set: %s", self._entry_id, self._attr_extra_state_attributes)
 
@@ -345,7 +355,10 @@ class AdaptiveThermostat(ClimateEntity):
         self._filtered_temperature: float | None = None
         self._last_filtered_temp: float | None = None
         self._temperature_slope: float = 0.0
+        self._raw_temperature_slope: float = 0.0
         self._last_measurement_ts: float | None = None
+        self._last_raw_temp: float | None = None
+        self._last_raw_ts: float | None = None
         self._last_update_ts: float | None = None
         self._integrator: float = 0.0
         self._window_start_ts: float | None = None
@@ -362,12 +375,19 @@ class AdaptiveThermostat(ClimateEntity):
         self._peak_max_temp: float | None = None
         self._peak_target: float | None = None
         self._peak_run_duration: float | None = None
+        self._peak_track_start_ts: float | None = None
         self._last_command_timestamp: float | None = None
         self._last_heater_command: Optional[bool] = None
         self._cycle_mode_active: bool = False
         self._open_window_detected: bool = False
         self._last_window_event_ts: float | None = None
         self._last_run_duration: float | None = None
+        self._run_history: list[Dict[str, Any]] = []
+        self._current_run_record: Optional[Dict[str, Any]] = None
+        self._pending_overshoot_record: Optional[Dict[str, Any]] = None
+        self._run_sequence: int = 0
+        self._total_run_count: int = 0
+        self._cycle_entries: int = 0
 
         # Remove device creation - not needed for single climate entity
 
@@ -378,6 +398,7 @@ class AdaptiveThermostat(ClimateEntity):
 
         # Track entity instance so services can address it by entity_id
         domain_data = self.hass.data.setdefault(DOMAIN, {})
+        entry_map = domain_data.setdefault("entry_to_entity_id", {})
 
         if "profile_store" not in domain_data:
             domain_data["profile_store"] = Store(self.hass, STORAGE_VERSION, STORAGE_KEY)
@@ -402,6 +423,9 @@ class AdaptiveThermostat(ClimateEntity):
             # CRITICAL: Write state immediately so card gets data on reload
             self.async_write_ha_state()
             _LOGGER.info("[%s] *** ZONE '%s' ENTITY READY: %s ***", self._entry_id, self._attr_name, self.entity_id)
+            if self.entity_id:
+                entry_map[self._entry_id] = self.entity_id
+                async_dispatcher_send(self.hass, f"{SIGNAL_THERMOSTAT_READY}_{self._entry_id}", self.entity_id)
         except Exception as e:
             _LOGGER.error("[%s] Error during entity initialization: %s", self._entry_id, e, exc_info=True)
 
@@ -498,6 +522,7 @@ class AdaptiveThermostat(ClimateEntity):
     async def async_will_remove_from_hass(self) -> None:
         """Run when entity will be removed from hass."""
         _LOGGER.debug("[%s] Removing adaptive thermostat from Home Assistant", self._entry_id)
+        domain_data = self.hass.data.get(DOMAIN, {})
 
         # Cancel any pending central heater tasks
         if self._central_heater_task:
@@ -525,9 +550,14 @@ class AdaptiveThermostat(ClimateEntity):
             await self._async_persist_profile()
 
         # Remove entity from tracked instances
-        entities = self.hass.data.get(DOMAIN, {}).get("entities")
+        entities = domain_data.get("entities")
         if entities and self.entity_id in entities:
-            entities.pop(self.entity_id)
+            entities.pop(self.entity_id, None)
+
+        entry_map = domain_data.get("entry_to_entity_id")
+        if entry_map and self._entry_id in entry_map:
+            entry_map.pop(self._entry_id, None)
+            async_dispatcher_send(self.hass, f"{SIGNAL_THERMOSTAT_READY}_{self._entry_id}", None)
 
         await super().async_will_remove_from_hass()
 
@@ -582,6 +612,14 @@ class AdaptiveThermostat(ClimateEntity):
     def preset_modes(self) -> list[str] | None:
         """Return a list of available preset modes."""
         return list(self._presets.keys())
+
+    @property
+    def device_info(self) -> DeviceInfo:
+        """Return device metadata for registry."""
+        return DeviceInfo(
+            identifiers={(DOMAIN, self._entry_id)},
+            name=self._attr_name,
+        )
 
     @property
     def extra_state_attributes(self) -> dict[str, Any] | None:
@@ -938,6 +976,7 @@ class AdaptiveThermostat(ClimateEntity):
             "filtered_temperature": self._filtered_temperature,
             "control_temperature": control_temperature,
             "temperature_slope_per_min": slope_per_min,
+            "raw_temperature_slope_per_min": (self._raw_temperature_slope or 0.0) * 60.0,
             "target_temperature": self._target_temperature,
             "target_tolerance": self._target_tolerance,
             "current_humidity": self._current_humidity,
@@ -948,6 +987,17 @@ class AdaptiveThermostat(ClimateEntity):
             "last_run_duration_seconds": round(self._last_run_duration, 1)
             if self._last_run_duration is not None
             else None,
+            "current_run": (
+                {
+                    **self._current_run_record,
+                    "on_time_seconds": round(self._current_run_record.get("on_time_seconds", 0.0), 1),
+                }
+                if self._current_run_record
+                else None
+            ),
+            "run_history": list(self._run_history[-5:]),
+            "total_run_count": self._total_run_count,
+            "cycle_entries": self._cycle_entries,
             "auto_on_off_enabled": self._auto_on_off_enabled,
             "auto_on_temp": self._auto_on_temp,
             "auto_off_temp": self._auto_off_temp,
@@ -997,6 +1047,13 @@ class AdaptiveThermostat(ClimateEntity):
 
         if dt > 0 and self._zone_heater_on:
             self._window_on_time += dt
+            if self._current_run_record is not None:
+                on_time = self._current_run_record.get("on_time_seconds", 0.0) + dt
+                self._current_run_record["on_time_seconds"] = on_time
+                self._attr_extra_state_attributes["current_run"] = {
+                    **self._current_run_record,
+                    "on_time_seconds": round(on_time, 1),
+                }
 
     def _rolling_window_reset(self, now_ts: float) -> None:
         """Reset duty window when elapsed time exceeds window length."""
@@ -1017,10 +1074,11 @@ class AdaptiveThermostat(ClimateEntity):
                 self._last_window_event_ts = now_ts
             return
 
-        if self._filtered_temperature is None:
+        if self._filtered_temperature is None and self._current_temperature is None:
             return
 
-        slope_per_min = (self._temperature_slope or 0.0) * 60.0
+        slope_base = self._raw_temperature_slope if self._raw_temperature_slope is not None else self._temperature_slope
+        slope_per_min = (slope_base or 0.0) * 60.0
         threshold = self._window_slope_threshold
         release_threshold = threshold * 0.4
 
@@ -1072,6 +1130,13 @@ class AdaptiveThermostat(ClimateEntity):
             duty += CONTROL_KP * error
             duty += CONTROL_KI * self._integrator
 
+        tolerance = self._target_tolerance if self._target_tolerance is not None else DEFAULT_TARGET_TOLERANCE
+        tolerance = max(tolerance, COMFORT_EPSILON)
+        overshoot = max(self._adaptive_profile.overshoot, 0.0)
+        if overshoot > tolerance:
+            damp_factor = 1.0 / (1.0 + overshoot / tolerance)
+            duty *= damp_factor
+
         return _clamp(duty, 0.0, 1.0) * self._control_window
 
     def _update_temperature_metrics(
@@ -1084,6 +1149,15 @@ class AdaptiveThermostat(ClimateEntity):
         prev_ts = self._last_measurement_ts or measurement_ts
         dt = max(0.0, measurement_ts - prev_ts)
         self._last_measurement_ts = measurement_ts
+
+        prev_raw_ts = self._last_raw_ts or measurement_ts
+        raw_dt = max(0.0, measurement_ts - prev_raw_ts)
+        if raw_dt > 0 and self._last_raw_temp is not None:
+            self._raw_temperature_slope = (raw_temp - self._last_raw_temp) / raw_dt
+        else:
+            self._raw_temperature_slope = 0.0
+        self._last_raw_temp = raw_temp
+        self._last_raw_ts = measurement_ts
 
         prev_filtered = self._filtered_temperature
         if prev_filtered is None:
@@ -1225,10 +1299,27 @@ class AdaptiveThermostat(ClimateEntity):
             if peak_candidate is not None:
                 if self._peak_max_temp is None or peak_candidate > self._peak_max_temp:
                     self._peak_max_temp = peak_candidate
-            if (
-                slope < -MIN_SLOPE_THRESHOLD
-                or (self._last_command_timestamp and now_ts - self._last_command_timestamp > self._control_window)
-            ):
+            track_start = self._peak_track_start_ts or self._last_command_timestamp or now_ts
+            track_elapsed = max(0.0, now_ts - track_start)
+            target = self._peak_target or self._target_temperature
+            tolerance = self._target_tolerance if self._target_tolerance is not None else DEFAULT_TARGET_TOLERANCE
+            tolerance = max(tolerance, COMFORT_EPSILON)
+            current_temp = self._filtered_temperature if self._filtered_temperature is not None else self._current_temperature
+
+            should_finalize = False
+            if track_elapsed >= OVERSHOOT_MAX_TRACK_SECONDS:
+                should_finalize = True
+            elif track_elapsed >= OVERSHOOT_MIN_TRACK_SECONDS:
+                if slope < -MIN_SLOPE_THRESHOLD:
+                    should_finalize = True
+                elif (
+                    target is not None
+                    and current_temp is not None
+                    and current_temp <= target + tolerance
+                ):
+                    should_finalize = True
+
+            if should_finalize:
                 self._finalize_peak_tracking()
 
     def _finalize_peak_tracking(self) -> None:
@@ -1269,13 +1360,64 @@ class AdaptiveThermostat(ClimateEntity):
                 "overshoot": round(target_sample, 3),
                 "run_duration": run_duration_rounded,
             }
+            if self._pending_overshoot_record is not None:
+                self._pending_overshoot_record["overshoot"] = round(target_sample, 3)
+                self._pending_overshoot_record["peak_temperature"] = round(peak_temp, 3)
+                self._pending_overshoot_record["overshoot_captured_at"] = dt_util.utcnow().isoformat()
+                self._attr_extra_state_attributes["run_history"] = list(self._run_history[-5:])
+                self._pending_overshoot_record = None
         else:
             self._attr_extra_state_attributes["last_overshoot_capture"] = None
+            self._pending_overshoot_record = None
 
         self._awaiting_peak = False
         self._peak_target = None
         self._peak_max_temp = None
         self._peak_run_duration = None
+        self._peak_track_start_ts = None
+
+    def _record_run_start(self, start_ts: float) -> None:
+        """Track the beginning of a heating run for diagnostics."""
+        if self._current_run_record is not None:
+            return
+        self._run_sequence += 1
+        self._total_run_count += 1
+        record: Dict[str, Any] = {
+            "run_id": self._run_sequence,
+            "started_at": dt_util.utc_from_timestamp(start_ts).isoformat(),
+            "target": round(self._target_temperature, 3) if self._target_temperature is not None else None,
+            "start_temperature": round(self._current_temperature, 3)
+            if self._current_temperature is not None
+            else None,
+            "cycle_mode_used": bool(self._cycle_mode_active),
+            "on_time_seconds": 0.0,
+            "duration_seconds": None,
+            "overshoot": None,
+        }
+        self._current_run_record = record
+        self._attr_extra_state_attributes["total_run_count"] = self._total_run_count
+        self._attr_extra_state_attributes["current_run"] = {
+            **record,
+            "on_time_seconds": round(record.get("on_time_seconds", 0.0), 1),
+        }
+
+    def _finalize_current_run(self, run_duration: Optional[float], end_ts: float) -> None:
+        """Finalize run metrics once the heater turns off."""
+        if self._current_run_record is None:
+            return
+        record = dict(self._current_run_record)
+        record["ended_at"] = dt_util.utc_from_timestamp(end_ts).isoformat()
+        record["duration_seconds"] = round(run_duration, 1) if run_duration is not None else None
+        record["on_time_seconds"] = round(record.get("on_time_seconds", 0.0), 1)
+        record["end_temperature"] = round(self._current_temperature, 3) if self._current_temperature is not None else None
+        record["integrator_end"] = round(self._integrator, 3)
+        self._run_history.append(record)
+        if len(self._run_history) > RUN_LOG_LENGTH:
+            del self._run_history[: len(self._run_history) - RUN_LOG_LENGTH]
+        self._attr_extra_state_attributes["run_history"] = list(self._run_history[-5:])
+        self._pending_overshoot_record = record
+        self._current_run_record = None
+        self._attr_extra_state_attributes["current_run"] = None
 
     def _set_profile_field(self, field: str, value: float) -> bool:
         """Set adaptive profile field and schedule persistence if changed."""
@@ -1333,13 +1475,17 @@ class AdaptiveThermostat(ClimateEntity):
 
         heating_rate = max(self._adaptive_profile.heating_rate, MIN_SLOPE_THRESHOLD)
         cooling_rate = max(self._adaptive_profile.cooling_rate, MIN_SLOPE_THRESHOLD)
-        tolerance = max(self._target_tolerance, 0.1)
+        tolerance_setting = self._target_tolerance if self._target_tolerance is not None else DEFAULT_TARGET_TOLERANCE
+        tolerance = max(tolerance_setting, COMFORT_EPSILON)
         delay = max(self._adaptive_profile.delay_seconds, 20.0)
 
         heating_time = tolerance / heating_rate
         cooling_time = tolerance / cooling_rate
 
         target_window = delay + heating_time + cooling_time
+        overshoot = max(self._adaptive_profile.overshoot, 0.0)
+        if overshoot > tolerance:
+            target_window /= 1.0 + overshoot / tolerance
         min_window = max(60.0, self._min_on_time + self._min_off_time, self._configured_control_window * 0.5)
         max_window = min(900.0, self._configured_control_window * 1.5)
         target_window = _clamp(target_window, min_window, max_window)
@@ -1471,6 +1617,7 @@ class AdaptiveThermostat(ClimateEntity):
                     self._entry_id,
                     delta_below_target,
                 )
+                self._cycle_entries += 1
             else:
                 _LOGGER.debug(
                     "[%s] Exiting duty cycling (effective temp %.2f°C below target)",
@@ -1480,6 +1627,9 @@ class AdaptiveThermostat(ClimateEntity):
             self._cycle_mode_active = cycle_active
 
         self._attr_extra_state_attributes["cycle_mode_active"] = self._cycle_mode_active
+        self._attr_extra_state_attributes["cycle_entries"] = self._cycle_entries
+        if self._current_run_record is not None and self._cycle_mode_active:
+            self._current_run_record["cycle_mode_used"] = True
 
         delay = _clamp(self._adaptive_profile.delay_seconds, 20.0, 900.0)
         overshoot = max(self._adaptive_profile.overshoot, 0.0)
@@ -1588,6 +1738,22 @@ class AdaptiveThermostat(ClimateEntity):
         should_heat = self._evaluate_should_heat(now_ts)
 
         if should_heat and not self._zone_heater_on:
+            if self._target_temperature is not None:
+                tolerance = self._target_tolerance if self._target_tolerance is not None else DEFAULT_TARGET_TOLERANCE
+                tolerance = max(tolerance, COMFORT_EPSILON)
+                candidate_temps = [
+                    temp for temp in (self._current_temperature, self._filtered_temperature) if temp is not None
+                ]
+                if candidate_temps:
+                    max_temp = max(candidate_temps)
+                    if max_temp >= self._target_temperature + tolerance:
+                        _LOGGER.debug(
+                            "[%s] Heat request suppressed - measured %.2f°C exceeds target+tolerance %.2f°C",
+                            self._entry_id,
+                            max_temp,
+                            self._target_temperature + tolerance,
+                        )
+                        return
             _LOGGER.info(
                 "[%s] 🔥 Control: Turning heater ON (current=%.2f°C, target=%.2f°C)",
                 self._entry_id,
@@ -1730,6 +1896,7 @@ class AdaptiveThermostat(ClimateEntity):
         self._last_run_duration = None
         self._last_command_timestamp = now_ts
         self._last_heater_command = True
+        self._record_run_start(now_ts)
 
     async def _async_close_zone_valves(self) -> None:
         """Helper to close all configured zone valves."""
@@ -1805,6 +1972,8 @@ class AdaptiveThermostat(ClimateEntity):
         self._last_command_timestamp = now_ts
         self._last_heater_command = False
         self._integrator = min(self._integrator, 0.0)
+        self._finalize_current_run(run_duration, now_ts)
+        self._peak_track_start_ts = now_ts
 
     async def _async_coordinate_central_heater_on(self) -> None:
         """Coordinate turning on central heater after zone valves."""

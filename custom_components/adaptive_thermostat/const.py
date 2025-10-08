@@ -3,7 +3,7 @@
 DOMAIN = "adaptive_thermostat"
 
 # Platforms to set up
-PLATFORMS = ["climate"]
+PLATFORMS = ["climate", "sensor"]
 
 # Configuration Keys
 CONF_HEATER = "heater"
@@ -43,7 +43,7 @@ DEFAULT_MIN_ON_TIME = 45      # seconds
 DEFAULT_MIN_OFF_TIME = 45     # seconds
 DEFAULT_FILTER_ALPHA = 0.2
 DEFAULT_WINDOW_DETECTION_ENABLED = False
-DEFAULT_WINDOW_SLOPE_THRESHOLD = 0.6  # °C per minute
+DEFAULT_WINDOW_SLOPE_THRESHOLD = 0.3  # °C per minute
 
 # Temperature limits applied to presets and manual setpoints
 MIN_TARGET_TEMP = 5.0
@@ -60,3 +60,6 @@ DEFAULT_AUTO_OFF_TEMP = 18.0  # °C - turn off when outdoor temp is above this
 # Persistent storage
 STORAGE_KEY = "adaptive_thermostat_models"
 STORAGE_VERSION = 1
+
+# Dispatcher signals
+SIGNAL_THERMOSTAT_READY = "adaptive_thermostat_thermostat_ready"

@@ -16,6 +16,7 @@ async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
     """Set up the Adaptive Thermostat integration."""
     domain_data = hass.data.setdefault(DOMAIN, {})
     domain_data.setdefault("entities", {})
+    domain_data.setdefault("entry_to_entity_id", {})
     # No Lovelace registration attempt here anymore.
     # Rely on manifest.json and HACS for card availability,
     # and manual user addition if necessary.
