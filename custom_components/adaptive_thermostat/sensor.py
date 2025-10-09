@@ -137,7 +137,10 @@ class AdaptiveThermostatSlopeSensor(SensorEntity):
         self._attr_available = True
 
         attrs = state.attributes or {}
-        slope_per_hour = attrs.get("temperature_slope_per_hour")
+        slope_per_hour = attrs.get("temperature_slope_instant_per_hour")
+
+        if slope_per_hour is None:
+            slope_per_hour = attrs.get("temperature_slope_per_hour")
 
         if slope_per_hour is None:
             display_per_min = attrs.get("temperature_slope_per_min")
@@ -153,5 +156,6 @@ class AdaptiveThermostatSlopeSensor(SensorEntity):
         self._attr_native_value = native_value
         self._attr_extra_state_attributes = {
             "slope_per_hour": slope_per_hour,
+            "hourly_slope_per_hour": attrs.get("temperature_slope_per_hour"),
             "linked_entity_id": state.entity_id,
         }

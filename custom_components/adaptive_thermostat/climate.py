@@ -3,6 +3,7 @@
 import asyncio
 import logging
 import math
+from collections import deque
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional
@@ -84,6 +85,18 @@ from .const import (
 _LOGGER = logging.getLogger(__name__)
 MIN_SLOPE_THRESHOLD = 0.0002  # °C per second (~0.012°C per minute)
 SLOPE_CHANGE_EPSILON = 0.001  # °C change required to treat as a new slope sample
+HOURLY_SLOPE_WINDOW_SECONDS = 3600.0
+HOURLY_HISTORY_BUFFER_SECONDS = 4200.0  # keep a little extra beyond one hour for interpolation
+UNDERSHOOT_STREAK_TRIGGER = 2
+OVERSHOOT_STREAK_TRIGGER = 2
+CONTROL_WINDOW_ADJUST_STEP = 0.2
+CONTROL_WINDOW_MIN_FACTOR = 0.5
+CONTROL_WINDOW_MAX_FACTOR = 1.8
+DEFAULT_UNDERSHOOT_BIAS = 0.12
+MIN_UNDERSHOOT_BIAS = 0.04
+MAX_UNDERSHOOT_BIAS = 0.35
+UNDERSHOOT_BIAS_STEP = 0.01
+BIAS_RELAX_RATE = 0.02
 DEFAULT_DELAY_SECONDS = 90.0
 CONTROL_KP = 0.6
 CONTROL_KI = 0.0005
@@ -341,6 +354,11 @@ class AdaptiveThermostat(ClimateEntity):
             "total_run_count": 0,
             "cycle_entries": 0,
             "current_run": None,
+            "cycle_comfort_state": "comfort",
+            "cycle_undershoot_bias": DEFAULT_UNDERSHOOT_BIAS,
+            "cycle_undershoot_streak": 0,
+            "cycle_overshoot_streak": 0,
+            "cycle_last_adjust": None,
         }
         _LOGGER.debug("[%s] Extra state attributes set: %s", self._entry_id, self._attr_extra_state_attributes)
 
@@ -359,6 +377,13 @@ class AdaptiveThermostat(ClimateEntity):
         self._last_measurement_ts: float | None = None
         self._last_measurement_temp: float | None = None
         self._display_temperature_slope: float = 0.0
+        self._hourly_temperature_slope: float = 0.0
+        self._temperature_history: deque[tuple[float, float]] = deque()
+        self._comfort_state: str = "comfort"
+        self._undershoot_streak: int = 0
+        self._overshoot_streak: int = 0
+        self._undershoot_bias: float = DEFAULT_UNDERSHOOT_BIAS
+        self._last_cycle_adjust_ts: float | None = None
         self._last_update_ts: float | None = None
         self._integrator: float = 0.0
         self._window_start_ts: float | None = None
@@ -784,7 +809,8 @@ class AdaptiveThermostat(ClimateEntity):
                 and self._target_temperature is not None
                 and dt > 0
             ):
-                error = self._target_temperature - filtered_for_control
+                effective_target = max(self._target_temperature - self._undershoot_bias, MIN_TARGET_TEMP)
+                error = effective_target - filtered_for_control
                 tolerance = self._target_tolerance if self._target_tolerance is not None else DEFAULT_TARGET_TOLERANCE
                 tolerance = max(tolerance, COMFORT_EPSILON)
                 if error <= -tolerance:
@@ -961,7 +987,8 @@ class AdaptiveThermostat(ClimateEntity):
         )
 
         slope_per_sec = self._display_temperature_slope
-        slope_per_hour = slope_per_sec * 3600.0
+        instant_slope_per_hour = slope_per_sec * 3600.0
+        hourly_slope_per_hour = self._hourly_temperature_slope
         raw_slope_per_sec = self._raw_temperature_slope or 0.0
         raw_slope_per_hour = raw_slope_per_sec * 3600.0
         window_alert = self._attr_extra_state_attributes.get("window_alert")
@@ -1002,7 +1029,9 @@ class AdaptiveThermostat(ClimateEntity):
             "current_temperature": self._current_temperature,
             "filtered_temperature": self._filtered_temperature,
             "control_temperature": control_temperature,
-            "temperature_slope_per_hour": slope_per_hour,
+            "temperature_slope_per_hour": hourly_slope_per_hour,
+            "temperature_slope_instant_per_hour": instant_slope_per_hour,
+            "raw_temperature_slope_per_hour": raw_slope_per_hour,
             "target_temperature": self._target_temperature,
             "target_tolerance": self._target_tolerance,
             "current_humidity": self._current_humidity,
@@ -1046,6 +1075,15 @@ class AdaptiveThermostat(ClimateEntity):
                 "delay": self._adaptive_profile.delay_samples,
                 "overshoot": self._adaptive_profile.overshoot_samples,
             },
+            "cycle_comfort_state": self._comfort_state,
+            "cycle_undershoot_bias": round(self._undershoot_bias, 3),
+            "cycle_undershoot_streak": self._undershoot_streak,
+            "cycle_overshoot_streak": self._overshoot_streak,
+            "cycle_last_adjust": (
+                dt_util.utc_from_timestamp(self._last_cycle_adjust_ts).isoformat()
+                if self._last_cycle_adjust_ts
+                else None
+            ),
             "window_detection_enabled": self._window_detection_enabled,
             "window_open_detected": self._open_window_detected,
             "window_slope_threshold": self._window_slope_threshold,
@@ -1056,11 +1094,12 @@ class AdaptiveThermostat(ClimateEntity):
         })
 
         _LOGGER.debug(
-            "[%s] Sensor update: T=%.2f°C (filtered=%.2f°C, slope=%.3f°C/h, instant=%.3f°C/h), target=%.2f°C",
+            "[%s] Sensor update: T=%.2f°C (filtered=%.2f°C, instant=%.3f°C/h, hourly=%.3f°C/h, raw=%.3f°C/h), target=%.2f°C",
             self._entry_id,
             self._current_temperature if self._current_temperature is not None else float("nan"),
             self._filtered_temperature if self._filtered_temperature is not None else float("nan"),
-            slope_per_hour,
+            instant_slope_per_hour,
+            hourly_slope_per_hour,
             raw_slope_per_hour,
             self._target_temperature if self._target_temperature is not None else float("nan"),
         )
@@ -1162,7 +1201,8 @@ class AdaptiveThermostat(ClimateEntity):
                 )
 
         if filtered is not None:
-            error = target - filtered
+            effective_target = max(target - self._undershoot_bias, MIN_TARGET_TEMP)
+            error = effective_target - filtered
             duty += CONTROL_KP * error
             duty += CONTROL_KI * self._integrator
 
@@ -1213,8 +1253,37 @@ class AdaptiveThermostat(ClimateEntity):
         elif meaningful_change and dt > 0:
             self._display_temperature_slope = slope
 
+        self._update_hourly_temperature_slope(sample_ts, raw_temp)
+
         if meaningful_change:
             self._update_adaptive_learning(sample_ts, slope, outdoor_temp, self._zone_heater_on, dt)
+
+    def _update_hourly_temperature_slope(self, sample_ts: float, temp: float) -> None:
+        """Maintain rolling temperature history and compute long-term slope."""
+        if self._temperature_history and sample_ts <= self._temperature_history[-1][0]:
+            # Replace last sample if timestamps are identical or out-of-order
+            self._temperature_history[-1] = (sample_ts, temp)
+        else:
+            self._temperature_history.append((sample_ts, temp))
+
+        cutoff = sample_ts - HOURLY_SLOPE_WINDOW_SECONDS
+        prune_before = sample_ts - HOURLY_HISTORY_BUFFER_SECONDS
+        while len(self._temperature_history) > 1 and self._temperature_history[0][0] < prune_before:
+            self._temperature_history.popleft()
+
+        reference_ts, reference_temp = self._temperature_history[0]
+        for ts, value in self._temperature_history:
+            if ts <= cutoff:
+                reference_ts, reference_temp = ts, value
+            else:
+                break
+
+        dt_hist = sample_ts - reference_ts
+        if dt_hist <= 0:
+            return
+
+        slope_per_hour = (temp - reference_temp) / dt_hist * 3600.0
+        self._hourly_temperature_slope = slope_per_hour
 
     def _update_adaptive_learning(
         self,
@@ -1580,6 +1649,104 @@ class AdaptiveThermostat(ClimateEntity):
             self._dynamic_control_window = new_window
             self._window_desired_on = self._compute_desired_on_duration()
 
+    def _update_cycle_state(self, new_state: str, now_ts: float) -> None:
+        """Track comfort state transitions and adjust cycle behaviour."""
+        if new_state == self._comfort_state:
+            if new_state == "comfort":
+                self._adjust_cycle_bias(relax=True)
+            self._attr_extra_state_attributes["cycle_undershoot_bias"] = round(self._undershoot_bias, 3)
+            return
+
+        previous_state = self._comfort_state
+        self._comfort_state = new_state
+
+        if new_state == "undershoot":
+            self._overshoot_streak = 0
+            self._undershoot_streak = min(self._undershoot_streak + 1, UNDERSHOOT_STREAK_TRIGGER)
+            self._adjust_cycle_bias(warmer=True)
+            if self._undershoot_streak >= UNDERSHOOT_STREAK_TRIGGER:
+                self._undershoot_streak = 0
+                self._adjust_cycle_window(increase=True, reason="undershoot", now_ts=now_ts)
+        elif new_state == "overshoot":
+            self._undershoot_streak = 0
+            self._overshoot_streak = min(self._overshoot_streak + 1, OVERSHOOT_STREAK_TRIGGER)
+            self._adjust_cycle_bias(cooler=True)
+            if self._overshoot_streak >= OVERSHOOT_STREAK_TRIGGER:
+                self._overshoot_streak = 0
+                self._adjust_cycle_window(increase=False, reason="overshoot", now_ts=now_ts)
+        else:
+            self._undershoot_streak = 0
+            self._overshoot_streak = 0
+            self._adjust_cycle_bias(relax=True)
+
+        self._attr_extra_state_attributes["cycle_comfort_state"] = self._comfort_state
+        self._attr_extra_state_attributes["cycle_undershoot_bias"] = round(self._undershoot_bias, 3)
+        self._attr_extra_state_attributes["cycle_undershoot_streak"] = self._undershoot_streak
+        self._attr_extra_state_attributes["cycle_overshoot_streak"] = self._overshoot_streak
+
+        if previous_state != new_state:
+            _LOGGER.debug(
+                "[%s] Comfort state change: %s -> %s",
+                self._entry_id,
+                previous_state,
+                new_state,
+            )
+
+    def _adjust_cycle_bias(self, *, warmer: bool = False, cooler: bool = False, relax: bool = False) -> None:
+        """Adapt undershoot bias to favour warmer or cooler outcomes."""
+        bias = self._undershoot_bias
+        if warmer:
+            bias -= UNDERSHOOT_BIAS_STEP
+        elif cooler:
+            bias += UNDERSHOOT_BIAS_STEP
+        elif relax:
+            bias += (DEFAULT_UNDERSHOOT_BIAS - bias) * BIAS_RELAX_RATE
+        else:
+            return
+
+        bias = _clamp(bias, MIN_UNDERSHOOT_BIAS, MAX_UNDERSHOOT_BIAS)
+        if abs(bias - self._undershoot_bias) > 1e-4:
+            previous = self._undershoot_bias
+            self._undershoot_bias = bias
+            self._window_desired_on = self._compute_desired_on_duration()
+            self._attr_extra_state_attributes["desired_on_time_seconds"] = round(self._window_desired_on, 1)
+            _LOGGER.debug(
+                "[%s] Undershoot bias adjusted from %.3f to %.3f",
+                self._entry_id,
+                previous,
+                bias,
+            )
+
+    def _adjust_cycle_window(self, *, increase: bool, reason: str, now_ts: float) -> None:
+        """Adjust control window to lengthen or shorten duty cycles."""
+        base_window = self._configured_control_window if self._configured_control_window else self._control_window
+        min_window = max(60.0, base_window * CONTROL_WINDOW_MIN_FACTOR)
+        max_window = min(1200.0, base_window * CONTROL_WINDOW_MAX_FACTOR)
+        factor = 1.0 + CONTROL_WINDOW_ADJUST_STEP if increase else 1.0 - CONTROL_WINDOW_ADJUST_STEP
+        candidate = _clamp(self._control_window * factor, min_window, max_window)
+        if abs(candidate - self._control_window) < 0.5:
+            return
+
+        previous = self._control_window
+        self._control_window = candidate
+        self._dynamic_control_window = candidate
+        self._window_desired_on = self._compute_desired_on_duration()
+        self._window_start_ts = now_ts
+        self._window_on_time = 0.0
+        self._last_cycle_adjust_ts = now_ts
+        self._attr_extra_state_attributes["control_window_seconds"] = round(self._control_window, 1)
+        self._attr_extra_state_attributes["control_window_adaptive_seconds"] = round(self._control_window, 1)
+        self._attr_extra_state_attributes["desired_on_time_seconds"] = round(self._window_desired_on, 1)
+        self._attr_extra_state_attributes["cycle_last_adjust"] = dt_util.utc_from_timestamp(now_ts).isoformat()
+
+        _LOGGER.info(
+            "[%s] Control window adjusted to %.1fs (reason=%s, previous=%.1fs)",
+            self._entry_id,
+            self._control_window,
+            reason,
+            previous,
+        )
+
     def _mark_profile_dirty(self) -> None:
         """Schedule persistence of the adaptive profile."""
         if not self._profile_store:
@@ -1656,10 +1823,18 @@ class AdaptiveThermostat(ClimateEntity):
             return False
 
         target = self._target_temperature
-        tolerance = self._target_tolerance
+        tolerance_setting = self._target_tolerance if self._target_tolerance is not None else DEFAULT_TARGET_TOLERANCE
+        tolerance = max(tolerance_setting, COMFORT_EPSILON)
 
-        # Basic hysteresis guard outside comfort band to guarantee heat starts early enough
+        state = "comfort"
         if comparison_temp <= target - tolerance:
+            state = "undershoot"
+        elif comparison_temp >= target + tolerance:
+            state = "overshoot"
+
+        self._update_cycle_state(state, now_ts)
+
+        if state == "undershoot":
             if (
                 not self._zone_heater_on
                 and self._last_command_timestamp is not None
@@ -1671,7 +1846,7 @@ class AdaptiveThermostat(ClimateEntity):
             self._attr_extra_state_attributes["cycle_mode_active"] = False
             return True
 
-        if comparison_temp >= target + tolerance:
+        if state == "overshoot":
             if (
                 self._zone_heater_on
                 and self._last_command_timestamp is not None
@@ -1734,7 +1909,18 @@ class AdaptiveThermostat(ClimateEntity):
 
         if self._zone_heater_on:
             predicted_peak = effective_filtered + heating_rate * delay + overshoot
-            if predicted_peak >= target + tolerance and not in_min_on:
+            if delay > 0.0:
+                lookahead = min(delay, 900.0)
+                instant_slope = self._display_temperature_slope
+                instant_peak = comparison_temp + max(instant_slope, 0.0) * lookahead
+                predicted_peak = max(predicted_peak, instant_peak)
+                hourly_peak = comparison_temp + max(self._hourly_temperature_slope / 3600.0, 0.0) * lookahead
+                predicted_peak = max(predicted_peak, hourly_peak)
+
+            peak_limit = target + tolerance - self._undershoot_bias * 0.5
+            peak_limit = max(target + COMFORT_EPSILON, peak_limit)
+
+            if predicted_peak >= peak_limit and not in_min_on:
                 return False
             if (
                 self._window_desired_on > 0
@@ -1752,7 +1938,19 @@ class AdaptiveThermostat(ClimateEntity):
             return False
 
         predicted_floor = comparison_temp - cooling_rate * delay
-        floor_threshold = target - (CYCLE_ENTRY_DELTA if self._cycle_mode_active else tolerance)
+        bias = self._undershoot_bias
+        floor_threshold = target - bias - (CYCLE_ENTRY_DELTA if self._cycle_mode_active else tolerance)
+        floor_threshold = max(target - 1.5, floor_threshold)
+        floor_threshold = min(floor_threshold, target - COMFORT_EPSILON)
+
+        floor_candidates = [predicted_floor]
+        if delay > 0.0:
+            lookahead = min(delay, 900.0)
+            instant_slope = self._display_temperature_slope
+            floor_candidates.append(comparison_temp + instant_slope * lookahead)
+            floor_candidates.append(comparison_temp + (self._hourly_temperature_slope / 3600.0) * lookahead)
+        predicted_floor = min(floor_candidates)
+
         if predicted_floor <= floor_threshold:
             return True
 
