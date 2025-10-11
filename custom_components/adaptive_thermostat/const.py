@@ -18,9 +18,6 @@ CONF_SLEEP_PRESET = "sleep_preset"
 CONF_HOME_PRESET = "home_preset"
 CONF_AWAY_PRESET = "away_preset"
 CONF_TARGET_TOLERANCE = "target_tolerance"
-CONF_CONTROL_WINDOW = "control_window"
-CONF_MIN_ON_TIME = "min_on_time"
-CONF_MIN_OFF_TIME = "min_off_time"
 CONF_WINDOW_DETECTION_ENABLED = "window_detection_enabled"
 CONF_WINDOW_SLOPE_THRESHOLD = "window_slope_threshold"
 
@@ -37,9 +34,6 @@ DEFAULT_HOME_PRESET = 23.0
 DEFAULT_SLEEP_PRESET = 21.0
 DEFAULT_AWAY_PRESET = 18.0
 DEFAULT_TARGET_TOLERANCE = 0.1
-DEFAULT_CONTROL_WINDOW = 180  # seconds
-DEFAULT_MIN_ON_TIME = 45      # seconds
-DEFAULT_MIN_OFF_TIME = 45     # seconds
 DEFAULT_WINDOW_DETECTION_ENABLED = False
 DEFAULT_WINDOW_SLOPE_THRESHOLD = 2.5  # °C per hour
 
@@ -56,8 +50,8 @@ DEFAULT_AUTO_ON_TEMP = 10.0  # °C - turn on when outdoor temp is below this
 DEFAULT_AUTO_OFF_TEMP = 18.0  # °C - turn off when outdoor temp is above this
 
 # Persistent storage
-STORAGE_KEY = "adaptive_thermostat_models"
 STORAGE_VERSION = 1
+STORAGE_STATE_KEY = "adaptive_thermostat_runtime_state"
 
 # Dispatcher signals
 SIGNAL_THERMOSTAT_READY = "adaptive_thermostat_thermostat_ready"

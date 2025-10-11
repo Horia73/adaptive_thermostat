@@ -46,8 +46,6 @@
         "data": {
           "target_tolerance": "Target Tolerance (±°C)",
           "control_window": "Control Window Length (seconds)",
-          "min_on_time": "Minimum Heater On Time (seconds)",
-          "min_off_time": "Minimum Heater Off Time (seconds)",
           "window_detection_enabled": "Detect Open Window Events",
           "window_slope_threshold": "Open Window Slope Threshold (°C/h)"
         }
@@ -122,8 +120,6 @@
         "data": {
           "target_tolerance": "Target Tolerance (±°C)",
           "control_window": "Control Window Length (seconds)",
-          "min_on_time": "Minimum Heater On Time (seconds)",
-          "min_off_time": "Minimum Heater Off Time (seconds)",
           "window_detection_enabled": "Detect Open Window Events",
           "window_slope_threshold": "Open Window Slope Threshold (°C/h)"
         }

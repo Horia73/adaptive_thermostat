@@ -10,7 +10,7 @@ from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.dispatcher import async_dispatcher_connect
-from homeassistant.helpers.event import async_track_state_change_event, Event # type: ignore
+from homeassistant.helpers.event import async_track_state_change_event, Event  # type: ignore
 from homeassistant.const import CONF_NAME
 
 from .const import DOMAIN, SIGNAL_THERMOSTAT_READY
@@ -24,28 +24,39 @@ async def async_setup_entry(
     async_add_entities,
 ) -> None:
     """Set up Adaptive Thermostat sensors."""
-    async_add_entities([AdaptiveThermostatSlopeSensor(hass, entry)])
+    sensors = [
+        AdaptiveThermostatSlopeSensor(hass, entry),
+        AdaptiveThermostatHourlySlopeSensor(hass, entry),
+    ]
+    async_add_entities(sensors)
 
 
-class AdaptiveThermostatSlopeSensor(SensorEntity):
-    """Sensor exposing the instantaneous temperature slope."""
+class _AdaptiveThermostatLinkedSensor(SensorEntity):
+    """Base class for sensors linked to the adaptive thermostat climate entity."""
 
     _attr_has_entity_name = True
     _attr_should_poll = False
-    _attr_icon = "mdi:chart-line"
-    _attr_native_unit_of_measurement = "°C/h"
     _attr_state_class = SensorStateClass.MEASUREMENT
+    _attr_native_unit_of_measurement = "°C/h"
 
-    def __init__(self, hass: HomeAssistant, entry: ConfigEntry) -> None:
-        """Initialize the slope sensor."""
+    def __init__(
+        self,
+        hass: HomeAssistant,
+        entry: ConfigEntry,
+        *,
+        unique_suffix: str,
+        name_suffix: str,
+        icon: str,
+    ) -> None:
         self._hass = hass
         self._entry = entry
         self._climate_entity_id: Optional[str] = None
         self._unsub_dispatcher: Optional[Callable[[], None]] = None
         self._unsub_state: Optional[Callable[[], None]] = None
-        self._attr_unique_id = f"{entry.entry_id}_temperature_slope"
         base_name = entry.title or entry.data.get(CONF_NAME) or "Adaptive Thermostat"
-        self._attr_name = f"{base_name} Temperature Slope"
+        self._attr_unique_id = f"{entry.entry_id}_{unique_suffix}"
+        self._attr_name = f"{base_name} {name_suffix}"
+        self._attr_icon = icon
         self._attr_device_info = DeviceInfo(
             identifiers={(DOMAIN, entry.entry_id)},
             name=base_name,
@@ -98,7 +109,11 @@ class AdaptiveThermostatSlopeSensor(SensorEntity):
         self._climate_entity_id = entity_id
 
         if not entity_id:
-            _LOGGER.debug("[%s] No thermostat entity available, marking slope sensor unavailable", self._entry.entry_id)
+            _LOGGER.debug(
+                "[%s] No thermostat entity available, marking %s sensor unavailable",
+                self._entry.entry_id,
+                self._attr_name,
+            )
             self._attr_available = False
             self._attr_native_value = None
             self._attr_extra_state_attributes = {}
@@ -106,8 +121,9 @@ class AdaptiveThermostatSlopeSensor(SensorEntity):
             return
 
         _LOGGER.debug(
-            "[%s] Binding slope sensor to climate entity %s",
+            "[%s] Binding %s sensor to climate entity %s",
             self._entry.entry_id,
+            self._attr_name,
             entity_id,
         )
         self._attr_available = True
@@ -127,6 +143,21 @@ class AdaptiveThermostatSlopeSensor(SensorEntity):
         self._update_from_state(new_state)
         self.async_write_ha_state()
 
+    def _extract_value(self, attrs: dict[str, Any]) -> Optional[float]:
+        """Extract native value from thermostat attributes."""
+        raise NotImplementedError
+
+    def _build_extra_attrs(
+        self,
+        attrs: dict[str, Any],
+        raw_value: Optional[float],
+        state: Any,
+    ) -> dict[str, Any]:
+        """Return additional state attributes for the sensor."""
+        return {
+            "linked_entity_id": getattr(state, "entity_id", None),
+        }
+
     def _update_from_state(self, state: Optional[Any]) -> None:
         """Update the sensor from a Home Assistant state object."""
         if state is None:
@@ -134,9 +165,27 @@ class AdaptiveThermostatSlopeSensor(SensorEntity):
             self._attr_native_value = None
             self._attr_extra_state_attributes = {}
             return
-        self._attr_available = True
 
+        self._attr_available = True
         attrs = state.attributes or {}
+        raw_value = self._extract_value(attrs)
+        self._attr_native_value = round(raw_value, 3) if raw_value is not None else None
+        self._attr_extra_state_attributes = self._build_extra_attrs(attrs, raw_value, state)
+
+
+class AdaptiveThermostatSlopeSensor(_AdaptiveThermostatLinkedSensor):
+    """Sensor exposing the instantaneous temperature slope."""
+
+    def __init__(self, hass: HomeAssistant, entry: ConfigEntry) -> None:
+        super().__init__(
+            hass,
+            entry,
+            unique_suffix="temperature_slope",
+            name_suffix="Temperature Slope",
+            icon="mdi:chart-line",
+        )
+
+    def _extract_value(self, attrs: dict[str, Any]) -> Optional[float]:
         slope_per_hour = attrs.get("temperature_slope_instant_per_hour")
 
         if slope_per_hour is None:
@@ -147,15 +196,60 @@ class AdaptiveThermostatSlopeSensor(SensorEntity):
             if display_per_min is not None:
                 slope_per_hour = display_per_min * 60.0
 
-        native_value: Optional[float]
-        if slope_per_hour is None:
-            native_value = None
-        else:
-            native_value = round(slope_per_hour, 3)
+        return slope_per_hour
 
-        self._attr_native_value = native_value
-        self._attr_extra_state_attributes = {
-            "slope_per_hour": slope_per_hour,
-            "hourly_slope_per_hour": attrs.get("temperature_slope_per_hour"),
-            "linked_entity_id": state.entity_id,
-        }
+    def _build_extra_attrs(
+        self,
+        attrs: dict[str, Any],
+        raw_value: Optional[float],
+        state: Any,
+    ) -> dict[str, Any]:
+        extra = super()._build_extra_attrs(attrs, raw_value, state)
+        extra.update(
+            {
+                "slope_per_hour": raw_value,
+                "hourly_slope_per_hour": attrs.get("temperature_slope_per_hour"),
+            }
+        )
+        return extra
+
+
+class AdaptiveThermostatHourlySlopeSensor(_AdaptiveThermostatLinkedSensor):
+    """Sensor exposing the long-term hourly temperature slope."""
+
+    def __init__(self, hass: HomeAssistant, entry: ConfigEntry) -> None:
+        super().__init__(
+            hass,
+            entry,
+            unique_suffix="temperature_slope_hourly",
+            name_suffix="Hourly Temperature Slope",
+            icon="mdi:chart-timeline-variant",
+        )
+
+    def _extract_value(self, attrs: dict[str, Any]) -> Optional[float]:
+        hourly_slope = attrs.get("temperature_slope_per_hour")
+
+        if hourly_slope is None:
+            slope_per_min = attrs.get("temperature_slope_per_min")
+            if slope_per_min is not None:
+                hourly_slope = slope_per_min * 60.0
+
+        if hourly_slope is None:
+            hourly_slope = attrs.get("temperature_slope_instant_per_hour")
+
+        return hourly_slope
+
+    def _build_extra_attrs(
+        self,
+        attrs: dict[str, Any],
+        raw_value: Optional[float],
+        state: Any,
+    ) -> dict[str, Any]:
+        extra = super()._build_extra_attrs(attrs, raw_value, state)
+        extra.update(
+            {
+                "hourly_slope_per_hour": raw_value,
+                "instant_slope_per_hour": attrs.get("temperature_slope_instant_per_hour"),
+            }
+        )
+        return extra
