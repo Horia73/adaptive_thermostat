@@ -55,6 +55,7 @@ class ThermalController:
         self._ema_alpha = self._halflife_to_alpha(ema_outdoor_halflife_s)
         self._ref_outdoor: Optional[float] = None
         self._last_good_on: Optional[float] = None
+        self._apply_adaptive_timings()
 
     @staticmethod
     def _halflife_to_alpha(halflife_s: float, dt_s: float = 1.0) -> float:
@@ -80,6 +81,7 @@ class ThermalController:
     def set_params(self, params: Params) -> None:
         """Override controller parameters."""
         self.params = params
+        self._apply_adaptive_timings()
 
     def get_params(self) -> Params:
         """Return current controller parameters."""
@@ -307,4 +309,16 @@ class ThermalController:
             new_params.K = _clip(new_params.K, 0.2, 20.0)
 
         self.params = new_params
+        self._apply_adaptive_timings()
         return new_params
+
+    def _apply_adaptive_timings(self) -> None:
+        """Derive min on/off times and PWM window from the current parameters."""
+        params = self.params
+        min_on = _clip(params.tau_r * 0.2, 30.0, params.tau_r * 0.8)
+        min_off = _clip(params.tau_th * 0.15, min_on, params.tau_th)
+        window = _clip(params.tau_th, 300.0, 3600.0)
+
+        self.min_on_s = int(min_on)
+        self.min_off_s = int(min_off)
+        self.window_s = int(window)

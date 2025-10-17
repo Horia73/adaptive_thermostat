@@ -72,8 +72,7 @@ from .thermal_controller import ThermalController
 
 _LOGGER = logging.getLogger(__name__)
 
-HEAT_ON_DELTA = 0.2  # °C below target where heating turns on
-HEAT_OFF_DELTA = 0.1  # °C below target where heating turns off
+DEFAULT_DEADBAND = 0.1  # °C band for adaptive controller
 STATE_SAVE_DELAY_SECONDS = 2.0
 CONTROL_TICK_SECONDS = 30
 SLOPE_CHANGE_EPSILON = 0.001  # °C change required to treat as a new slope sample
@@ -181,7 +180,7 @@ class AdaptiveThermostat(ClimateEntity):
         # Advanced thermal controller
         self._thermal_controller = ThermalController(
             target=self._target_temperature,
-            deadband=HEAT_OFF_DELTA,
+            deadband=DEFAULT_DEADBAND,
             window_s=600,
             min_on_s=60,
             min_off_s=120,
@@ -247,8 +246,8 @@ class AdaptiveThermostat(ClimateEntity):
             "window_slope_threshold": self._window_slope_threshold,
             "window_alert": None,
             "zone_heater_on": False,
-            "heat_on_delta": HEAT_ON_DELTA,
-            "heat_off_delta": HEAT_OFF_DELTA,
+            "heat_on_delta": self._thermal_controller.deadband,
+            "heat_off_delta": self._thermal_controller.deadband,
             "window_recovery_until": None,
             "window_data_block_until": None,
             "planned_zone_off_time": None,
@@ -784,10 +783,14 @@ class AdaptiveThermostat(ClimateEntity):
 
         effective_temp = self._filtered_temperature or self._current_temperature
         heat_on_threshold = (
-            self._target_temperature - HEAT_ON_DELTA if self._target_temperature is not None else None
+            self._target_temperature - self._thermal_controller.deadband
+            if self._target_temperature is not None
+            else None
         )
         heat_off_threshold = (
-            self._target_temperature - HEAT_OFF_DELTA if self._target_temperature is not None else None
+            self._target_temperature + self._thermal_controller.deadband
+            if self._target_temperature is not None
+            else None
         )
         window_recovery_iso = self._iso_or_none(self._window_heat_reenable_at)
         data_block_iso = self._iso_or_none(self._window_data_reenable_at)
@@ -820,6 +823,8 @@ class AdaptiveThermostat(ClimateEntity):
                 "manual_override": self._manual_override,
                 "heat_on_threshold": heat_on_threshold,
                 "heat_off_threshold": heat_off_threshold,
+                "heat_on_delta": self._thermal_controller.deadband,
+                "heat_off_delta": self._thermal_controller.deadband,
                 "effective_control_temperature": effective_temp,
                 "last_updated": now.isoformat(),
                 "window_recovery_until": window_recovery_iso,
@@ -859,15 +864,22 @@ class AdaptiveThermostat(ClimateEntity):
             and now_ts - self._last_command_timestamp < self._thermal_controller.min_off_s
         )
 
-        upper_band = self._target_temperature + self._thermal_controller.deadband
-        lower_band = self._target_temperature - HEAT_ON_DELTA
+        deadband = self._thermal_controller.deadband
+        upper_band = self._target_temperature + deadband
+        lower_band = self._target_temperature - deadband
 
         if self._zone_heater_on:
             should_turn_off = False
             if self._planned_heater_off_ts is not None and now_ts >= self._planned_heater_off_ts and not min_on_active:
                 should_turn_off = True
-            elif effective_temp >= upper_band and not min_on_active:
+            elif effective_temp >= self._target_temperature + 2 * deadband and not min_on_active:
                 should_turn_off = True
+                _LOGGER.warning(
+                    "[%s] Failsafe OFF (temp %.2f°C beyond target %.2f°C)",
+                    self._entry_id,
+                    effective_temp,
+                    self._target_temperature,
+                )
 
             if should_turn_off:
                 _LOGGER.info(
