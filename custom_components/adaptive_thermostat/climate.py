@@ -6,7 +6,7 @@ import asyncio
 import logging
 from collections import deque
 from datetime import datetime, timedelta
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from homeassistant.components.climate import (  # type: ignore
     ClimateEntity,
@@ -68,6 +68,7 @@ from .const import (
     STORAGE_STATE_KEY,
     STORAGE_VERSION,
 )
+from .thermal_controller import ThermalController
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -78,6 +79,8 @@ CONTROL_TICK_SECONDS = 30
 SLOPE_CHANGE_EPSILON = 0.001  # °C change required to treat as a new slope sample
 HOURLY_SLOPE_WINDOW_SECONDS = 3600.0
 HOURLY_HISTORY_BUFFER_SECONDS = 4200.0
+WINDOW_RECOVERY_BUFFER_SECONDS = 600.0  # 10 min before/after window events
+THERMAL_SAMPLE_HISTORY_SECONDS = 6 * 3600.0  # retain up to 6 hours of samples for model updates
 
 
 def _clamp(value: float, low: float, high: float) -> float:
@@ -175,6 +178,22 @@ class AdaptiveThermostat(ClimateEntity):
         self._zone_heater_on: bool = False
         self._manual_override: bool = False
 
+        # Advanced thermal controller
+        self._thermal_controller = ThermalController(
+            target=self._target_temperature,
+            deadband=HEAT_OFF_DELTA,
+            window_s=600,
+            min_on_s=60,
+            min_off_s=120,
+        )
+        self._thermal_samples: deque[Tuple[float, float, bool]] = deque()
+        self._planned_heater_off_ts: Optional[float] = None
+        self._planned_on_duration: Optional[float] = None
+        self._planned_off_unsub: Optional[Callable[[], None]] = None
+        self._window_data_reenable_at: Optional[float] = None
+        self._window_heat_reenable_at: Optional[float] = None
+        self._window_open_since_ts: Optional[float] = None
+
         # Slope tracking
         self._last_measurement_ts: Optional[float] = None
         self._last_measurement_temp: Optional[float] = None
@@ -230,6 +249,17 @@ class AdaptiveThermostat(ClimateEntity):
             "zone_heater_on": False,
             "heat_on_delta": HEAT_ON_DELTA,
             "heat_off_delta": HEAT_OFF_DELTA,
+            "window_recovery_until": None,
+            "window_data_block_until": None,
+            "planned_zone_off_time": None,
+            "planned_zone_on_duration": None,
+            "thermal_samples_cached": 0,
+            "thermal_params": {
+                "tau_r": self._thermal_controller.params.tau_r,
+                "tau_th": self._thermal_controller.params.tau_th,
+                "K": self._thermal_controller.params.K,
+                "p": self._thermal_controller.params.p,
+            },
         }
 
     @property
@@ -371,6 +401,10 @@ class AdaptiveThermostat(ClimateEntity):
             self._delayed_valve_off_task.cancel()
             self._delayed_valve_off_task = None
 
+        if self._planned_off_unsub:
+            self._planned_off_unsub()
+            self._planned_off_unsub = None
+
         if self._state_save_unsub:
             self._state_save_unsub()
             self._state_save_unsub = None
@@ -419,6 +453,7 @@ class AdaptiveThermostat(ClimateEntity):
 
         self._current_preset = preset_mode
         self._target_temperature = self._presets[preset_mode]
+        self._thermal_controller.target = self._target_temperature
         if self._hvac_mode == HVACMode.HEAT:
             await self._async_control_heating(dt_util.utcnow().timestamp())
         self._mark_state_dirty()
@@ -432,6 +467,7 @@ class AdaptiveThermostat(ClimateEntity):
         target = _clamp(float(temperature), MIN_TARGET_TEMP, MAX_TARGET_TEMP)
         self._target_temperature = target
         self._current_preset = None
+        self._thermal_controller.target = self._target_temperature
         if self._hvac_mode == HVACMode.HEAT:
             await self._async_control_heating(dt_util.utcnow().timestamp())
         self._mark_state_dirty()
@@ -463,6 +499,11 @@ class AdaptiveThermostat(ClimateEntity):
                 self._current_outdoor_temp = outdoor_temp
             elif backup_outdoor_temp is not None and self._current_outdoor_temp is None:
                 self._current_outdoor_temp = backup_outdoor_temp
+
+            if outdoor_temp is not None:
+                self._thermal_controller.update_outdoor(outdoor_temp)
+            elif backup_outdoor_temp is not None:
+                self._thermal_controller.update_outdoor(backup_outdoor_temp)
 
             await self._async_update_window_detection(now_ts, door_window_open)
             self._update_sensor_attributes(
@@ -574,6 +615,7 @@ class AdaptiveThermostat(ClimateEntity):
         self._display_temperature_slope = slope
         self._filtered_temperature = raw_temp
         self._update_hourly_temperature_slope(sample_ts, raw_temp)
+        self._record_thermal_sample(sample_ts, raw_temp)
 
     def _update_hourly_temperature_slope(self, sample_ts: float, temp: float) -> None:
         """Maintain a rolling history to compute long term slope."""
@@ -608,6 +650,74 @@ class AdaptiveThermostat(ClimateEntity):
         slope_per_hour = (temp - reference_temp) / dt_hist * 3600.0
         self._hourly_temperature_slope = slope_per_hour
 
+    def _record_thermal_sample(self, sample_ts: float, temp: float) -> None:
+        """Record a sample for the thermal model, respecting window quiescence."""
+        if self._open_window_detected:
+            return
+        if self._window_data_reenable_at is not None and sample_ts < self._window_data_reenable_at:
+            return
+
+        self._thermal_samples.append((sample_ts, temp, self._zone_heater_on))
+
+        while self._thermal_samples and sample_ts - self._thermal_samples[0][0] > THERMAL_SAMPLE_HISTORY_SECONDS:
+            self._thermal_samples.popleft()
+
+        self._attr_extra_state_attributes["thermal_samples_cached"] = len(self._thermal_samples)
+
+    def _purge_recent_samples(self, keep_before_ts: float) -> None:
+        """Drop recent samples collected during window disturbances."""
+        if not self._thermal_samples:
+            return
+
+        removed = 0
+        while self._thermal_samples and self._thermal_samples[-1][0] >= keep_before_ts:
+            self._thermal_samples.pop()
+            removed += 1
+
+        if removed:
+            _LOGGER.debug("[%s] Purged %d thermal samples after window detection", self._entry_id, removed)
+
+        self._attr_extra_state_attributes["thermal_samples_cached"] = len(self._thermal_samples)
+
+    def _handle_window_state_transition(self, now_ts: float, opened: bool) -> None:
+        """Apply bookkeeping when a window disturbance starts or ends."""
+        if opened:
+            self._window_open_since_ts = now_ts
+            self._purge_recent_samples(now_ts - WINDOW_RECOVERY_BUFFER_SECONDS)
+            self._window_data_reenable_at = None
+            self._window_heat_reenable_at = None
+            if self._planned_off_unsub:
+                self._planned_off_unsub()
+                self._planned_off_unsub = None
+            self._planned_heater_off_ts = None
+            self._planned_on_duration = None
+            self._attr_extra_state_attributes["planned_zone_off_time"] = None
+            self._attr_extra_state_attributes["planned_zone_on_duration"] = None
+            self._attr_extra_state_attributes["window_data_block_until"] = None
+            self._attr_extra_state_attributes["window_recovery_until"] = None
+        else:
+            self._window_open_since_ts = None
+            recovery_ts = now_ts + WINDOW_RECOVERY_BUFFER_SECONDS
+            self._window_data_reenable_at = recovery_ts
+            self._window_heat_reenable_at = recovery_ts
+            iso_value = self._iso_or_none(recovery_ts)
+            self._attr_extra_state_attributes["window_data_block_until"] = iso_value
+            self._attr_extra_state_attributes["window_recovery_until"] = iso_value
+
+    def _iso_or_none(self, ts: Optional[float]) -> Optional[str]:
+        """Return ISO timestamp or None."""
+        if ts is None:
+            return None
+        return dt_util.utc_from_timestamp(ts).isoformat()
+
+    async def _async_handle_planned_turn_off(self, _now: datetime) -> None:
+        """Handle scheduled heater turn-off initiated by the model."""
+        self._planned_off_unsub = None
+        self._planned_heater_off_ts = None
+        if self._zone_heater_on:
+            _LOGGER.debug("[%s] Model-triggered OFF reached", self._entry_id)
+            await self._async_turn_heater_off()
+
     async def _async_update_window_detection(self, now_ts: float, door_window_open: Optional[bool]) -> None:
         """Detect rapid cooling or open window events."""
         if not self._window_detection_enabled:
@@ -622,6 +732,7 @@ class AdaptiveThermostat(ClimateEntity):
                 self._open_window_detected = True
                 self._window_alert = "Door/window sensor reported open"
                 self._last_window_event_ts = now_ts
+                self._handle_window_state_transition(now_ts, True)
                 _LOGGER.warning("[%s] Window sensor open - disabling heating", self._entry_id)
                 if self._zone_heater_on:
                     await self._async_turn_heater_off()
@@ -637,6 +748,7 @@ class AdaptiveThermostat(ClimateEntity):
             self._open_window_detected = True
             self._window_alert = f"Open window detected (drop {abs(slope_per_hour):.2f}°C/h)"
             self._last_window_event_ts = now_ts
+            self._handle_window_state_transition(now_ts, True)
             _LOGGER.warning(
                 "[%s] Temperature drop detected (%.2f°C/h). Disabling heating.",
                 self._entry_id,
@@ -648,6 +760,7 @@ class AdaptiveThermostat(ClimateEntity):
             self._open_window_detected = False
             self._window_alert = None
             self._last_window_event_ts = now_ts
+            self._handle_window_state_transition(now_ts, False)
             _LOGGER.info("[%s] Window cooling resolved (%.2f°C/h)", self._entry_id, slope_per_hour)
 
     def _update_sensor_attributes(
@@ -676,6 +789,16 @@ class AdaptiveThermostat(ClimateEntity):
         heat_off_threshold = (
             self._target_temperature - HEAT_OFF_DELTA if self._target_temperature is not None else None
         )
+        window_recovery_iso = self._iso_or_none(self._window_heat_reenable_at)
+        data_block_iso = self._iso_or_none(self._window_data_reenable_at)
+        planned_off_iso = self._iso_or_none(self._planned_heater_off_ts)
+        params = self._thermal_controller.get_params()
+        thermal_params = {
+            "tau_r": round(params.tau_r, 2),
+            "tau_th": round(params.tau_th, 2),
+            "K": round(params.K, 3),
+            "p": round(params.p, 3),
+        }
 
         self._attr_extra_state_attributes.update(
             {
@@ -699,16 +822,16 @@ class AdaptiveThermostat(ClimateEntity):
                 "heat_off_threshold": heat_off_threshold,
                 "effective_control_temperature": effective_temp,
                 "last_updated": now.isoformat(),
+                "window_recovery_until": window_recovery_iso,
+                "window_data_block_until": data_block_iso,
+                "planned_zone_off_time": planned_off_iso,
+                "planned_zone_on_duration": self._planned_on_duration,
+                "thermal_params": thermal_params,
             }
         )
 
     async def _async_control_heating(self, now_ts: float) -> None:
-        """Apply simple hysteresis control."""
-        if self._open_window_detected:
-            if self._zone_heater_on:
-                await self._async_turn_heater_off()
-            return
-
+        """Apply model-based control with window-aware gating."""
         if self._target_temperature is None:
             return
 
@@ -720,38 +843,79 @@ class AdaptiveThermostat(ClimateEntity):
         if effective_temp is None:
             return
 
-        turn_on_threshold = self._target_temperature - HEAT_ON_DELTA
-        turn_off_threshold = self._target_temperature - HEAT_OFF_DELTA
+        if self._open_window_detected:
+            if self._zone_heater_on:
+                await self._async_turn_heater_off()
+            return
 
-        in_min_on = (
+        min_on_active = (
             self._zone_heater_on
             and self._last_command_timestamp is not None
-            and now_ts - self._last_command_timestamp < self._min_on_time
+            and now_ts - self._last_command_timestamp < self._thermal_controller.min_on_s
         )
-        in_min_off = (
+        min_off_active = (
             not self._zone_heater_on
             and self._last_command_timestamp is not None
-            and now_ts - self._last_command_timestamp < self._min_off_time
+            and now_ts - self._last_command_timestamp < self._thermal_controller.min_off_s
         )
 
+        upper_band = self._target_temperature + self._thermal_controller.deadband
+        lower_band = self._target_temperature - HEAT_ON_DELTA
+
         if self._zone_heater_on:
-            if effective_temp >= turn_off_threshold and not in_min_on:
+            should_turn_off = False
+            if self._planned_heater_off_ts is not None and now_ts >= self._planned_heater_off_ts and not min_on_active:
+                should_turn_off = True
+            elif effective_temp >= upper_band and not min_on_active:
+                should_turn_off = True
+
+            if should_turn_off:
                 _LOGGER.info(
-                    "[%s] Turning heat OFF (temp=%.2f°C, threshold=%.2f°C)",
+                    "[%s] Turning heat OFF (temp=%.2f°C, target=%.2f°C)",
                     self._entry_id,
                     effective_temp,
-                    turn_off_threshold,
+                    self._target_temperature,
                 )
                 await self._async_turn_heater_off()
-        else:
-            if effective_temp <= turn_on_threshold and not in_min_off:
-                _LOGGER.info(
-                    "[%s] Turning heat ON (temp=%.2f°C, threshold=%.2f°C)",
+            return
+
+        if self._window_heat_reenable_at is not None and now_ts < self._window_heat_reenable_at:
+            if effective_temp <= lower_band:
+                _LOGGER.debug(
+                    "[%s] Heating suppressed for %ss post-window recovery",
                     self._entry_id,
-                    effective_temp,
-                    turn_on_threshold,
+                    round(self._window_heat_reenable_at - now_ts, 1),
                 )
-                await self._async_turn_heater_on()
+            return
+
+        if min_off_active:
+            return
+
+        if effective_temp > lower_band:
+            return
+
+        tau_on = self._thermal_controller.propose_on_time(effective_temp, self._target_temperature)
+        tau_on = max(tau_on, float(self._thermal_controller.min_on_s))
+        if tau_on <= 0:
+            return
+
+        if self._planned_off_unsub:
+            self._planned_off_unsub()
+            self._planned_off_unsub = None
+
+        _LOGGER.info(
+            "[%s] Turning heat ON (temp=%.2f°C, target=%.2f°C, duration=%.0fs)",
+            self._entry_id,
+            effective_temp,
+            self._target_temperature,
+            tau_on,
+        )
+        await self._async_turn_heater_on()
+        self._planned_heater_off_ts = now_ts + tau_on
+        self._planned_on_duration = tau_on
+        self._attr_extra_state_attributes["planned_zone_on_duration"] = tau_on
+        self._attr_extra_state_attributes["planned_zone_off_time"] = self._iso_or_none(self._planned_heater_off_ts)
+        self._planned_off_unsub = async_call_later(self.hass, tau_on, self._async_handle_planned_turn_off)
 
     async def _async_handle_auto_onoff(
         self,
@@ -813,6 +977,14 @@ class AdaptiveThermostat(ClimateEntity):
         if self._delayed_valve_off_task:
             self._delayed_valve_off_task.cancel()
             self._delayed_valve_off_task = None
+
+        if self._planned_off_unsub:
+            self._planned_off_unsub()
+            self._planned_off_unsub = None
+        self._planned_heater_off_ts = None
+        self._planned_on_duration = None
+        self._attr_extra_state_attributes["planned_zone_off_time"] = None
+        self._attr_extra_state_attributes["planned_zone_on_duration"] = None
 
         other_zones_need_heat = False
         if self._central_heater_entity_id:
@@ -1032,6 +1204,7 @@ class AdaptiveThermostat(ClimateEntity):
         target = data.get("target_temperature")
         if isinstance(target, (int, float)):
             self._target_temperature = _clamp(float(target), MIN_TARGET_TEMP, MAX_TARGET_TEMP)
+            self._thermal_controller.target = self._target_temperature
 
         preset = data.get("current_preset")
         if preset in self._presets:
