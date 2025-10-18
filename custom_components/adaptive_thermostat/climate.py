@@ -87,6 +87,10 @@ WINDOW_FALSE_POSITIVE_TOLERANCE = 0.1  # °C slack to auto-clear noisy detection
 WINDOW_AUTO_CLEAR_SECONDS = 900.0  # seconds before clearing stale window alerts
 WINDOW_POST_RECOVERY_DAMPEN_CYCLES = 1  # heating cycles to soften after window close
 WINDOW_POST_RECOVERY_DAMPEN_SCALE = 0.6  # fractional runtime for the first post-window cycle
+CYCLE_PEAK_FOLLOWUP_SECONDS = 1800.0  # seconds to continue observing residual peak
+CYCLE_RESIDUAL_HOLD_DELTA_MAX = 0.35  # °C below target allowed while waiting for tail
+CYCLE_RESIDUAL_SLOPE_THRESHOLD = -0.00005  # °C/s; below this treats tail as cooling
+CYCLE_TARGET_TIME_GRACE = 120.0  # seconds grace beyond predicted peak time
 
 
 def _clamp(value: float, low: float, high: float) -> float:
@@ -274,6 +278,8 @@ class AdaptiveThermostat(ClimateEntity):
             "cycle_on_duration_s": None,
             "cycle_tail_duration_s": None,
             "cycle_time_to_target_s": None,
+            "pending_tail_follow_until": None,
+            "last_cycle_tail_delay_s": None,
         }
 
     @property
@@ -1003,30 +1009,45 @@ class AdaptiveThermostat(ClimateEntity):
             cycle = self._active_cycle
             cycle["last_temp"] = effective_temp
             prev_peak = cycle.get("peak_temp", effective_temp)
-            cycle["peak_temp"] = max(effective_temp, prev_peak)
+            if prev_peak is None or effective_temp >= prev_peak:
+                cycle["peak_temp"] = float(effective_temp)
+                cycle["peak_ts"] = float(now_ts)
 
         if not self._pending_cycle_eval:
             return
 
         cycle = self._pending_cycle_eval
+        cycle["last_temp"] = effective_temp
         prev_peak = cycle.get("peak_temp", effective_temp)
-        cycle["peak_temp"] = max(effective_temp, prev_peak)
+        if prev_peak is None or effective_temp >= prev_peak:
+            cycle["peak_temp"] = float(effective_temp)
+            cycle["peak_ts"] = float(now_ts)
 
         off_ts = float(cycle.get("off_ts", now_ts))
         time_since_off = now_ts - off_ts
         target = float(cycle.get("target", self._target_temperature))
         below_target = effective_temp <= target
-        slope_cooling = self._raw_temperature_slope <= 0.0
+        slope_cooling = self._raw_temperature_slope <= CYCLE_RESIDUAL_SLOPE_THRESHOLD
 
-        duration_ref = 0.0
-        for key in ("actual_on_duration", "planned_duration"):
-            value = cycle.get(key)
-            if isinstance(value, (int, float)):
-                duration_ref = float(value)
-                break
-        long_wait = duration_ref > 0.0 and time_since_off >= max(180.0, duration_ref)
+        follow_until = cycle.get("follow_until_ts")
+        if not isinstance(follow_until, (int, float)):
+            predicted_tail = cycle.get("predicted_tail")
+            follow_window = CYCLE_PEAK_FOLLOWUP_SECONDS
+            if isinstance(predicted_tail, (int, float)):
+                follow_window = max(follow_window, float(predicted_tail) + 300.0)
+            follow_until = off_ts + follow_window
+            cycle["follow_until_ts"] = follow_until
+            self._attr_extra_state_attributes["pending_tail_follow_until"] = self._iso_or_none(follow_until)
 
-        if below_target or (slope_cooling and time_since_off >= 60.0) or long_wait or self._zone_heater_on:
+        should_finalize = False
+        if self._zone_heater_on:
+            should_finalize = True
+        elif isinstance(follow_until, (int, float)) and now_ts >= follow_until:
+            should_finalize = True
+        elif below_target and slope_cooling and time_since_off >= CYCLE_PEAK_FOLLOWUP_SECONDS:
+            should_finalize = True
+
+        if should_finalize:
             self._finalize_cycle_evaluation(now_ts, force_peak=effective_temp)
 
     def _finalize_cycle_evaluation(self, now_ts: float, *, force_peak: Optional[float] = None) -> None:
@@ -1045,11 +1066,18 @@ class AdaptiveThermostat(ClimateEntity):
         start_temp = cycle.get("start_temp")
         tau_on = cycle.get("actual_on_duration") or cycle.get("planned_duration")
         target = cycle.get("target", self._target_temperature)
+        temp_cut = cycle.get("off_temp")
+        peak_ts = cycle.get("peak_ts")
+        off_ts = cycle.get("off_ts")
+        tail_delay = None
+        if isinstance(peak_ts, (int, float)) and isinstance(off_ts, (int, float)):
+            tail_delay = max(0.0, float(peak_ts) - float(off_ts))
 
         self._pending_cycle_eval = None
         self._attr_extra_state_attributes["cycle_on_duration_s"] = None
         self._attr_extra_state_attributes["cycle_tail_duration_s"] = None
         self._attr_extra_state_attributes["cycle_time_to_target_s"] = None
+        self._attr_extra_state_attributes["pending_tail_follow_until"] = None
         if start_temp is None or tau_on is None or peak_temp is None:
             self.async_write_ha_state()
             return
@@ -1059,8 +1087,11 @@ class AdaptiveThermostat(ClimateEntity):
             float(peak_temp),
             float(tau_on),
             temp_target=float(target),
+            temp_cut=float(temp_cut) if isinstance(temp_cut, (int, float)) else None,
+            tail_peak_delay_s=tail_delay,
         )
         self._attr_extra_state_attributes["thermal_params"] = self._current_thermal_param_payload()
+        self._attr_extra_state_attributes["last_cycle_tail_delay_s"] = tail_delay
         if diagnostics:
             self._last_cycle_diagnostics = diagnostics
             self._attr_extra_state_attributes["last_cycle_observed_at"] = self._iso_or_none(now_ts)
@@ -1140,6 +1171,32 @@ class AdaptiveThermostat(ClimateEntity):
         if effective_temp > lower_band:
             return
 
+        if self._pending_cycle_eval:
+            cycle = self._pending_cycle_eval
+            follow_until = cycle.get("follow_until_ts")
+            wait_for_tail = False
+            if isinstance(follow_until, (int, float)) and now_ts < float(follow_until):
+                predicted_peak_temp = cycle.get("predicted_peak_temp")
+                expected_target_ts = cycle.get("expected_target_ts")
+                slope = self._raw_temperature_slope
+                remaining_gain = None
+                if isinstance(predicted_peak_temp, (int, float)):
+                    remaining_gain = float(predicted_peak_temp) - effective_temp
+                if remaining_gain is not None and remaining_gain > 0.05:
+                    if slope >= CYCLE_RESIDUAL_SLOPE_THRESHOLD:
+                        wait_for_tail = True
+                elif isinstance(expected_target_ts, (int, float)) and now_ts < float(expected_target_ts) + CYCLE_TARGET_TIME_GRACE:
+                    if slope >= CYCLE_RESIDUAL_SLOPE_THRESHOLD:
+                        wait_for_tail = True
+            if wait_for_tail and (self._target_temperature - effective_temp) <= CYCLE_RESIDUAL_HOLD_DELTA_MAX:
+                _LOGGER.debug(
+                    "[%s] Deferring new heating cycle to observe residual tail (delta=%.3f°C, slope=%.4f°C/s)",
+                    self._entry_id,
+                    self._target_temperature - effective_temp,
+                    self._raw_temperature_slope,
+                )
+                return
+
         tau_on = self._thermal_controller.propose_on_time(effective_temp, self._target_temperature)
         tau_on = max(tau_on, float(self._thermal_controller.min_on_s))
         tail_delay = self._thermal_controller.residual_peak_delay()
@@ -1148,6 +1205,8 @@ class AdaptiveThermostat(ClimateEntity):
         time_to_target = tau_on + tail_delay
         if tau_on <= 0:
             return
+
+        predicted_peak_temp = self._thermal_controller.predict_peak(float(effective_temp), float(tau_on))
 
         if self._planned_off_unsub:
             self._planned_off_unsub()
@@ -1170,8 +1229,11 @@ class AdaptiveThermostat(ClimateEntity):
             "target": float(self._target_temperature),
             "planned_duration": float(tau_on),
             "peak_temp": float(effective_temp),
+            "peak_ts": float(now_ts),
             "predicted_tail": float(tail_delay),
             "predicted_time_to_target": float(time_to_target),
+            "predicted_peak_temp": float(predicted_peak_temp),
+            "expected_target_ts": float(now_ts + time_to_target),
         }
         if self._post_window_dampen_cycles > 0:
             self._post_window_dampen_cycles = max(0, self._post_window_dampen_cycles - 1)
@@ -1289,7 +1351,18 @@ class AdaptiveThermostat(ClimateEntity):
                 prev_peak = cycle.get("peak_temp", off_temp)
                 cycle["peak_temp"] = max(float(off_temp), float(prev_peak))
                 cycle["off_temp"] = float(off_temp)
+                if "peak_ts" not in cycle or not isinstance(cycle.get("peak_ts"), (int, float)):
+                    cycle["peak_ts"] = float(now_ts)
+            else:
+                if "peak_ts" not in cycle or not isinstance(cycle.get("peak_ts"), (int, float)):
+                    cycle["peak_ts"] = float(now_ts)
+            predicted_tail = cycle.get("predicted_tail")
+            follow_window = CYCLE_PEAK_FOLLOWUP_SECONDS
+            if isinstance(predicted_tail, (int, float)):
+                follow_window = max(follow_window, float(predicted_tail) + 300.0)
+            cycle["follow_until_ts"] = now_ts + follow_window
             self._pending_cycle_eval = cycle
+            self._attr_extra_state_attributes["pending_tail_follow_until"] = self._iso_or_none(cycle["follow_until_ts"])
             self._active_cycle = None
 
         self._zone_heater_on = False

@@ -91,6 +91,10 @@ class ThermalController:
         """Return time between heater off and predicted residual peak."""
         return float(max(0.0, self._t_peak()))
 
+    def predict_peak(self, temp_start: float, tau_on: float) -> float:
+        """Predict the peak temperature for a heating burst."""
+        return float(self._predicted_peak(temp_start, tau_on))
+
     def get_runtime_state(self) -> Dict[str, Optional[float] | Dict[str, float]]:
         """Return a JSON-serializable snapshot."""
         return {
@@ -360,6 +364,8 @@ class ThermalController:
         tau_on_s: float,
         *,
         temp_target: Optional[float] = None,
+        temp_cut: Optional[float] = None,
+        tail_peak_delay_s: Optional[float] = None,
     ) -> Optional[Dict[str, float]]:
         """Update model after observing a full heating cycle."""
         target = self.target if temp_target is None else temp_target
@@ -369,6 +375,7 @@ class ThermalController:
 
         predicted_peak = self._predicted_peak(temp_start, tau_on)
         predicted_delta = max(0.0, predicted_peak - temp_start)
+        predicted_overshoot = max(0.0, predicted_peak - target)
         actual_delta = max(0.0, temp_peak - temp_start)
         if predicted_delta <= 1e-6:
             return None
@@ -377,13 +384,43 @@ class ThermalController:
         params = self.params
         lr = _clip(self.learn_rate, 0.0, 1.0)
         desired_K = _clip(params.K * ratio, 0.2, 20.0)
+        actual_overshoot = max(0.0, temp_peak - target)
+        predicted_tail_delta = max(0.0, self._delta_tail_peak(tau_on))
+        predicted_tail_delay = max(1e-3, self._t_peak())
+        actual_on_delta: Optional[float] = None
+        if isinstance(temp_cut, (int, float)):
+            actual_on_delta = max(0.0, float(temp_cut) - temp_start)
+
+        tau_lr = min(0.25, 0.5 * lr)
+        new_tau_r = params.tau_r
+        new_tau_th = params.tau_th
+
+        if tail_peak_delay_s is not None and tail_peak_delay_s > 0.0:
+            delay_ratio = _clip(float(tail_peak_delay_s) / predicted_tail_delay, 0.25, 3.0)
+            tau_th_target = _clip(params.tau_th * delay_ratio, params.tau_r + 2.0, 6 * 3600.0)
+            tau_r_target = _clip(params.tau_r * delay_ratio, 60.0, tau_th_target - 1.0)
+            new_tau_r = (1.0 - tau_lr) * new_tau_r + tau_lr * tau_r_target
+            new_tau_th = (1.0 - tau_lr) * new_tau_th + tau_lr * tau_th_target
+
+        if predicted_tail_delta > 1e-6 and actual_overshoot > 0.0:
+            overshoot_ratio = _clip(actual_overshoot / max(predicted_tail_delta, 1e-6), 0.25, 3.0)
+            blend = min(0.2, 0.4 * lr + 0.05)
+            tau_th_target = _clip(new_tau_th * overshoot_ratio, new_tau_r + 2.0, 6 * 3600.0)
+            new_tau_th = (1.0 - blend) * new_tau_th + blend * tau_th_target
+            new_tau_r = min(new_tau_r, new_tau_th - 1.0)
+
         new_params = Params(
-            tau_r=params.tau_r,
-            tau_th=params.tau_th,
+            tau_r=new_tau_r,
+            tau_th=new_tau_th,
             K=(1.0 - lr) * params.K + lr * desired_K,
             p=params.p,
         )
-        if new_params.K != params.K:
+        changed = (
+            abs(new_params.K - params.K) > 1e-6
+            or abs(new_params.tau_r - params.tau_r) > 1e-3
+            or abs(new_params.tau_th - params.tau_th) > 1e-3
+        )
+        if changed:
             self.set_params(new_params)
 
         if ratio > 1.05:
@@ -395,7 +432,6 @@ class ThermalController:
         else:
             self._last_good_on = tau_on
 
-        overshoot = max(0.0, temp_peak - target)
         undershoot = max(0.0, target - temp_peak)
         diagnostics = {
             "predicted_peak": predicted_peak,
@@ -404,17 +440,24 @@ class ThermalController:
             "target_temp": target,
             "tau_on": tau_on,
             "ratio_actual_to_pred": ratio,
-            "overshoot": overshoot,
+            "overshoot": actual_overshoot,
             "undershoot": undershoot,
+            "predicted_overshoot": predicted_overshoot,
+            "predicted_tail_delta": predicted_tail_delta,
+            "predicted_tail_delay": predicted_tail_delay,
+            "observed_tail_delay": tail_peak_delay_s,
         }
+        if actual_on_delta is not None:
+            diagnostics["actual_on_delta"] = actual_on_delta
         return diagnostics
 
     def _apply_adaptive_timings(self) -> None:
         """Derive min on/off times and PWM window from the current parameters."""
         params = self.params
-        min_on = _clip(params.tau_r * 0.2, 30.0, params.tau_r * 0.8)
-        min_off = _clip(params.tau_th * 0.15, min_on, params.tau_th)
-        window = _clip(params.tau_th, 300.0, 3600.0)
+        min_on = _clip(params.tau_r * 0.25, 60.0, params.tau_r * 0.85)
+        min_off = _clip(params.tau_th * 0.2, min_on, params.tau_th)
+        window = _clip(params.tau_th * 1.1, 480.0, 5400.0)
+        window = max(window, min_on + min_off + 30.0)
 
         self.min_on_s = int(min_on)
         self.min_off_s = int(min_off)
