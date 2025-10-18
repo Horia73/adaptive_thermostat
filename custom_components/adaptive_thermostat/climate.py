@@ -192,6 +192,9 @@ class AdaptiveThermostat(ClimateEntity):
         self._window_data_reenable_at: Optional[float] = None
         self._window_heat_reenable_at: Optional[float] = None
         self._window_open_since_ts: Optional[float] = None
+        self._active_cycle: Optional[Dict[str, Any]] = None
+        self._pending_cycle_eval: Optional[Dict[str, Any]] = None
+        self._last_cycle_diagnostics: Optional[Dict[str, float]] = None
 
         # Slope tracking
         self._last_measurement_ts: Optional[float] = None
@@ -253,12 +256,7 @@ class AdaptiveThermostat(ClimateEntity):
             "planned_zone_off_time": None,
             "planned_zone_on_duration": None,
             "thermal_samples_cached": 0,
-            "thermal_params": {
-                "tau_r": self._thermal_controller.params.tau_r,
-                "tau_th": self._thermal_controller.params.tau_th,
-                "K": self._thermal_controller.params.K,
-                "p": self._thermal_controller.params.p,
-            },
+            "thermal_params": self._current_thermal_param_payload(),
         }
 
     @property
@@ -703,6 +701,16 @@ class AdaptiveThermostat(ClimateEntity):
             self._attr_extra_state_attributes["window_data_block_until"] = iso_value
             self._attr_extra_state_attributes["window_recovery_until"] = iso_value
 
+    def _current_thermal_param_payload(self) -> Dict[str, float]:
+        """Return rounded thermal parameter snapshot for diagnostics."""
+        params = self._thermal_controller.get_params()
+        return {
+            "tau_r": round(params.tau_r, 2),
+            "tau_th": round(params.tau_th, 2),
+            "K": round(params.K, 3),
+            "p": round(params.p, 3),
+        }
+
     def _iso_or_none(self, ts: Optional[float]) -> Optional[str]:
         """Return ISO timestamp or None."""
         if ts is None:
@@ -795,13 +803,17 @@ class AdaptiveThermostat(ClimateEntity):
         window_recovery_iso = self._iso_or_none(self._window_heat_reenable_at)
         data_block_iso = self._iso_or_none(self._window_data_reenable_at)
         planned_off_iso = self._iso_or_none(self._planned_heater_off_ts)
-        params = self._thermal_controller.get_params()
-        thermal_params = {
-            "tau_r": round(params.tau_r, 2),
-            "tau_th": round(params.tau_th, 2),
-            "K": round(params.K, 3),
-            "p": round(params.p, 3),
-        }
+        thermal_params = self._current_thermal_param_payload()
+        cycle_diag = {}
+        if self._last_cycle_diagnostics:
+            cycle_diag = {
+                "last_cycle_ratio": round(self._last_cycle_diagnostics["ratio_actual_to_pred"], 3),
+                "last_cycle_peak_predicted": round(self._last_cycle_diagnostics["predicted_peak"], 3),
+                "last_cycle_peak_actual": round(self._last_cycle_diagnostics["actual_peak"], 3),
+                "last_cycle_tau_on": round(self._last_cycle_diagnostics["tau_on"], 1),
+                "last_cycle_overshoot": round(self._last_cycle_diagnostics["overshoot"], 3),
+                "last_cycle_undershoot": round(self._last_cycle_diagnostics["undershoot"], 3),
+            }
 
         self._attr_extra_state_attributes.update(
             {
@@ -834,6 +846,74 @@ class AdaptiveThermostat(ClimateEntity):
                 "thermal_params": thermal_params,
             }
         )
+        if cycle_diag:
+            self._attr_extra_state_attributes.update(cycle_diag)
+
+    def _update_cycle_tracking(self, now_ts: float, effective_temp: float) -> None:
+        """Update heating cycle diagnostics and trigger post-cycle learning."""
+        if self._active_cycle:
+            cycle = self._active_cycle
+            cycle["last_temp"] = effective_temp
+            prev_peak = cycle.get("peak_temp", effective_temp)
+            cycle["peak_temp"] = max(effective_temp, prev_peak)
+
+        if not self._pending_cycle_eval:
+            return
+
+        cycle = self._pending_cycle_eval
+        prev_peak = cycle.get("peak_temp", effective_temp)
+        cycle["peak_temp"] = max(effective_temp, prev_peak)
+
+        off_ts = float(cycle.get("off_ts", now_ts))
+        time_since_off = now_ts - off_ts
+        target = float(cycle.get("target", self._target_temperature))
+        below_target = effective_temp <= target
+        slope_cooling = self._raw_temperature_slope <= 0.0
+
+        duration_ref = 0.0
+        for key in ("actual_on_duration", "planned_duration"):
+            value = cycle.get(key)
+            if isinstance(value, (int, float)):
+                duration_ref = float(value)
+                break
+        long_wait = duration_ref > 0.0 and time_since_off >= max(180.0, duration_ref)
+
+        if below_target or (slope_cooling and time_since_off >= 60.0) or long_wait or self._zone_heater_on:
+            self._finalize_cycle_evaluation(now_ts, force_peak=effective_temp)
+
+    def _finalize_cycle_evaluation(self, now_ts: float, *, force_peak: Optional[float] = None) -> None:
+        """Finalize pending cycle diagnostics and feed the model."""
+        if not self._pending_cycle_eval:
+            return
+
+        cycle = self._pending_cycle_eval
+        peak_temp = cycle.get("peak_temp")
+        if force_peak is not None:
+            peak_temp = max(force_peak, peak_temp) if isinstance(peak_temp, (int, float)) else force_peak
+        if peak_temp is None:
+            fallback = cycle.get("off_temp") or cycle.get("last_temp") or cycle.get("start_temp")
+            peak_temp = float(fallback) if isinstance(fallback, (int, float)) else None
+
+        start_temp = cycle.get("start_temp")
+        tau_on = cycle.get("actual_on_duration") or cycle.get("planned_duration")
+        target = cycle.get("target", self._target_temperature)
+
+        self._pending_cycle_eval = None
+        if start_temp is None or tau_on is None or peak_temp is None:
+            return
+
+        diagnostics = self._thermal_controller.register_cycle_result(
+            float(start_temp),
+            float(peak_temp),
+            float(tau_on),
+            temp_target=float(target),
+        )
+        self._attr_extra_state_attributes["thermal_params"] = self._current_thermal_param_payload()
+        if diagnostics:
+            self._last_cycle_diagnostics = diagnostics
+            self._attr_extra_state_attributes["last_cycle_observed_at"] = self._iso_or_none(now_ts)
+            self._mark_state_dirty()
+            self.async_write_ha_state()
 
     async def _async_control_heating(self, now_ts: float) -> None:
         """Apply model-based control with window-aware gating."""
@@ -847,6 +927,8 @@ class AdaptiveThermostat(ClimateEntity):
         )
         if effective_temp is None:
             return
+
+        self._update_cycle_tracking(now_ts, effective_temp)
 
         if self._open_window_detected:
             if self._zone_heater_on:
@@ -872,7 +954,7 @@ class AdaptiveThermostat(ClimateEntity):
             should_turn_off = False
             if self._planned_heater_off_ts is not None and now_ts >= self._planned_heater_off_ts and not min_on_active:
                 should_turn_off = True
-            elif effective_temp >= self._target_temperature + 2 * deadband and not min_on_active:
+            elif effective_temp >= self._target_temperature + deadband and not min_on_active:
                 should_turn_off = True
                 _LOGGER.warning(
                     "[%s] Failsafe OFF (temp %.2f°C beyond target %.2f°C)",
@@ -923,6 +1005,13 @@ class AdaptiveThermostat(ClimateEntity):
             tau_on,
         )
         await self._async_turn_heater_on()
+        self._active_cycle = {
+            "start_ts": now_ts,
+            "start_temp": float(effective_temp),
+            "target": float(self._target_temperature),
+            "planned_duration": float(tau_on),
+            "peak_temp": float(effective_temp),
+        }
         self._planned_heater_off_ts = now_ts + tau_on
         self._planned_on_duration = tau_on
         self._attr_extra_state_attributes["planned_zone_on_duration"] = tau_on
@@ -1015,6 +1104,29 @@ class AdaptiveThermostat(ClimateEntity):
             await self._async_coordinate_central_heater_off(other_zones_need_heat)
 
         now_ts = dt_util.utcnow().timestamp()
+        off_temp = (
+            self._filtered_temperature
+            if self._filtered_temperature is not None
+            else self._current_temperature
+        )
+
+        if self._pending_cycle_eval:
+            self._finalize_cycle_evaluation(now_ts, force_peak=off_temp if isinstance(off_temp, (int, float)) else None)
+
+        if self._active_cycle:
+            cycle = dict(self._active_cycle)
+            cycle["off_ts"] = now_ts
+            start_ts = cycle.get("start_ts")
+            if isinstance(start_ts, (int, float)):
+                cycle["actual_on_duration"] = max(0.0, now_ts - float(start_ts))
+            if isinstance(off_temp, (int, float)):
+                cycle["last_temp"] = float(off_temp)
+                prev_peak = cycle.get("peak_temp", off_temp)
+                cycle["peak_temp"] = max(float(off_temp), float(prev_peak))
+                cycle["off_temp"] = float(off_temp)
+            self._pending_cycle_eval = cycle
+            self._active_cycle = None
+
         self._zone_heater_on = False
         self._last_command_timestamp = now_ts
         self._attr_extra_state_attributes["zone_heater_on"] = False
@@ -1165,6 +1277,7 @@ class AdaptiveThermostat(ClimateEntity):
             "current_preset": self._current_preset,
             "manual_override": self._manual_override,
             "zone_heater_on": self._zone_heater_on,
+            "thermal_state": self._thermal_controller.get_runtime_state(),
         }
 
     def _mark_state_dirty(self) -> None:
@@ -1218,6 +1331,11 @@ class AdaptiveThermostat(ClimateEntity):
             self._target_temperature = _clamp(float(target), MIN_TARGET_TEMP, MAX_TARGET_TEMP)
             self._thermal_controller.target = self._target_temperature
 
+        thermal_state = data.get("thermal_state")
+        if isinstance(thermal_state, dict):
+            self._thermal_controller.restore_runtime_state(thermal_state)
+            self._thermal_controller.target = self._target_temperature
+
         preset = data.get("current_preset")
         if preset in self._presets:
             self._current_preset = preset
@@ -1230,6 +1348,7 @@ class AdaptiveThermostat(ClimateEntity):
 
         self._zone_heater_on = False  # never resume with valve open on startup
         self._attr_extra_state_attributes["zone_heater_on"] = False
+        self._attr_extra_state_attributes["thermal_params"] = self._current_thermal_param_payload()
 
         _LOGGER.info(
             "[%s] Restored state hvac_mode=%s target=%.2f preset=%s manual_override=%s",

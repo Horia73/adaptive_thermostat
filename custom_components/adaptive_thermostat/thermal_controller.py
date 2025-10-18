@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 import math
 
 
@@ -86,6 +86,43 @@ class ThermalController:
     def get_params(self) -> Params:
         """Return current controller parameters."""
         return self.params
+
+    def get_runtime_state(self) -> Dict[str, Optional[float] | Dict[str, float]]:
+        """Return a JSON-serializable snapshot."""
+        return {
+            "params": {
+                "tau_r": float(self.params.tau_r),
+                "tau_th": float(self.params.tau_th),
+                "K": float(self.params.K),
+                "p": float(self.params.p),
+            },
+            "ema_outdoor": None if self._ema_outdoor is None else float(self._ema_outdoor),
+            "ref_outdoor": None if self._ref_outdoor is None else float(self._ref_outdoor),
+            "last_good_on": None if self._last_good_on is None else float(self._last_good_on),
+        }
+
+    def restore_runtime_state(self, payload: Optional[Dict[str, object]]) -> None:
+        """Restore controller state from persistence."""
+        if not payload:
+            return
+
+        params_payload = payload.get("params")
+        if isinstance(params_payload, dict):
+            tau_r = float(params_payload.get("tau_r", self.params.tau_r))
+            tau_th = float(params_payload.get("tau_th", self.params.tau_th))
+            K = float(params_payload.get("K", self.params.K))
+            p = float(params_payload.get("p", self.params.p))
+            restored = Params(tau_r=tau_r, tau_th=tau_th, K=K, p=p)
+            self.set_params(restored)
+
+        ema_outdoor = payload.get("ema_outdoor")
+        self._ema_outdoor = float(ema_outdoor) if isinstance(ema_outdoor, (int, float)) else None
+
+        ref_outdoor = payload.get("ref_outdoor")
+        self._ref_outdoor = float(ref_outdoor) if isinstance(ref_outdoor, (int, float)) else None
+
+        last_good_on = payload.get("last_good_on")
+        self._last_good_on = float(last_good_on) if isinstance(last_good_on, (int, float)) else None
 
     def _t_peak(self) -> float:
         """Return time from heat cut to peak of the residual tail."""
@@ -311,6 +348,62 @@ class ThermalController:
         self.params = new_params
         self._apply_adaptive_timings()
         return new_params
+
+    def register_cycle_result(
+        self,
+        temp_start: float,
+        temp_peak: float,
+        tau_on_s: float,
+        *,
+        temp_target: Optional[float] = None,
+    ) -> Optional[Dict[str, float]]:
+        """Update model after observing a full heating cycle."""
+        target = self.target if temp_target is None else temp_target
+        tau_on = max(0.0, float(tau_on_s))
+        if tau_on <= 0:
+            return None
+
+        predicted_peak = self._predicted_peak(temp_start, tau_on)
+        predicted_delta = max(0.0, predicted_peak - temp_start)
+        actual_delta = max(0.0, temp_peak - temp_start)
+        if predicted_delta <= 1e-6:
+            return None
+
+        ratio = _clip(actual_delta / predicted_delta, 0.25, 3.5)
+        params = self.params
+        lr = _clip(self.learn_rate, 0.0, 1.0)
+        desired_K = _clip(params.K * ratio, 0.2, 20.0)
+        new_params = Params(
+            tau_r=params.tau_r,
+            tau_th=params.tau_th,
+            K=(1.0 - lr) * params.K + lr * desired_K,
+            p=params.p,
+        )
+        if new_params.K != params.K:
+            self.set_params(new_params)
+
+        if ratio > 1.05:
+            shrink = _clip(1.0 / ratio, 0.3, 1.0)
+            self._last_good_on = max(float(self.min_on_s), tau_on * shrink)
+        elif ratio < 0.95:
+            boost = _clip(1.0 / max(ratio, 1e-3), 1.0, 3.0)
+            self._last_good_on = _clip(tau_on * boost, float(self.min_on_s), 45 * 60.0)
+        else:
+            self._last_good_on = tau_on
+
+        overshoot = max(0.0, temp_peak - target)
+        undershoot = max(0.0, target - temp_peak)
+        diagnostics = {
+            "predicted_peak": predicted_peak,
+            "actual_peak": temp_peak,
+            "start_temp": temp_start,
+            "target_temp": target,
+            "tau_on": tau_on,
+            "ratio_actual_to_pred": ratio,
+            "overshoot": overshoot,
+            "undershoot": undershoot,
+        }
+        return diagnostics
 
     def _apply_adaptive_timings(self) -> None:
         """Derive min on/off times and PWM window from the current parameters."""
