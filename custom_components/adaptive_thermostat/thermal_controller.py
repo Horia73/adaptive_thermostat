@@ -87,6 +87,10 @@ class ThermalController:
         """Return current controller parameters."""
         return self.params
 
+    def residual_peak_delay(self) -> float:
+        """Return time between heater off and predicted residual peak."""
+        return float(max(0.0, self._t_peak()))
+
     def get_runtime_state(self) -> Dict[str, Optional[float] | Dict[str, float]]:
         """Return a JSON-serializable snapshot."""
         return {

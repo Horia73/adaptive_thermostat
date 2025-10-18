@@ -80,6 +80,13 @@ HOURLY_SLOPE_WINDOW_SECONDS = 3600.0
 HOURLY_HISTORY_BUFFER_SECONDS = 4200.0
 WINDOW_RECOVERY_BUFFER_SECONDS = 600.0  # 10 min before/after window events
 THERMAL_SAMPLE_HISTORY_SECONDS = 6 * 3600.0  # retain up to 6 hours of samples for model updates
+WINDOW_CONFIRMATION_SECONDS = 120.0  # seconds window slope must persist before auto-confirm
+WINDOW_CONFIRMATION_DROP = 0.15  # °C additional drop required to confirm immediately
+WINDOW_CANDIDATE_RESET_SECONDS = 240.0  # seconds before discarding an unconfirmed candidate
+WINDOW_FALSE_POSITIVE_TOLERANCE = 0.1  # °C slack to auto-clear noisy detections
+WINDOW_AUTO_CLEAR_SECONDS = 900.0  # seconds before clearing stale window alerts
+WINDOW_POST_RECOVERY_DAMPEN_CYCLES = 1  # heating cycles to soften after window close
+WINDOW_POST_RECOVERY_DAMPEN_SCALE = 0.6  # fractional runtime for the first post-window cycle
 
 
 def _clamp(value: float, low: float, high: float) -> float:
@@ -199,6 +206,7 @@ class AdaptiveThermostat(ClimateEntity):
         # Slope tracking
         self._last_measurement_ts: Optional[float] = None
         self._last_measurement_temp: Optional[float] = None
+        self._prev_measurement_temp: Optional[float] = None
         self._raw_temperature_slope: float = 0.0
         self._display_temperature_slope: float = 0.0
         self._hourly_temperature_slope: float = 0.0
@@ -208,6 +216,10 @@ class AdaptiveThermostat(ClimateEntity):
         self._open_window_detected: bool = False
         self._last_window_event_ts: Optional[float] = None
         self._window_alert: Optional[str] = None
+        self._open_window_baseline_temp: Optional[float] = None
+        self._window_candidate: Optional[Dict[str, Any]] = None
+        self._post_window_dampen_cycles: int = 0
+        self._window_last_closed_ts: Optional[float] = None
 
         # Outdoor tracking
         self._current_outdoor_temp: Optional[float] = None
@@ -251,12 +263,17 @@ class AdaptiveThermostat(ClimateEntity):
             "zone_heater_on": False,
             "heat_on_delta": self._thermal_controller.deadband,
             "heat_off_delta": self._thermal_controller.deadband,
+            "window_candidate_active": False,
+            "post_window_dampen_cycles": 0,
             "window_recovery_until": None,
             "window_data_block_until": None,
             "planned_zone_off_time": None,
             "planned_zone_on_duration": None,
             "thermal_samples_cached": 0,
             "thermal_params": self._current_thermal_param_payload(),
+            "cycle_on_duration_s": None,
+            "cycle_tail_duration_s": None,
+            "cycle_time_to_target_s": None,
         }
 
     @property
@@ -606,6 +623,7 @@ class AdaptiveThermostat(ClimateEntity):
             else:
                 slope = self._raw_temperature_slope
 
+        self._prev_measurement_temp = prev_temp
         self._last_measurement_ts = sample_ts
         self._last_measurement_temp = raw_temp
         self._raw_temperature_slope = slope
@@ -676,9 +694,10 @@ class AdaptiveThermostat(ClimateEntity):
 
         self._attr_extra_state_attributes["thermal_samples_cached"] = len(self._thermal_samples)
 
-    def _handle_window_state_transition(self, now_ts: float, opened: bool) -> None:
+    def _handle_window_state_transition(self, now_ts: float, opened: bool, *, enforce_recovery: bool = True) -> None:
         """Apply bookkeeping when a window disturbance starts or ends."""
         if opened:
+            self._window_candidate = None
             self._window_open_since_ts = now_ts
             self._purge_recent_samples(now_ts - WINDOW_RECOVERY_BUFFER_SECONDS)
             self._window_data_reenable_at = None
@@ -692,14 +711,33 @@ class AdaptiveThermostat(ClimateEntity):
             self._attr_extra_state_attributes["planned_zone_on_duration"] = None
             self._attr_extra_state_attributes["window_data_block_until"] = None
             self._attr_extra_state_attributes["window_recovery_until"] = None
+            self._post_window_dampen_cycles = 0
+            self._attr_extra_state_attributes["post_window_dampen_cycles"] = 0
+            self._attr_extra_state_attributes["window_candidate_active"] = False
+            self._attr_extra_state_attributes["cycle_on_duration_s"] = None
+            self._attr_extra_state_attributes["cycle_tail_duration_s"] = None
+            self._attr_extra_state_attributes["cycle_time_to_target_s"] = None
         else:
             self._window_open_since_ts = None
-            recovery_ts = now_ts + WINDOW_RECOVERY_BUFFER_SECONDS
-            self._window_data_reenable_at = recovery_ts
-            self._window_heat_reenable_at = recovery_ts
-            iso_value = self._iso_or_none(recovery_ts)
-            self._attr_extra_state_attributes["window_data_block_until"] = iso_value
-            self._attr_extra_state_attributes["window_recovery_until"] = iso_value
+            if enforce_recovery:
+                recovery_ts = now_ts + WINDOW_RECOVERY_BUFFER_SECONDS
+                self._window_data_reenable_at = recovery_ts
+                self._window_heat_reenable_at = recovery_ts
+                iso_value = self._iso_or_none(recovery_ts)
+                self._attr_extra_state_attributes["window_data_block_until"] = iso_value
+                self._attr_extra_state_attributes["window_recovery_until"] = iso_value
+                self._post_window_dampen_cycles = WINDOW_POST_RECOVERY_DAMPEN_CYCLES
+                self._window_last_closed_ts = now_ts
+            else:
+                self._window_data_reenable_at = None
+                self._window_heat_reenable_at = None
+                self._attr_extra_state_attributes["window_data_block_until"] = None
+                self._attr_extra_state_attributes["window_recovery_until"] = None
+                self._post_window_dampen_cycles = 0
+                self._window_last_closed_ts = None
+            self._open_window_baseline_temp = None
+            self._attr_extra_state_attributes["post_window_dampen_cycles"] = self._post_window_dampen_cycles
+            self._attr_extra_state_attributes["window_candidate_active"] = False
 
     def _current_thermal_param_payload(self) -> Dict[str, float]:
         """Return rounded thermal parameter snapshot for diagnostics."""
@@ -732,17 +770,30 @@ class AdaptiveThermostat(ClimateEntity):
                 self._open_window_detected = False
                 self._window_alert = None
                 self._last_window_event_ts = now_ts
+            if self._window_candidate:
+                self._window_candidate = None
+                self._attr_extra_state_attributes["window_candidate_active"] = False
             return
+
+        current_temp = (
+            self._filtered_temperature
+            if self._filtered_temperature is not None
+            else self._current_temperature
+        )
+        current_measurement_ts = self._last_measurement_ts
 
         if door_window_open:
             if not self._open_window_detected:
                 self._open_window_detected = True
+                self._open_window_baseline_temp = float(current_temp) if current_temp is not None else None
                 self._window_alert = "Door/window sensor reported open"
                 self._last_window_event_ts = now_ts
                 self._handle_window_state_transition(now_ts, True)
                 _LOGGER.warning("[%s] Window sensor open - disabling heating", self._entry_id)
                 if self._zone_heater_on:
                     await self._async_turn_heater_off()
+            self._window_candidate = None
+            self._attr_extra_state_attributes["window_candidate_active"] = False
             return
 
         slope_base = self._display_temperature_slope
@@ -751,24 +802,119 @@ class AdaptiveThermostat(ClimateEntity):
         slope_per_hour = (slope_base or 0.0) * 3600.0
         threshold = self._window_slope_threshold
 
+        candidate = self._window_candidate
+        if candidate and current_measurement_ts is not None:
+            last_measurement = candidate.get("last_measurement_ts")
+            if last_measurement != current_measurement_ts:
+                candidate["last_measurement_ts"] = current_measurement_ts
+                candidate["sample_count"] = candidate.get("sample_count", 1) + 1
+                if current_temp is not None:
+                    candidate["last_temp"] = float(current_temp)
+
         if not self._open_window_detected and slope_per_hour <= -threshold:
-            self._open_window_detected = True
-            self._window_alert = f"Open window detected (drop {abs(slope_per_hour):.2f}°C/h)"
-            self._last_window_event_ts = now_ts
-            self._handle_window_state_transition(now_ts, True)
-            _LOGGER.warning(
-                "[%s] Temperature drop detected (%.2f°C/h). Disabling heating.",
-                self._entry_id,
-                slope_per_hour,
+            if candidate is None:
+                start_temp = None
+                if self._prev_measurement_temp is not None:
+                    start_temp = float(self._prev_measurement_temp)
+                elif current_temp is not None:
+                    start_temp = float(current_temp)
+                self._window_candidate = {
+                    "start_ts": now_ts,
+                    "start_temp": start_temp,
+                    "last_temp": float(current_temp) if current_temp is not None else None,
+                    "start_measurement_ts": current_measurement_ts,
+                    "last_measurement_ts": current_measurement_ts,
+                    "sample_count": 1,
+                }
+                candidate = self._window_candidate
+                self._attr_extra_state_attributes["window_candidate_active"] = True
+                _LOGGER.debug("[%s] Window candidate started (slope=%.2f°C/h)", self._entry_id, slope_per_hour)
+            else:
+                if current_temp is not None:
+                    candidate["last_temp"] = float(current_temp)
+
+            start_temp = candidate.get("start_temp")
+            last_temp = candidate.get("last_temp")
+            drop = None
+            if start_temp is not None and last_temp is not None:
+                drop = start_temp - last_temp
+
+            confirm_drop = drop is not None and drop >= WINDOW_CONFIRMATION_DROP
+            sample_count = candidate.get("sample_count", 1)
+            confirm_duration = (
+                sample_count >= 2
+                and now_ts - candidate["start_ts"] >= WINDOW_CONFIRMATION_SECONDS
+                and slope_per_hour <= -threshold * 0.5
             )
-            if self._zone_heater_on:
-                await self._async_turn_heater_off()
-        elif self._open_window_detected and slope_per_hour >= -threshold * 0.4:
-            self._open_window_detected = False
-            self._window_alert = None
-            self._last_window_event_ts = now_ts
-            self._handle_window_state_transition(now_ts, False)
-            _LOGGER.info("[%s] Window cooling resolved (%.2f°C/h)", self._entry_id, slope_per_hour)
+
+            if confirm_drop or confirm_duration:
+                baseline = start_temp if start_temp is not None else last_temp
+                self._open_window_detected = True
+                self._open_window_baseline_temp = baseline
+                self._window_alert = f"Open window detected (drop {abs(slope_per_hour):.2f}°C/h)"
+                self._last_window_event_ts = now_ts
+                self._window_candidate = None
+                self._attr_extra_state_attributes["window_candidate_active"] = False
+                self._handle_window_state_transition(now_ts, True)
+                _LOGGER.warning(
+                    "[%s] Temperature drop detected (%.2f°C/h). Disabling heating.",
+                    self._entry_id,
+                    slope_per_hour,
+                )
+                if self._zone_heater_on:
+                    await self._async_turn_heater_off()
+                return
+            if sample_count < 2 and now_ts - candidate["start_ts"] >= WINDOW_CANDIDATE_RESET_SECONDS:
+                _LOGGER.debug(
+                    "[%s] Window candidate expired without confirmation (elapsed=%.0fs)",
+                    self._entry_id,
+                    now_ts - candidate["start_ts"],
+                )
+                self._window_candidate = None
+                self._attr_extra_state_attributes["window_candidate_active"] = False
+        else:
+            if candidate:
+                elapsed = now_ts - candidate.get("start_ts", now_ts)
+                if slope_per_hour > -threshold * 0.2 or elapsed >= WINDOW_CANDIDATE_RESET_SECONDS:
+                    _LOGGER.debug(
+                        "[%s] Window candidate cleared (slope=%.2f°C/h elapsed=%.0fs)",
+                        self._entry_id,
+                        slope_per_hour,
+                        elapsed,
+                    )
+                    self._window_candidate = None
+                    self._attr_extra_state_attributes["window_candidate_active"] = False
+
+        if self._open_window_detected:
+            baseline = self._open_window_baseline_temp
+            false_positive = (
+                baseline is not None
+                and current_temp is not None
+                and baseline - current_temp < WINDOW_FALSE_POSITIVE_TOLERANCE
+                and self._last_window_event_ts is not None
+                and now_ts - self._last_window_event_ts >= WINDOW_CONFIRMATION_SECONDS
+            )
+            stale = (
+                self._last_window_event_ts is not None
+                and now_ts - self._last_window_event_ts >= WINDOW_AUTO_CLEAR_SECONDS
+                and slope_per_hour > -threshold
+            )
+            if slope_per_hour >= -threshold * 0.4 or false_positive or stale:
+                self._open_window_detected = False
+                self._window_alert = None
+                self._last_window_event_ts = now_ts
+                enforce_recovery = not false_positive
+                self._handle_window_state_transition(now_ts, False, enforce_recovery=enforce_recovery)
+                if false_positive:
+                    _LOGGER.info("[%s] Window alert cleared (no sustained drop)", self._entry_id)
+                elif stale:
+                    _LOGGER.info(
+                        "[%s] Window alert timed out after %.0fs without further cooling",
+                        self._entry_id,
+                        WINDOW_AUTO_CLEAR_SECONDS,
+                    )
+                else:
+                    _LOGGER.info("[%s] Window cooling resolved (%.2f°C/h)", self._entry_id, slope_per_hour)
 
     def _update_sensor_attributes(
         self,
@@ -830,6 +976,7 @@ class AdaptiveThermostat(ClimateEntity):
                 "window_open_detected": self._open_window_detected,
                 "window_alert": self._window_alert,
                 "last_window_event": last_window_event,
+                "window_candidate_active": bool(self._window_candidate),
                 "door_window_open": door_window_open,
                 "motion_active": motion_active,
                 "manual_override": self._manual_override,
@@ -844,6 +991,7 @@ class AdaptiveThermostat(ClimateEntity):
                 "planned_zone_off_time": planned_off_iso,
                 "planned_zone_on_duration": self._planned_on_duration,
                 "thermal_params": thermal_params,
+                "post_window_dampen_cycles": self._post_window_dampen_cycles,
             }
         )
         if cycle_diag:
@@ -899,7 +1047,11 @@ class AdaptiveThermostat(ClimateEntity):
         target = cycle.get("target", self._target_temperature)
 
         self._pending_cycle_eval = None
+        self._attr_extra_state_attributes["cycle_on_duration_s"] = None
+        self._attr_extra_state_attributes["cycle_tail_duration_s"] = None
+        self._attr_extra_state_attributes["cycle_time_to_target_s"] = None
         if start_temp is None or tau_on is None or peak_temp is None:
+            self.async_write_ha_state()
             return
 
         diagnostics = self._thermal_controller.register_cycle_result(
@@ -913,7 +1065,7 @@ class AdaptiveThermostat(ClimateEntity):
             self._last_cycle_diagnostics = diagnostics
             self._attr_extra_state_attributes["last_cycle_observed_at"] = self._iso_or_none(now_ts)
             self._mark_state_dirty()
-            self.async_write_ha_state()
+        self.async_write_ha_state()
 
     async def _async_control_heating(self, now_ts: float) -> None:
         """Apply model-based control with window-aware gating."""
@@ -990,6 +1142,10 @@ class AdaptiveThermostat(ClimateEntity):
 
         tau_on = self._thermal_controller.propose_on_time(effective_temp, self._target_temperature)
         tau_on = max(tau_on, float(self._thermal_controller.min_on_s))
+        tail_delay = self._thermal_controller.residual_peak_delay()
+        if self._post_window_dampen_cycles > 0:
+            tau_on = max(float(self._thermal_controller.min_on_s), tau_on * WINDOW_POST_RECOVERY_DAMPEN_SCALE)
+        time_to_target = tau_on + tail_delay
         if tau_on <= 0:
             return
 
@@ -997,6 +1153,9 @@ class AdaptiveThermostat(ClimateEntity):
             self._planned_off_unsub()
             self._planned_off_unsub = None
 
+        self._attr_extra_state_attributes["cycle_on_duration_s"] = tau_on
+        self._attr_extra_state_attributes["cycle_tail_duration_s"] = tail_delay
+        self._attr_extra_state_attributes["cycle_time_to_target_s"] = time_to_target
         _LOGGER.info(
             "[%s] Turning heat ON (temp=%.2f°C, target=%.2f°C, duration=%.0fs)",
             self._entry_id,
@@ -1011,12 +1170,18 @@ class AdaptiveThermostat(ClimateEntity):
             "target": float(self._target_temperature),
             "planned_duration": float(tau_on),
             "peak_temp": float(effective_temp),
+            "predicted_tail": float(tail_delay),
+            "predicted_time_to_target": float(time_to_target),
         }
+        if self._post_window_dampen_cycles > 0:
+            self._post_window_dampen_cycles = max(0, self._post_window_dampen_cycles - 1)
+            self._attr_extra_state_attributes["post_window_dampen_cycles"] = self._post_window_dampen_cycles
         self._planned_heater_off_ts = now_ts + tau_on
         self._planned_on_duration = tau_on
         self._attr_extra_state_attributes["planned_zone_on_duration"] = tau_on
         self._attr_extra_state_attributes["planned_zone_off_time"] = self._iso_or_none(self._planned_heater_off_ts)
         self._planned_off_unsub = async_call_later(self.hass, tau_on, self._async_handle_planned_turn_off)
+        self.async_write_ha_state()
 
     async def _async_handle_auto_onoff(
         self,

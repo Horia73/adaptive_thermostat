@@ -5,7 +5,7 @@ from __future__ import annotations
 import logging
 from typing import Any, Optional, Callable
 
-from homeassistant.components.sensor import SensorEntity, SensorStateClass
+from homeassistant.components.sensor import SensorEntity, SensorStateClass, SensorDeviceClass
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.device_registry import DeviceInfo
@@ -27,6 +27,9 @@ async def async_setup_entry(
     sensors = [
         AdaptiveThermostatSlopeSensor(hass, entry),
         AdaptiveThermostatHourlySlopeSensor(hass, entry),
+        AdaptiveThermostatCycleOnSensor(hass, entry),
+        AdaptiveThermostatCycleTailSensor(hass, entry),
+        AdaptiveThermostatCycleTargetSensor(hass, entry),
     ]
     async_add_entities(sensors)
 
@@ -37,7 +40,6 @@ class _AdaptiveThermostatLinkedSensor(SensorEntity):
     _attr_has_entity_name = True
     _attr_should_poll = False
     _attr_state_class = SensorStateClass.MEASUREMENT
-    _attr_native_unit_of_measurement = "°C/h"
 
     def __init__(
         self,
@@ -47,6 +49,8 @@ class _AdaptiveThermostatLinkedSensor(SensorEntity):
         unique_suffix: str,
         name_suffix: str,
         icon: str,
+        unit: str,
+        device_class: Optional[SensorDeviceClass] = None,
     ) -> None:
         self._hass = hass
         self._entry = entry
@@ -61,6 +65,9 @@ class _AdaptiveThermostatLinkedSensor(SensorEntity):
             identifiers={(DOMAIN, entry.entry_id)},
             name=base_name,
         )
+        self._attr_native_unit_of_measurement = unit
+        if device_class is not None:
+            self._attr_device_class = device_class
         self._attr_native_value: Optional[float] = None
         self._attr_extra_state_attributes: dict[str, Any] = {}
         self._attr_available = False
@@ -183,6 +190,7 @@ class AdaptiveThermostatSlopeSensor(_AdaptiveThermostatLinkedSensor):
             unique_suffix="temperature_slope",
             name_suffix="Temperature Slope",
             icon="mdi:chart-line",
+            unit="°C/h",
         )
 
     def _extract_value(self, attrs: dict[str, Any]) -> Optional[float]:
@@ -224,6 +232,7 @@ class AdaptiveThermostatHourlySlopeSensor(_AdaptiveThermostatLinkedSensor):
             unique_suffix="temperature_slope_hourly",
             name_suffix="Hourly Temperature Slope",
             icon="mdi:chart-timeline-variant",
+            unit="°C/h",
         )
 
     def _extract_value(self, attrs: dict[str, Any]) -> Optional[float]:
@@ -250,6 +259,105 @@ class AdaptiveThermostatHourlySlopeSensor(_AdaptiveThermostatLinkedSensor):
             {
                 "hourly_slope_per_hour": raw_value,
                 "instant_slope_per_hour": attrs.get("temperature_slope_instant_per_hour"),
+            }
+        )
+        return extra
+
+
+class AdaptiveThermostatCycleOnSensor(_AdaptiveThermostatLinkedSensor):
+    """Sensor exposing the predicted ON duration of the active heating burst."""
+
+    def __init__(self, hass: HomeAssistant, entry: ConfigEntry) -> None:
+        super().__init__(
+            hass,
+            entry,
+            unique_suffix="cycle_on_seconds",
+            name_suffix="Cycle On Duration",
+            icon="mdi:timer-play",
+            unit="s",
+            device_class=SensorDeviceClass.DURATION,
+        )
+
+    def _extract_value(self, attrs: dict[str, Any]) -> Optional[float]:
+        return attrs.get("cycle_on_duration_s")
+
+    def _build_extra_attrs(
+        self,
+        attrs: dict[str, Any],
+        raw_value: Optional[float],
+        state: Any,
+    ) -> dict[str, Any]:
+        extra = super()._build_extra_attrs(attrs, raw_value, state)
+        extra.update(
+            {
+                "cycle_tail_duration_s": attrs.get("cycle_tail_duration_s"),
+                "cycle_time_to_target_s": attrs.get("cycle_time_to_target_s"),
+            }
+        )
+        return extra
+
+
+class AdaptiveThermostatCycleTailSensor(_AdaptiveThermostatLinkedSensor):
+    """Sensor exposing the predicted residual heating tail length."""
+
+    def __init__(self, hass: HomeAssistant, entry: ConfigEntry) -> None:
+        super().__init__(
+            hass,
+            entry,
+            unique_suffix="cycle_tail_seconds",
+            name_suffix="Cycle Tail Duration",
+            icon="mdi:timer-stop",
+            unit="s",
+            device_class=SensorDeviceClass.DURATION,
+        )
+
+    def _extract_value(self, attrs: dict[str, Any]) -> Optional[float]:
+        return attrs.get("cycle_tail_duration_s")
+
+    def _build_extra_attrs(
+        self,
+        attrs: dict[str, Any],
+        raw_value: Optional[float],
+        state: Any,
+    ) -> dict[str, Any]:
+        extra = super()._build_extra_attrs(attrs, raw_value, state)
+        extra.update(
+            {
+                "cycle_on_duration_s": attrs.get("cycle_on_duration_s"),
+                "cycle_time_to_target_s": attrs.get("cycle_time_to_target_s"),
+            }
+        )
+        return extra
+
+
+class AdaptiveThermostatCycleTargetSensor(_AdaptiveThermostatLinkedSensor):
+    """Sensor exposing the predicted time to reach target temperature for the burst."""
+
+    def __init__(self, hass: HomeAssistant, entry: ConfigEntry) -> None:
+        super().__init__(
+            hass,
+            entry,
+            unique_suffix="cycle_time_to_target",
+            name_suffix="Cycle Time To Target",
+            icon="mdi:timer-sand",
+            unit="s",
+            device_class=SensorDeviceClass.DURATION,
+        )
+
+    def _extract_value(self, attrs: dict[str, Any]) -> Optional[float]:
+        return attrs.get("cycle_time_to_target_s")
+
+    def _build_extra_attrs(
+        self,
+        attrs: dict[str, Any],
+        raw_value: Optional[float],
+        state: Any,
+    ) -> dict[str, Any]:
+        extra = super()._build_extra_attrs(attrs, raw_value, state)
+        extra.update(
+            {
+                "cycle_on_duration_s": attrs.get("cycle_on_duration_s"),
+                "cycle_tail_duration_s": attrs.get("cycle_tail_duration_s"),
             }
         )
         return extra
