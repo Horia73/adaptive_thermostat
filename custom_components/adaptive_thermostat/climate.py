@@ -84,13 +84,17 @@ WINDOW_CONFIRMATION_SECONDS = 120.0  # seconds window slope must persist before 
 WINDOW_CONFIRMATION_DROP = 0.15  # °C additional drop required to confirm immediately
 WINDOW_CANDIDATE_RESET_SECONDS = 240.0  # seconds before discarding an unconfirmed candidate
 WINDOW_FALSE_POSITIVE_TOLERANCE = 0.1  # °C slack to auto-clear noisy detections
-WINDOW_AUTO_CLEAR_SECONDS = 900.0  # seconds before clearing stale window alerts
+WINDOW_RECOVERY_POSITIVE_SLOPE_THRESHOLD = 0.2  # °C/h slope to mark recovery start
+WINDOW_RECOVERY_STABLE_SLOPE_THRESHOLD = 2.5  # °C/h slope to resume heating
+WINDOW_RECOVERY_MIN_SECONDS = 120.0  # seconds to wait after recovery starts
 WINDOW_POST_RECOVERY_DAMPEN_CYCLES = 1  # heating cycles to soften after window close
 WINDOW_POST_RECOVERY_DAMPEN_SCALE = 0.6  # fractional runtime for the first post-window cycle
 CYCLE_PEAK_FOLLOWUP_SECONDS = 1800.0  # seconds to continue observing residual peak
 CYCLE_RESIDUAL_HOLD_DELTA_MAX = 0.35  # °C below target allowed while waiting for tail
 CYCLE_RESIDUAL_SLOPE_THRESHOLD = -0.00005  # °C/s; below this treats tail as cooling
 CYCLE_TARGET_TIME_GRACE = 120.0  # seconds grace beyond predicted peak time
+VALVE_OPEN_TIMEOUT_SECONDS = 60.0
+VALVE_OPEN_POLL_SECONDS = 2.0
 
 
 def _clamp(value: float, low: float, high: float) -> float:
@@ -222,6 +226,8 @@ class AdaptiveThermostat(ClimateEntity):
         self._window_alert: Optional[str] = None
         self._open_window_baseline_temp: Optional[float] = None
         self._window_candidate: Optional[Dict[str, Any]] = None
+        self._window_recovery_start_ts: Optional[float] = None
+        self._window_recovery_peak_slope: Optional[float] = None
         self._post_window_dampen_cycles: int = 0
         self._window_last_closed_ts: Optional[float] = None
 
@@ -236,6 +242,8 @@ class AdaptiveThermostat(ClimateEntity):
         self._delayed_valve_off_task: Optional[asyncio.Task] = None
         self._control_tick_unsub = None
         self._remove_listener = None
+        self._valve_error: Optional[str] = None
+        self._valve_error_at: Optional[float] = None
 
         # Persistent runtime state
         self._state_store: Store | None = None
@@ -264,6 +272,8 @@ class AdaptiveThermostat(ClimateEntity):
             "window_open_detected": False,
             "window_slope_threshold": self._window_slope_threshold,
             "window_alert": None,
+            "window_recovery_started_at": None,
+            "window_recovery_peak_slope_per_hour": None,
             "zone_heater_on": False,
             "heat_on_delta": self._thermal_controller.deadband,
             "heat_off_delta": self._thermal_controller.deadband,
@@ -280,6 +290,11 @@ class AdaptiveThermostat(ClimateEntity):
             "cycle_time_to_target_s": None,
             "pending_tail_follow_until": None,
             "last_cycle_tail_delay_s": None,
+            "valve_error": None,
+            "valve_error_at": None,
+            "min_on_s": self._thermal_controller.min_on_s,
+            "min_off_s": self._thermal_controller.min_off_s,
+            "min_on_override_s": self._thermal_controller.get_min_on_override(),
         }
 
     @property
@@ -485,8 +500,12 @@ class AdaptiveThermostat(ClimateEntity):
         if temperature is None:
             return
         target = _clamp(float(temperature), MIN_TARGET_TEMP, MAX_TARGET_TEMP)
-        self._target_temperature = target
-        self._current_preset = None
+        if self._current_preset in self._presets:
+            self._presets[self._current_preset] = target
+            self._target_temperature = target
+        else:
+            self._target_temperature = target
+            self._current_preset = None
         self._thermal_controller.target = self._target_temperature
         if self._hvac_mode == HVACMode.HEAT:
             await self._async_control_heating(dt_util.utcnow().timestamp())
@@ -700,11 +719,21 @@ class AdaptiveThermostat(ClimateEntity):
 
         self._attr_extra_state_attributes["thermal_samples_cached"] = len(self._thermal_samples)
 
-    def _handle_window_state_transition(self, now_ts: float, opened: bool, *, enforce_recovery: bool = True) -> None:
+    def _handle_window_state_transition(
+        self,
+        now_ts: float,
+        opened: bool,
+        *,
+        enforce_recovery: bool = True,
+        heat_delay_s: Optional[float] = None,
+        data_delay_s: Optional[float] = None,
+    ) -> None:
         """Apply bookkeeping when a window disturbance starts or ends."""
         if opened:
             self._window_candidate = None
             self._window_open_since_ts = now_ts
+            self._window_recovery_start_ts = None
+            self._window_recovery_peak_slope = None
             self._purge_recent_samples(now_ts - WINDOW_RECOVERY_BUFFER_SECONDS)
             self._window_data_reenable_at = None
             self._window_heat_reenable_at = None
@@ -726,12 +755,16 @@ class AdaptiveThermostat(ClimateEntity):
         else:
             self._window_open_since_ts = None
             if enforce_recovery:
-                recovery_ts = now_ts + WINDOW_RECOVERY_BUFFER_SECONDS
-                self._window_data_reenable_at = recovery_ts
-                self._window_heat_reenable_at = recovery_ts
-                iso_value = self._iso_or_none(recovery_ts)
-                self._attr_extra_state_attributes["window_data_block_until"] = iso_value
-                self._attr_extra_state_attributes["window_recovery_until"] = iso_value
+                data_delay = WINDOW_RECOVERY_BUFFER_SECONDS if data_delay_s is None else data_delay_s
+                heat_delay = WINDOW_RECOVERY_BUFFER_SECONDS if heat_delay_s is None else heat_delay_s
+                data_ts = now_ts + max(0.0, float(data_delay))
+                heat_ts = now_ts + max(0.0, float(heat_delay))
+                self._window_data_reenable_at = data_ts
+                self._window_heat_reenable_at = heat_ts
+                data_iso = self._iso_or_none(data_ts)
+                heat_iso = self._iso_or_none(heat_ts)
+                self._attr_extra_state_attributes["window_data_block_until"] = data_iso
+                self._attr_extra_state_attributes["window_recovery_until"] = heat_iso
                 self._post_window_dampen_cycles = WINDOW_POST_RECOVERY_DAMPEN_CYCLES
                 self._window_last_closed_ts = now_ts
             else:
@@ -742,6 +775,8 @@ class AdaptiveThermostat(ClimateEntity):
                 self._post_window_dampen_cycles = 0
                 self._window_last_closed_ts = None
             self._open_window_baseline_temp = None
+            self._window_recovery_start_ts = None
+            self._window_recovery_peak_slope = None
             self._attr_extra_state_attributes["post_window_dampen_cycles"] = self._post_window_dampen_cycles
             self._attr_extra_state_attributes["window_candidate_active"] = False
 
@@ -779,6 +814,8 @@ class AdaptiveThermostat(ClimateEntity):
             if self._window_candidate:
                 self._window_candidate = None
                 self._attr_extra_state_attributes["window_candidate_active"] = False
+            self._window_recovery_start_ts = None
+            self._window_recovery_peak_slope = None
             return
 
         current_temp = (
@@ -900,27 +937,51 @@ class AdaptiveThermostat(ClimateEntity):
                 and self._last_window_event_ts is not None
                 and now_ts - self._last_window_event_ts >= WINDOW_CONFIRMATION_SECONDS
             )
-            stale = (
-                self._last_window_event_ts is not None
-                and now_ts - self._last_window_event_ts >= WINDOW_AUTO_CLEAR_SECONDS
-                and slope_per_hour > -threshold
-            )
-            if slope_per_hour >= -threshold * 0.4 or false_positive or stale:
+            if false_positive:
                 self._open_window_detected = False
                 self._window_alert = None
                 self._last_window_event_ts = now_ts
-                enforce_recovery = not false_positive
-                self._handle_window_state_transition(now_ts, False, enforce_recovery=enforce_recovery)
-                if false_positive:
-                    _LOGGER.info("[%s] Window alert cleared (no sustained drop)", self._entry_id)
-                elif stale:
+                self._handle_window_state_transition(now_ts, False, enforce_recovery=False)
+                _LOGGER.info("[%s] Window alert cleared (no sustained drop)", self._entry_id)
+                return
+
+            if self._window_recovery_start_ts is None:
+                if slope_per_hour >= WINDOW_RECOVERY_POSITIVE_SLOPE_THRESHOLD:
+                    self._window_recovery_start_ts = now_ts
+                    self._window_recovery_peak_slope = slope_per_hour
                     _LOGGER.info(
-                        "[%s] Window alert timed out after %.0fs without further cooling",
+                        "[%s] Window recovery started (slope=%.2f°C/h)",
                         self._entry_id,
-                        WINDOW_AUTO_CLEAR_SECONDS,
+                        slope_per_hour,
                     )
-                else:
-                    _LOGGER.info("[%s] Window cooling resolved (%.2f°C/h)", self._entry_id, slope_per_hour)
+                return
+
+            if (
+                self._window_recovery_peak_slope is None
+                or slope_per_hour > self._window_recovery_peak_slope
+            ):
+                self._window_recovery_peak_slope = slope_per_hour
+
+            recovery_elapsed = now_ts - self._window_recovery_start_ts
+            if (
+                recovery_elapsed >= WINDOW_RECOVERY_MIN_SECONDS
+                and 0.0 <= slope_per_hour <= WINDOW_RECOVERY_STABLE_SLOPE_THRESHOLD
+            ):
+                self._open_window_detected = False
+                self._window_alert = None
+                self._last_window_event_ts = now_ts
+                self._handle_window_state_transition(
+                    now_ts,
+                    False,
+                    enforce_recovery=True,
+                    heat_delay_s=0.0,
+                )
+                _LOGGER.info(
+                    "[%s] Window recovery stabilized (slope=%.2f°C/h, peak=%.2f°C/h)",
+                    self._entry_id,
+                    slope_per_hour,
+                    self._window_recovery_peak_slope or slope_per_hour,
+                )
 
     def _update_sensor_attributes(
         self,
@@ -956,6 +1017,12 @@ class AdaptiveThermostat(ClimateEntity):
         data_block_iso = self._iso_or_none(self._window_data_reenable_at)
         planned_off_iso = self._iso_or_none(self._planned_heater_off_ts)
         thermal_params = self._current_thermal_param_payload()
+        window_recovery_started_iso = self._iso_or_none(self._window_recovery_start_ts)
+        window_recovery_peak = (
+            round(self._window_recovery_peak_slope, 3)
+            if isinstance(self._window_recovery_peak_slope, (int, float))
+            else None
+        )
         cycle_diag = {}
         if self._last_cycle_diagnostics:
             cycle_diag = {
@@ -994,10 +1061,17 @@ class AdaptiveThermostat(ClimateEntity):
                 "last_updated": now.isoformat(),
                 "window_recovery_until": window_recovery_iso,
                 "window_data_block_until": data_block_iso,
+                "window_recovery_started_at": window_recovery_started_iso,
+                "window_recovery_peak_slope_per_hour": window_recovery_peak,
                 "planned_zone_off_time": planned_off_iso,
                 "planned_zone_on_duration": self._planned_on_duration,
                 "thermal_params": thermal_params,
                 "post_window_dampen_cycles": self._post_window_dampen_cycles,
+                "valve_error": self._valve_error,
+                "valve_error_at": self._iso_or_none(self._valve_error_at),
+                "min_on_s": self._thermal_controller.min_on_s,
+                "min_off_s": self._thermal_controller.min_off_s,
+                "min_on_override_s": self._thermal_controller.get_min_on_override(),
             }
         )
         if cycle_diag:
@@ -1050,6 +1124,63 @@ class AdaptiveThermostat(ClimateEntity):
         if should_finalize:
             self._finalize_cycle_evaluation(now_ts, force_peak=effective_temp)
 
+    def _maybe_adjust_active_cycle(self, now_ts: float, effective_temp: float) -> None:
+        """Shorten the active cycle if heating is faster than expected."""
+        if not self._active_cycle or self._planned_heater_off_ts is None:
+            return
+
+        cycle = self._active_cycle
+        start_ts = cycle.get("start_ts")
+        start_temp = cycle.get("start_temp")
+        planned_duration = cycle.get("planned_duration")
+        if not isinstance(start_ts, (int, float)):
+            return
+        if not isinstance(start_temp, (int, float)) or not isinstance(planned_duration, (int, float)):
+            return
+
+        elapsed = max(0.0, now_ts - float(start_ts))
+        min_sample = max(30.0, float(self._thermal_controller.min_on_s) * 0.5)
+        if elapsed < min_sample:
+            return
+
+        predicted_delta = self._thermal_controller.predict_on_delta(elapsed)
+        actual_delta = effective_temp - float(start_temp)
+        if predicted_delta <= 0.0 or actual_delta <= 0.0:
+            return
+
+        ratio = actual_delta / predicted_delta
+        if ratio <= 1.15:
+            return
+
+        new_duration = float(planned_duration) / ratio
+        new_duration = max(float(self._thermal_controller.min_on_s), new_duration)
+        if new_duration >= float(planned_duration) - 10.0:
+            return
+
+        new_off_ts = float(start_ts) + new_duration
+        if new_off_ts < now_ts:
+            new_off_ts = now_ts
+            new_duration = max(float(self._thermal_controller.min_on_s), now_ts - float(start_ts))
+
+        if self._planned_off_unsub:
+            self._planned_off_unsub()
+            self._planned_off_unsub = None
+
+        delay = max(0.0, new_off_ts - now_ts)
+        self._planned_off_unsub = async_call_later(self.hass, delay, self._async_handle_planned_turn_off)
+        self._planned_heater_off_ts = new_off_ts
+        self._planned_on_duration = new_duration
+        cycle["planned_duration"] = new_duration
+        self._attr_extra_state_attributes["planned_zone_on_duration"] = new_duration
+        self._attr_extra_state_attributes["planned_zone_off_time"] = self._iso_or_none(new_off_ts)
+        self._attr_extra_state_attributes["cycle_on_duration_s"] = new_duration
+        _LOGGER.debug(
+            "[%s] Shortened cycle (ratio=%.2f, new=%.0fs)",
+            self._entry_id,
+            ratio,
+            new_duration,
+        )
+
     def _finalize_cycle_evaluation(self, now_ts: float, *, force_peak: Optional[float] = None) -> None:
         """Finalize pending cycle diagnostics and feed the model."""
         if not self._pending_cycle_eval:
@@ -1095,6 +1226,16 @@ class AdaptiveThermostat(ClimateEntity):
         if diagnostics:
             self._last_cycle_diagnostics = diagnostics
             self._attr_extra_state_attributes["last_cycle_observed_at"] = self._iso_or_none(now_ts)
+            if cycle.get("min_on_clamped"):
+                overshoot = diagnostics.get("overshoot")
+                if isinstance(overshoot, (int, float)) and overshoot > 0.2:
+                    current_override = self._thermal_controller.get_min_on_override()
+                    proposed_override = max(30.0, float(self._thermal_controller.min_on_s) * 0.8)
+                    if current_override is None or proposed_override < float(current_override) - 1.0:
+                        self._thermal_controller.set_min_on_override(proposed_override)
+                        self._attr_extra_state_attributes["min_on_override_s"] = (
+                            self._thermal_controller.get_min_on_override()
+                        )
             self._mark_state_dirty()
         self.async_write_ha_state()
 
@@ -1134,6 +1275,7 @@ class AdaptiveThermostat(ClimateEntity):
         lower_band = self._target_temperature - deadband
 
         if self._zone_heater_on:
+            self._maybe_adjust_active_cycle(now_ts, effective_temp)
             should_turn_off = False
             if self._planned_heater_off_ts is not None and now_ts >= self._planned_heater_off_ts and not min_on_active:
                 should_turn_off = True
@@ -1197,8 +1339,9 @@ class AdaptiveThermostat(ClimateEntity):
                 )
                 return
 
-        tau_on = self._thermal_controller.propose_on_time(effective_temp, self._target_temperature)
-        tau_on = max(tau_on, float(self._thermal_controller.min_on_s))
+        raw_tau_on = self._thermal_controller.propose_on_time(effective_temp, self._target_temperature)
+        min_on_s = float(self._thermal_controller.min_on_s)
+        tau_on = max(raw_tau_on, min_on_s)
         tail_delay = self._thermal_controller.residual_peak_delay()
         if self._post_window_dampen_cycles > 0:
             tau_on = max(float(self._thermal_controller.min_on_s), tau_on * WINDOW_POST_RECOVERY_DAMPEN_SCALE)
@@ -1222,12 +1365,16 @@ class AdaptiveThermostat(ClimateEntity):
             self._target_temperature,
             tau_on,
         )
-        await self._async_turn_heater_on()
+        success = await self._async_turn_heater_on()
+        if not success:
+            return
         self._active_cycle = {
             "start_ts": now_ts,
             "start_temp": float(effective_temp),
             "target": float(self._target_temperature),
             "planned_duration": float(tau_on),
+            "raw_duration": float(raw_tau_on),
+            "min_on_clamped": raw_tau_on < min_on_s - 1e-3,
             "peak_temp": float(effective_temp),
             "peak_ts": float(now_ts),
             "predicted_tail": float(tail_delay),
@@ -1282,14 +1429,41 @@ class AdaptiveThermostat(ClimateEntity):
             self._hvac_mode = HVACMode.OFF
             self._mark_state_dirty()
 
-    async def _async_turn_heater_on(self) -> None:
+    async def _async_turn_heater_on(self) -> bool:
         """Turn on valves and coordinate central heater."""
         if self._delayed_valve_off_task:
             self._delayed_valve_off_task.cancel()
             self._delayed_valve_off_task = None
 
+        if not self._heater_entity_ids:
+            self._set_valve_error("No heater entities configured")
+            self.async_write_ha_state()
+            return False
+
+        self._clear_valve_error()
         for heater_id in self._heater_entity_ids:
             await self._async_turn_on_entity(heater_id, "zone heater/valve")
+
+        results = await asyncio.gather(
+            *[self._async_wait_for_heater_open(heater_id) for heater_id in self._heater_entity_ids]
+        )
+        failures = []
+        for heater_id, (status, state_value) in zip(self._heater_entity_ids, results):
+            if status == "open":
+                continue
+            if status == "unavailable":
+                failures.append(f"{heater_id} unavailable")
+            else:
+                failures.append(f"{heater_id} stalled ({state_value})")
+
+        if failures:
+            self._set_valve_error("Valve error: " + ", ".join(failures))
+            await self._async_close_zone_valves()
+            self._zone_heater_on = False
+            self._attr_extra_state_attributes["zone_heater_on"] = False
+            self._mark_state_dirty()
+            self.async_write_ha_state()
+            return False
 
         if self._central_heater_entity_id:
             await self._async_coordinate_central_heater_on()
@@ -1299,6 +1473,7 @@ class AdaptiveThermostat(ClimateEntity):
         self._last_command_timestamp = now_ts
         self._attr_extra_state_attributes["zone_heater_on"] = True
         self._mark_state_dirty()
+        return True
 
     async def _async_turn_heater_off(self) -> None:
         """Turn off valves and coordinate central heater."""
@@ -1437,6 +1612,49 @@ class AdaptiveThermostat(ClimateEntity):
                 return True
         return False
 
+    def _is_heater_open_state(self, entity_id: str, state_value: str) -> bool:
+        """Return True if the heater entity reports an open/on state."""
+        domain = entity_id.split(".", 1)[0] if "." in entity_id else ""
+        if domain == "valve":
+            return state_value == "open"
+        if domain == "climate":
+            return state_value in {HVACMode.HEAT.value, STATE_ON}
+        return state_value == STATE_ON
+
+    async def _async_wait_for_heater_open(
+        self, heater_id: str
+    ) -> Tuple[str, Optional[str]]:
+        """Wait for a heater entity to report open/on or timeout."""
+        start_ts = dt_util.utcnow().timestamp()
+        last_state: Optional[str] = None
+        while True:
+            state = self.hass.states.get(heater_id)
+            if state:
+                last_state = state.state
+                if state.state in ("unknown", "unavailable"):
+                    return "unavailable", state.state
+                if self._is_heater_open_state(heater_id, state.state):
+                    return "open", state.state
+            if dt_util.utcnow().timestamp() - start_ts >= VALVE_OPEN_TIMEOUT_SECONDS:
+                return "timeout", last_state
+            await asyncio.sleep(VALVE_OPEN_POLL_SECONDS)
+
+    def _set_valve_error(self, message: str) -> None:
+        """Store a valve error for UI display."""
+        self._valve_error = message
+        self._valve_error_at = dt_util.utcnow().timestamp()
+        self._attr_extra_state_attributes["valve_error"] = message
+        self._attr_extra_state_attributes["valve_error_at"] = self._iso_or_none(self._valve_error_at)
+
+    def _clear_valve_error(self) -> None:
+        """Clear any stored valve error."""
+        if self._valve_error is None:
+            return
+        self._valve_error = None
+        self._valve_error_at = None
+        self._attr_extra_state_attributes["valve_error"] = None
+        self._attr_extra_state_attributes["valve_error_at"] = None
+
     async def _async_turn_on_entity(self, entity_id: Optional[str], label: str) -> None:
         """Helper to turn on a Home Assistant entity."""
         if not entity_id:
@@ -1516,6 +1734,7 @@ class AdaptiveThermostat(ClimateEntity):
             "manual_override": self._manual_override,
             "zone_heater_on": self._zone_heater_on,
             "thermal_state": self._thermal_controller.get_runtime_state(),
+            "preset_targets": self._presets,
         }
 
     def _mark_state_dirty(self) -> None:
@@ -1573,6 +1792,12 @@ class AdaptiveThermostat(ClimateEntity):
         if isinstance(thermal_state, dict):
             self._thermal_controller.restore_runtime_state(thermal_state)
             self._thermal_controller.target = self._target_temperature
+
+        stored_presets = data.get("preset_targets")
+        if isinstance(stored_presets, dict):
+            for key, value in stored_presets.items():
+                if key in self._presets and isinstance(value, (int, float)):
+                    self._presets[key] = _clamp(float(value), MIN_TARGET_TEMP, MAX_TARGET_TEMP)
 
         preset = data.get("current_preset")
         if preset in self._presets:

@@ -55,6 +55,7 @@ class ThermalController:
         self._ema_alpha = self._halflife_to_alpha(ema_outdoor_halflife_s)
         self._ref_outdoor: Optional[float] = None
         self._last_good_on: Optional[float] = None
+        self._min_on_override_s: Optional[float] = None
         self._apply_adaptive_timings()
 
     @staticmethod
@@ -95,6 +96,19 @@ class ThermalController:
         """Predict the peak temperature for a heating burst."""
         return float(self._predicted_peak(temp_start, tau_on))
 
+    def predict_on_delta(self, tau_on: float) -> float:
+        """Return expected temperature rise after tau_on seconds of heating."""
+        return float(self._delta_on(tau_on))
+
+    def set_min_on_override(self, value: Optional[float]) -> None:
+        """Override the derived minimum ON time."""
+        self._min_on_override_s = float(value) if value is not None else None
+        self._apply_adaptive_timings()
+
+    def get_min_on_override(self) -> Optional[float]:
+        """Return the current minimum ON override."""
+        return self._min_on_override_s
+
     def get_runtime_state(self) -> Dict[str, Optional[float] | Dict[str, float]]:
         """Return a JSON-serializable snapshot."""
         return {
@@ -107,6 +121,7 @@ class ThermalController:
             "ema_outdoor": None if self._ema_outdoor is None else float(self._ema_outdoor),
             "ref_outdoor": None if self._ref_outdoor is None else float(self._ref_outdoor),
             "last_good_on": None if self._last_good_on is None else float(self._last_good_on),
+            "min_on_override": None if self._min_on_override_s is None else float(self._min_on_override_s),
         }
 
     def restore_runtime_state(self, payload: Optional[Dict[str, object]]) -> None:
@@ -131,6 +146,11 @@ class ThermalController:
 
         last_good_on = payload.get("last_good_on")
         self._last_good_on = float(last_good_on) if isinstance(last_good_on, (int, float)) else None
+
+        min_on_override = payload.get("min_on_override")
+        if isinstance(min_on_override, (int, float)):
+            self._min_on_override_s = float(min_on_override)
+            self._apply_adaptive_timings()
 
     def _t_peak(self) -> float:
         """Return time from heat cut to peak of the residual tail."""
@@ -455,6 +475,9 @@ class ThermalController:
         """Derive min on/off times and PWM window from the current parameters."""
         params = self.params
         min_on = _clip(params.tau_r * 0.25, 60.0, params.tau_r * 0.85)
+        if self._min_on_override_s is not None:
+            min_on = min(min_on, float(self._min_on_override_s))
+        min_on = max(30.0, min_on)
         min_off = _clip(params.tau_th * 0.2, min_on, params.tau_th)
         window = _clip(params.tau_th * 1.1, 480.0, 5400.0)
         window = max(window, min_on + min_off + 30.0)
