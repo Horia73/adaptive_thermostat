@@ -87,6 +87,10 @@ WINDOW_FALSE_POSITIVE_TOLERANCE = 0.1  # °C slack to auto-clear noisy detection
 WINDOW_RECOVERY_POSITIVE_SLOPE_THRESHOLD = 0.2  # °C/h slope to mark recovery start
 WINDOW_RECOVERY_STABLE_SLOPE_THRESHOLD = 2.5  # °C/h slope to resume heating
 WINDOW_RECOVERY_MIN_SECONDS = 120.0  # seconds to wait after recovery starts
+WINDOW_RECOVERY_FLAT_SLOPE_THRESHOLD = 0.8  # °C/h allow recovery on near-flat cooling
+WINDOW_RECOVERY_FLAT_MIN_SECONDS = 900.0  # seconds before flat-slope recovery
+WINDOW_RECOVERY_SMALL_DROP_ABS = 1.0  # °C absolute drop allowed for fast recovery
+WINDOW_RECOVERY_SMALL_DROP_FRACTION = 0.1  # fraction of indoor-outdoor delta
 WINDOW_POST_RECOVERY_DAMPEN_CYCLES = 1  # heating cycles to soften after window close
 WINDOW_POST_RECOVERY_DAMPEN_SCALE = 0.6  # fractional runtime for the first post-window cycle
 CYCLE_PEAK_FOLLOWUP_SECONDS = 1800.0  # seconds to continue observing residual peak
@@ -943,6 +947,50 @@ class AdaptiveThermostat(ClimateEntity):
                 self._last_window_event_ts = now_ts
                 self._handle_window_state_transition(now_ts, False, enforce_recovery=False)
                 _LOGGER.info("[%s] Window alert cleared (no sustained drop)", self._entry_id)
+                return
+
+            drop = None
+            max_drop = None
+            baseline = self._open_window_baseline_temp
+            if baseline is not None and current_temp is not None:
+                drop = float(baseline) - float(current_temp)
+                max_drop = WINDOW_RECOVERY_SMALL_DROP_ABS
+                if isinstance(self._current_outdoor_temp, (int, float)):
+                    delta_outdoor = max(0.0, float(baseline) - float(self._current_outdoor_temp))
+                    max_drop = max(max_drop, delta_outdoor * WINDOW_RECOVERY_SMALL_DROP_FRACTION)
+
+            flat_elapsed = None
+            if self._last_window_event_ts is not None:
+                flat_elapsed = now_ts - self._last_window_event_ts
+
+            if (
+                drop is not None
+                and max_drop is not None
+                and 0.0 <= drop <= max_drop
+                and slope_per_hour >= -WINDOW_RECOVERY_FLAT_SLOPE_THRESHOLD
+                and flat_elapsed is not None
+                and flat_elapsed >= WINDOW_RECOVERY_FLAT_MIN_SECONDS
+            ):
+                self._open_window_detected = False
+                self._window_alert = None
+                self._last_window_event_ts = now_ts
+                self._handle_window_state_transition(
+                    now_ts,
+                    False,
+                    enforce_recovery=True,
+                    heat_delay_s=0.0,
+                    data_delay_s=0.0,
+                )
+                _LOGGER.info(
+                    "[%s] Window recovery cleared (drop=%.2f°C max=%.2f°C slope=%.2f°C/h outdoor=%s°C)",
+                    self._entry_id,
+                    drop,
+                    max_drop,
+                    slope_per_hour,
+                    "n/a"
+                    if self._current_outdoor_temp is None
+                    else f"{float(self._current_outdoor_temp):.1f}",
+                )
                 return
 
             if self._window_recovery_start_ts is None:
