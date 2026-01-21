@@ -56,6 +56,29 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             }),
         )
 
+    if not hass.services.has_service(DOMAIN, "dismiss_window_alert"):
+        async def dismiss_window_alert_service(call: ServiceCall) -> None:
+            """Service to dismiss a window alert for a thermostat."""
+            entity_id = call.data.get("entity_id")
+
+            climate_entities = hass.data.get(DOMAIN, {}).get("entities", {})
+            climate_entity = climate_entities.get(entity_id)
+            if climate_entity and hasattr(climate_entity, "dismiss_window_alert"):
+                climate_entity.dismiss_window_alert()
+                _LOGGER.info("Dismissed window alert for %s", entity_id)
+                return
+
+            _LOGGER.warning("Could not find adaptive thermostat entity: %s", entity_id)
+
+        hass.services.async_register(
+            DOMAIN,
+            "dismiss_window_alert",
+            dismiss_window_alert_service,
+            schema=vol.Schema({
+                vol.Required("entity_id"): cv.entity_id,
+            }),
+        )
+
     # Listen for options updates.
     entry.async_on_unload(entry.add_update_listener(async_update_options))
 

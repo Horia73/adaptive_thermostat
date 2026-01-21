@@ -20,3 +20,14 @@ reset_adaptive_profile:
       selector:
         entity:
           domain: climate
+dismiss_window_alert:
+  name: Dismiss Window Alert
+  description: Dismiss a window-open alert when you confirm it is a false alarm
+  fields:
+    entity_id:
+      name: Entity
+      description: The adaptive thermostat entity to dismiss
+      required: true
+      selector:
+        entity:
+          domain: climate

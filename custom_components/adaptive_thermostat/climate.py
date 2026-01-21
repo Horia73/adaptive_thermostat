@@ -91,6 +91,10 @@ WINDOW_RECOVERY_FLAT_SLOPE_THRESHOLD = 0.8  # °C/h allow recovery on near-flat 
 WINDOW_RECOVERY_FLAT_MIN_SECONDS = 900.0  # seconds before flat-slope recovery
 WINDOW_RECOVERY_SMALL_DROP_ABS = 1.0  # °C absolute drop allowed for fast recovery
 WINDOW_RECOVERY_SMALL_DROP_FRACTION = 0.1  # fraction of indoor-outdoor delta
+HEAT_SPIKE_WINDOW_SECONDS = 1800.0  # seconds to look back for temporary heat spikes
+HEAT_SPIKE_RISE_DELTA = 0.5  # °C rise to treat as a short-lived heat source
+HEAT_SPIKE_DROP_DELTA = 0.5  # °C drop after the spike to suppress window detection
+HEAT_SPIKE_MAX_AGE_SECONDS = 900.0  # seconds after spike peak to suppress detection
 WINDOW_POST_RECOVERY_DAMPEN_CYCLES = 1  # heating cycles to soften after window close
 WINDOW_POST_RECOVERY_DAMPEN_SCALE = 0.6  # fractional runtime for the first post-window cycle
 CYCLE_PEAK_FOLLOWUP_SECONDS = 1800.0  # seconds to continue observing residual peak
@@ -708,6 +712,28 @@ class AdaptiveThermostat(ClimateEntity):
 
         self._attr_extra_state_attributes["thermal_samples_cached"] = len(self._thermal_samples)
 
+    def _recent_heat_spike_detected(self, now_ts: float, current_temp: Optional[float]) -> bool:
+        """Detect a recent temporary heat spike (oven, dryer, etc.)."""
+        if current_temp is None or not self._temperature_history:
+            return False
+
+        window_start = now_ts - HEAT_SPIKE_WINDOW_SECONDS
+        recent = [(ts, temp) for ts, temp in self._temperature_history if ts >= window_start]
+        if len(recent) < 3:
+            return False
+
+        peak_ts, peak_temp = max(recent, key=lambda item: item[1])
+        if now_ts - peak_ts > HEAT_SPIKE_MAX_AGE_SECONDS:
+            return False
+
+        min_before = min((temp for ts, temp in recent if ts <= peak_ts), default=None)
+        if min_before is None:
+            return False
+
+        rise = peak_temp - min_before
+        drop = peak_temp - current_temp
+        return rise >= HEAT_SPIKE_RISE_DELTA and drop >= HEAT_SPIKE_DROP_DELTA
+
     def _purge_recent_samples(self, keep_before_ts: float) -> None:
         """Drop recent samples collected during window disturbances."""
         if not self._thermal_samples:
@@ -859,6 +885,12 @@ class AdaptiveThermostat(ClimateEntity):
                     candidate["last_temp"] = float(current_temp)
 
         if not self._open_window_detected and slope_per_hour <= -threshold:
+            if self._recent_heat_spike_detected(now_ts, current_temp):
+                if candidate:
+                    self._window_candidate = None
+                    self._attr_extra_state_attributes["window_candidate_active"] = False
+                _LOGGER.debug("[%s] Window detection suppressed (recent heat spike)", self._entry_id)
+                return
             if candidate is None:
                 start_temp = None
                 if self._prev_measurement_temp is not None:
@@ -1883,5 +1915,28 @@ class AdaptiveThermostat(ClimateEntity):
         """Clear manual override so auto on/off can resume control."""
         self._manual_override = False
         self._attr_extra_state_attributes["manual_override"] = False
+        self._mark_state_dirty()
+        self.async_write_ha_state()
+
+    def dismiss_window_alert(self) -> None:
+        """Clear a window alert when the user confirms it as a false alarm."""
+        now_ts = dt_util.utcnow().timestamp()
+        if self._open_window_detected or self._window_candidate:
+            self._open_window_detected = False
+            self._window_alert = None
+            self._last_window_event_ts = now_ts
+            self._window_candidate = None
+            self._handle_window_state_transition(
+                now_ts,
+                False,
+                enforce_recovery=False,
+                heat_delay_s=0.0,
+                data_delay_s=0.0,
+            )
+        self._attr_extra_state_attributes["window_open_detected"] = False
+        self._attr_extra_state_attributes["window_alert"] = None
+        self._attr_extra_state_attributes["window_candidate_active"] = False
+        if self._hvac_mode == HVACMode.HEAT:
+            self.hass.async_create_task(self._async_control_heating(now_ts))
         self._mark_state_dirty()
         self.async_write_ha_state()
