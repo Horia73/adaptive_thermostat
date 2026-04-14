@@ -1505,8 +1505,8 @@ class AdaptiveThermostat(ClimateEntity):
                 temp,
                 self._auto_off_temp,
             )
-            await self._async_turn_heater_off()
             self._hvac_mode = HVACMode.OFF
+            await self._async_turn_heater_off()
             self._mark_state_dirty()
 
     async def _async_turn_heater_on(self) -> bool:
@@ -1624,6 +1624,18 @@ class AdaptiveThermostat(ClimateEntity):
         self._last_command_timestamp = now_ts
         self._attr_extra_state_attributes["zone_heater_on"] = False
         self._mark_state_dirty()
+
+        if self._central_heater_entity_id and other_zones_need_heat:
+            # Two zones can stop almost simultaneously, each seeing the other as still
+            # active and both deciding to keep the shared central heater running.
+            # Re-check after marking this zone off so the last zone to stop can
+            # reliably switch the shared central heater off.
+            if not await self._async_check_other_zones_need_heat():
+                _LOGGER.debug(
+                    "[%s] Rechecking shared central heater after shutdown: no active zones remain",
+                    self._entry_id,
+                )
+                await self._async_turn_off_entity(self._central_heater_entity_id, "central heater")
 
     async def _async_close_zone_valves(self) -> None:
         """Close all zone valves immediately."""
