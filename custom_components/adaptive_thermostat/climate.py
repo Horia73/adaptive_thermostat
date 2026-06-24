@@ -104,6 +104,16 @@ CYCLE_TARGET_TIME_GRACE = 120.0  # seconds grace beyond predicted peak time
 VALVE_OPEN_TIMEOUT_SECONDS = 60.0
 VALVE_OPEN_POLL_SECONDS = 2.0
 
+# Logbook integration. Heating start/stop is reported through ``hvac_action`` rather
+# than the entity state, so it never reaches the logbook on its own. Firing an explicit
+# ``logbook_entry`` event on each transition makes the heater turning on/off show up in
+# the more-info "Activity" feed instead of only manual setting changes.
+EVENT_LOGBOOK_ENTRY = "logbook_entry"
+LOGBOOK_ENTRY_NAME = "name"
+LOGBOOK_ENTRY_MESSAGE = "message"
+LOGBOOK_ENTRY_ENTITY_ID = "entity_id"
+LOGBOOK_ENTRY_DOMAIN = "domain"
+
 
 def _clamp(value: float, low: float, high: float) -> float:
     """Clamp value within bounds."""
@@ -1509,6 +1519,37 @@ class AdaptiveThermostat(ClimateEntity):
             await self._async_turn_heater_off()
             self._mark_state_dirty()
 
+    @callback
+    def _set_zone_heater_state(self, on: bool) -> None:
+        """Update the zone heater flag, mirror it to attributes, and log transitions.
+
+        Centralizes every zone-heater on/off change so a logbook entry is emitted
+        exactly once per real transition (and never on no-op calls), making heating
+        visible in the entity's "Activity" feed.
+        """
+        if on == self._zone_heater_on:
+            self._attr_extra_state_attributes["zone_heater_on"] = on
+            return
+        self._zone_heater_on = on
+        self._attr_extra_state_attributes["zone_heater_on"] = on
+        self._async_log_heating_event(on)
+
+    @callback
+    def _async_log_heating_event(self, on: bool) -> None:
+        """Fire a logbook entry for a heating start/stop transition."""
+        entity_id = self.entity_id
+        if not entity_id or self.hass is None:
+            return
+        self.hass.bus.async_fire(
+            EVENT_LOGBOOK_ENTRY,
+            {
+                LOGBOOK_ENTRY_NAME: self._attr_name,
+                LOGBOOK_ENTRY_MESSAGE: "started heating" if on else "stopped heating",
+                LOGBOOK_ENTRY_ENTITY_ID: entity_id,
+                LOGBOOK_ENTRY_DOMAIN: "climate",
+            },
+        )
+
     async def _async_turn_heater_on(self) -> bool:
         """Turn on valves and coordinate central heater."""
         if self._delayed_valve_off_task:
@@ -1539,8 +1580,7 @@ class AdaptiveThermostat(ClimateEntity):
         if failures:
             self._set_valve_error("Valve error: " + ", ".join(failures))
             await self._async_close_zone_valves()
-            self._zone_heater_on = False
-            self._attr_extra_state_attributes["zone_heater_on"] = False
+            self._set_zone_heater_state(False)
             self._mark_state_dirty()
             self.async_write_ha_state()
             return False
@@ -1549,9 +1589,8 @@ class AdaptiveThermostat(ClimateEntity):
             await self._async_coordinate_central_heater_on()
 
         now_ts = dt_util.utcnow().timestamp()
-        self._zone_heater_on = True
         self._last_command_timestamp = now_ts
-        self._attr_extra_state_attributes["zone_heater_on"] = True
+        self._set_zone_heater_state(True)
         self._mark_state_dirty()
         return True
 
@@ -1620,9 +1659,8 @@ class AdaptiveThermostat(ClimateEntity):
             self._attr_extra_state_attributes["pending_tail_follow_until"] = self._iso_or_none(cycle["follow_until_ts"])
             self._active_cycle = None
 
-        self._zone_heater_on = False
         self._last_command_timestamp = now_ts
-        self._attr_extra_state_attributes["zone_heater_on"] = False
+        self._set_zone_heater_state(False)
         self._mark_state_dirty()
 
         if self._central_heater_entity_id and other_zones_need_heat:

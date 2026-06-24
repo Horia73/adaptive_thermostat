@@ -4,10 +4,11 @@
   "documentation": "https://github.com/Horia73/adaptive_thermostat",
   "issue_tracker": "https://github.com/Horia73/adaptive_thermostat/issues",
   "dependencies": [],
+  "after_dependencies": ["logbook"],
   "codeowners": ["@Horia73"],
   "requirements": [],
   "config_flow": true,
   "reconfigure": true,
-  "version": "1.1.5",
+  "version": "1.1.6",
   "iot_class": "calculated"
 } 
