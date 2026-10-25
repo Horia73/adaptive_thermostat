@@ -1,45 +1,59 @@
 """Config flow for Adaptive Thermostat integration."""
+
+from __future__ import annotations
+
 import logging
-from typing import Any, Dict, Optional
+from typing import Any
 
-import voluptuous as vol # type: ignore
-
-from homeassistant import config_entries # type: ignore
-from homeassistant.core import callback # type: ignore
-from homeassistant.helpers import selector # type: ignore
-from homeassistant.const import CONF_NAME # type: ignore
+from homeassistant import config_entries
+from homeassistant.config_entries import ConfigFlowResult
+from homeassistant.const import CONF_NAME
+from homeassistant.helpers import selector
+import voluptuous as vol
 
 from .const import (
-    DOMAIN,
-    CONF_HEATER,
-    CONF_CENTRAL_HEATER,
-    CONF_TEMP_SENSOR,
-    CONF_HUMIDITY_SENSOR,
-    CONF_DOOR_WINDOW_SENSOR,
-    CONF_MOTION_SENSOR,
-    CONF_OUTDOOR_SENSOR,
-    CONF_BACKUP_OUTDOOR_SENSOR,
-    CONF_HOME_PRESET,
-    CONF_SLEEP_PRESET,
-    CONF_AWAY_PRESET,
-    CONF_TARGET_TOLERANCE,
-    CONF_WINDOW_DETECTION_ENABLED,
-    CONF_WINDOW_SLOPE_THRESHOLD,
-    CONF_CENTRAL_HEATER_TURN_ON_DELAY,
-    CONF_CENTRAL_HEATER_TURN_OFF_DELAY,
+    CENTRAL_HEATER_TURN_OFF_DELAY,
+    CENTRAL_HEATER_TURN_ON_DELAY,
+    CONF_AUTO_OFF_TEMP,
     CONF_AUTO_ON_OFF_ENABLED,
     CONF_AUTO_ON_TEMP,
-    CONF_AUTO_OFF_TEMP,
-    DEFAULT_HOME_PRESET,
-    DEFAULT_SLEEP_PRESET,
-    DEFAULT_AWAY_PRESET,
-    CENTRAL_HEATER_TURN_ON_DELAY,
-    CENTRAL_HEATER_TURN_OFF_DELAY,
-    DEFAULT_AUTO_ON_TEMP,
+    CONF_AWAY_PRESET,
+    CONF_BACKUP_OUTDOOR_SENSOR,
+    CONF_CENTRAL_HEATER,
+    CONF_CENTRAL_HEATER_MIN_OFF,
+    CONF_CENTRAL_HEATER_MIN_ON,
+    CONF_CENTRAL_HEATER_TURN_OFF_DELAY,
+    CONF_CENTRAL_HEATER_TURN_ON_DELAY,
+    CONF_DOOR_WINDOW_SENSOR,
+    CONF_HEATER,
+    CONF_HOME_PRESET,
+    CONF_HUMIDITY_SENSOR,
+    CONF_MAX_BURST,
+    CONF_MIN_BURST,
+    CONF_MODEL_CONTROL,
+    CONF_MOTION_SENSOR,
+    CONF_OUTDOOR_SENSOR,
+    CONF_SENSOR_STALE_TIMEOUT,
+    CONF_SLEEP_PRESET,
+    CONF_TARGET_TOLERANCE,
+    CONF_TEMP_SENSOR,
+    CONF_WINDOW_DETECTION_ENABLED,
+    CONF_WINDOW_SLOPE_THRESHOLD,
     DEFAULT_AUTO_OFF_TEMP,
+    DEFAULT_AUTO_ON_TEMP,
+    DEFAULT_AWAY_PRESET,
+    DEFAULT_CENTRAL_HEATER_MIN_OFF,
+    DEFAULT_CENTRAL_HEATER_MIN_ON,
+    DEFAULT_HOME_PRESET,
+    DEFAULT_MAX_BURST,
+    DEFAULT_MIN_BURST,
+    DEFAULT_MODEL_CONTROL,
+    DEFAULT_SENSOR_STALE_TIMEOUT,
+    DEFAULT_SLEEP_PRESET,
     DEFAULT_TARGET_TOLERANCE,
     DEFAULT_WINDOW_DETECTION_ENABLED,
     DEFAULT_WINDOW_SLOPE_THRESHOLD,
+    DOMAIN,
 )
 
 _LOGGER = logging.getLogger(__name__)
@@ -53,7 +67,9 @@ STEP_USER_DATA_SCHEMA = vol.Schema(
 STEP_ZONE_DATA_SCHEMA = vol.Schema(
     {
         vol.Required(CONF_HEATER): selector.EntitySelector(
-            selector.EntitySelectorConfig(domain=["switch", "input_boolean", "climate", "valve"], multiple=True)
+            selector.EntitySelectorConfig(
+                domain=["switch", "input_boolean", "climate", "valve"], multiple=True
+            )
         ),
         vol.Optional(CONF_CENTRAL_HEATER): selector.EntitySelector(
             selector.EntitySelectorConfig(domain=["switch", "input_boolean", "climate"])
@@ -71,7 +87,9 @@ STEP_ZONE_DATA_SCHEMA = vol.Schema(
             selector.EntitySelectorConfig(domain=["sensor"], device_class="humidity", multiple=False)
         ),
         vol.Optional(CONF_DOOR_WINDOW_SENSOR): selector.EntitySelector(
-            selector.EntitySelectorConfig(domain=["binary_sensor"], device_class=["door", "window"], multiple=False)
+            selector.EntitySelectorConfig(
+                domain=["binary_sensor"], device_class=["door", "window"], multiple=False
+            )
         ),
         vol.Optional(CONF_MOTION_SENSOR): selector.EntitySelector(
             selector.EntitySelectorConfig(domain=["binary_sensor"], device_class="motion", multiple=False)
@@ -81,11 +99,33 @@ STEP_ZONE_DATA_SCHEMA = vol.Schema(
 
 STEP_TIMING_SCHEMA = vol.Schema(
     {
-        vol.Required(CONF_CENTRAL_HEATER_TURN_ON_DELAY, default=CENTRAL_HEATER_TURN_ON_DELAY): selector.NumberSelector(
-            selector.NumberSelectorConfig(min=5, max=60, step=1, mode="box", unit_of_measurement="seconds")
+        vol.Required(
+            CONF_CENTRAL_HEATER_TURN_ON_DELAY, default=CENTRAL_HEATER_TURN_ON_DELAY
+        ): selector.NumberSelector(
+            selector.NumberSelectorConfig(
+                min=5, max=60, step=1, mode=selector.NumberSelectorMode.BOX, unit_of_measurement="seconds"
+            )
         ),
-        vol.Required(CONF_CENTRAL_HEATER_TURN_OFF_DELAY, default=CENTRAL_HEATER_TURN_OFF_DELAY): selector.NumberSelector(
-            selector.NumberSelectorConfig(min=30, max=300, step=10, mode="box", unit_of_measurement="seconds")
+        vol.Required(
+            CONF_CENTRAL_HEATER_TURN_OFF_DELAY, default=CENTRAL_HEATER_TURN_OFF_DELAY
+        ): selector.NumberSelector(
+            selector.NumberSelectorConfig(
+                min=30, max=300, step=10, mode=selector.NumberSelectorMode.BOX, unit_of_measurement="seconds"
+            )
+        ),
+        vol.Required(
+            CONF_CENTRAL_HEATER_MIN_ON, default=DEFAULT_CENTRAL_HEATER_MIN_ON
+        ): selector.NumberSelector(
+            selector.NumberSelectorConfig(
+                min=0, max=900, step=10, mode=selector.NumberSelectorMode.BOX, unit_of_measurement="seconds"
+            )
+        ),
+        vol.Required(
+            CONF_CENTRAL_HEATER_MIN_OFF, default=DEFAULT_CENTRAL_HEATER_MIN_OFF
+        ): selector.NumberSelector(
+            selector.NumberSelectorConfig(
+                min=0, max=1800, step=10, mode=selector.NumberSelectorMode.BOX, unit_of_measurement="seconds"
+            )
         ),
     }
 )
@@ -94,10 +134,14 @@ STEP_AUTO_ONOFF_SCHEMA = vol.Schema(
     {
         vol.Required(CONF_AUTO_ON_OFF_ENABLED, default=False): selector.BooleanSelector(),
         vol.Required(CONF_AUTO_ON_TEMP, default=DEFAULT_AUTO_ON_TEMP): selector.NumberSelector(
-            selector.NumberSelectorConfig(min=-10, max=25, step=0.5, mode="box", unit_of_measurement="°C")
+            selector.NumberSelectorConfig(
+                min=-10, max=25, step=0.5, mode=selector.NumberSelectorMode.BOX, unit_of_measurement="°C"
+            )
         ),
         vol.Required(CONF_AUTO_OFF_TEMP, default=DEFAULT_AUTO_OFF_TEMP): selector.NumberSelector(
-            selector.NumberSelectorConfig(min=10, max=35, step=0.5, mode="box", unit_of_measurement="°C")
+            selector.NumberSelectorConfig(
+                min=10, max=35, step=0.5, mode=selector.NumberSelectorMode.BOX, unit_of_measurement="°C"
+            )
         ),
     }
 )
@@ -105,28 +149,55 @@ STEP_AUTO_ONOFF_SCHEMA = vol.Schema(
 STEP_ADAPTIVE_SCHEMA = vol.Schema(
     {
         vol.Required(CONF_TARGET_TOLERANCE, default=DEFAULT_TARGET_TOLERANCE): selector.NumberSelector(
-            selector.NumberSelectorConfig(min=0.02, max=0.5, step=0.01, mode="box", unit_of_measurement="°C")
+            selector.NumberSelectorConfig(
+                min=0.02, max=0.5, step=0.01, mode=selector.NumberSelectorMode.BOX, unit_of_measurement="°C"
+            )
         ),
-        vol.Required(CONF_WINDOW_DETECTION_ENABLED, default=DEFAULT_WINDOW_DETECTION_ENABLED): selector.BooleanSelector(),
-        vol.Required(CONF_WINDOW_SLOPE_THRESHOLD, default=DEFAULT_WINDOW_SLOPE_THRESHOLD): selector.NumberSelector(
-            selector.NumberSelectorConfig(min=0.5, max=15.0, step=0.5, mode="box", unit_of_measurement="°C/h")
+        vol.Required(
+            CONF_WINDOW_DETECTION_ENABLED, default=DEFAULT_WINDOW_DETECTION_ENABLED
+        ): selector.BooleanSelector(),
+        vol.Required(
+            CONF_WINDOW_SLOPE_THRESHOLD, default=DEFAULT_WINDOW_SLOPE_THRESHOLD
+        ): selector.NumberSelector(
+            selector.NumberSelectorConfig(
+                min=0.5, max=15.0, step=0.5, mode=selector.NumberSelectorMode.BOX, unit_of_measurement="°C/h"
+            )
         ),
+        vol.Required(
+            CONF_SENSOR_STALE_TIMEOUT, default=DEFAULT_SENSOR_STALE_TIMEOUT
+        ): selector.NumberSelector(
+            selector.NumberSelectorConfig(
+                min=30, max=1440, step=10, mode=selector.NumberSelectorMode.BOX, unit_of_measurement="min"
+            )
+        ),
+        vol.Required(CONF_MIN_BURST, default=DEFAULT_MIN_BURST): selector.NumberSelector(
+            selector.NumberSelectorConfig(
+                min=60, max=900, step=10, mode=selector.NumberSelectorMode.BOX, unit_of_measurement="seconds"
+            )
+        ),
+        vol.Required(CONF_MAX_BURST, default=DEFAULT_MAX_BURST): selector.NumberSelector(
+            selector.NumberSelectorConfig(
+                min=10, max=120, step=1, mode=selector.NumberSelectorMode.BOX, unit_of_measurement="min"
+            )
+        ),
+        vol.Required(CONF_MODEL_CONTROL, default=DEFAULT_MODEL_CONTROL): selector.BooleanSelector(),
     }
 )
 
 STEP_PRESETS_SCHEMA = vol.Schema(
     {
         vol.Required(CONF_HOME_PRESET, default=DEFAULT_HOME_PRESET): selector.NumberSelector(
-            selector.NumberSelectorConfig(min=10, max=30, step=0.1, mode="box")
+            selector.NumberSelectorConfig(min=10, max=30, step=0.1, mode=selector.NumberSelectorMode.BOX)
         ),
         vol.Required(CONF_SLEEP_PRESET, default=DEFAULT_SLEEP_PRESET): selector.NumberSelector(
-            selector.NumberSelectorConfig(min=10, max=30, step=0.1, mode="box")
+            selector.NumberSelectorConfig(min=10, max=30, step=0.1, mode=selector.NumberSelectorMode.BOX)
         ),
         vol.Required(CONF_AWAY_PRESET, default=DEFAULT_AWAY_PRESET): selector.NumberSelector(
-            selector.NumberSelectorConfig(min=10, max=30, step=0.1, mode="box")
+            selector.NumberSelectorConfig(min=10, max=30, step=0.1, mode=selector.NumberSelectorMode.BOX)
         ),
     }
 )
+
 
 def _validate_input(user_input: dict, schema: vol.Schema) -> dict:
     """Validate user input against schema, clean up empty optional fields."""
@@ -135,11 +206,12 @@ def _validate_input(user_input: dict, schema: vol.Schema) -> dict:
 
     for key_marker in schema.schema:
         key_str = key_marker.schema if isinstance(key_marker, vol.Marker) else key_marker
-        
+
         if key_str in cleaned_input and cleaned_input[key_str] == "":
             if isinstance(key_marker, vol.Optional):
-                 cleaned_input[key_str] = None
+                cleaned_input[key_str] = None
     return cleaned_input
+
 
 class AdaptiveThermostatConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
     """Handle a config flow for Adaptive Thermostat."""
@@ -150,16 +222,16 @@ class AdaptiveThermostatConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         """Initialize the config flow."""
         self._config_data = {}
 
-    async def async_step_user(self, user_input: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    async def async_step_user(self, user_input: dict[str, Any] | None = None) -> ConfigFlowResult:
         """Handle the initial step where the user enters the zone name."""
-        errors: Dict[str, str] = {}
+        errors: dict[str, str] = {}
         if user_input is not None:
             try:
                 self._config_data.update(user_input)
                 # Ensure unique name
                 await self.async_set_unique_id(user_input[CONF_NAME])
                 self._abort_if_unique_id_configured()
-                
+
                 return await self.async_step_zone_setup()
 
             except vol.MultipleInvalid as e:
@@ -167,25 +239,23 @@ class AdaptiveThermostatConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                 for error in e.errors:
                     path = error.path[0] if error.path else "base"
                     if path == CONF_NAME and "already configured" in str(error.msg).lower():
-                         errors["base"] = "name_exists"
+                        errors["base"] = "name_exists"
                     else:
                         errors[path if isinstance(path, str) else "base"] = "invalid_input"
-            except Exception as e: # pylint: disable=broad-except
+            except Exception:  # pylint: disable=broad-except
                 _LOGGER.exception("Unexpected exception in user step")
                 errors["base"] = "unknown"
 
-        return self.async_show_form(
-            step_id="user", data_schema=STEP_USER_DATA_SCHEMA, errors=errors
-        )
+        return self.async_show_form(step_id="user", data_schema=STEP_USER_DATA_SCHEMA, errors=errors)
 
-    async def async_step_zone_setup(self, user_input: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    async def async_step_zone_setup(self, user_input: dict[str, Any] | None = None) -> ConfigFlowResult:
         """Handle the zone setup."""
-        errors: Dict[str, str] = {}
+        errors: dict[str, str] = {}
         if user_input is not None:
             try:
                 validated_input = _validate_input(user_input, STEP_ZONE_DATA_SCHEMA)
                 self._config_data.update(validated_input)
-                
+
                 # Check if central heater is configured to determine next step
                 central_heater = self._config_data.get(CONF_CENTRAL_HEATER)
                 if central_heater and central_heater.strip():  # Only if central heater is actually selected
@@ -194,13 +264,13 @@ class AdaptiveThermostatConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                 else:
                     _LOGGER.debug("No central heater configured, skipping timing setup")
                     return await self.async_step_auto_onoff_setup()
-                
+
             except vol.MultipleInvalid as e:
                 _LOGGER.error(f"Validation error in zone setup: {e}")
                 for error in e.errors:
                     path = error.path[0] if error.path else "base"
                     errors[path if isinstance(path, str) else "base"] = "invalid_input"
-            except Exception: # pylint: disable=broad-except
+            except Exception:  # pylint: disable=broad-except
                 _LOGGER.exception("Unexpected exception in zone_setup")
                 errors["base"] = "unknown"
 
@@ -210,9 +280,9 @@ class AdaptiveThermostatConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             errors=errors,
         )
 
-    async def async_step_timing_setup(self, user_input: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    async def async_step_timing_setup(self, user_input: dict[str, Any] | None = None) -> ConfigFlowResult:
         """Handle central heater timing configuration."""
-        errors: Dict[str, str] = {}
+        errors: dict[str, str] = {}
         if user_input is not None:
             try:
                 validated_input = _validate_input(user_input, STEP_TIMING_SCHEMA)
@@ -223,7 +293,7 @@ class AdaptiveThermostatConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                 for error in e.errors:
                     path = error.path[0] if error.path else "base"
                     errors[path if isinstance(path, str) else "base"] = "invalid_input"
-            except Exception: # pylint: disable=broad-except
+            except Exception:  # pylint: disable=broad-except
                 _LOGGER.exception("Unexpected exception in timing_setup")
                 errors["base"] = "unknown"
 
@@ -233,9 +303,9 @@ class AdaptiveThermostatConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             errors=errors,
         )
 
-    async def async_step_auto_onoff_setup(self, user_input: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    async def async_step_auto_onoff_setup(self, user_input: dict[str, Any] | None = None) -> ConfigFlowResult:
         """Handle auto on/off configuration."""
-        errors: Dict[str, str] = {}
+        errors: dict[str, str] = {}
         if user_input is not None:
             try:
                 validated_input = _validate_input(user_input, STEP_AUTO_ONOFF_SCHEMA)
@@ -246,7 +316,7 @@ class AdaptiveThermostatConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                 for error in e.errors:
                     path = error.path[0] if error.path else "base"
                     errors[path if isinstance(path, str) else "base"] = "invalid_input"
-            except Exception: # pylint: disable=broad-except
+            except Exception:  # pylint: disable=broad-except
                 _LOGGER.exception("Unexpected exception in auto_onoff_setup")
                 errors["base"] = "unknown"
 
@@ -256,9 +326,9 @@ class AdaptiveThermostatConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             errors=errors,
         )
 
-    async def async_step_adaptive_setup(self, user_input: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    async def async_step_adaptive_setup(self, user_input: dict[str, Any] | None = None) -> ConfigFlowResult:
         """Handle adaptive control configuration."""
-        errors: Dict[str, str] = {}
+        errors: dict[str, str] = {}
         if user_input is not None:
             try:
                 validated_input = _validate_input(user_input, STEP_ADAPTIVE_SCHEMA)
@@ -279,9 +349,9 @@ class AdaptiveThermostatConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             errors=errors,
         )
 
-    async def async_step_presets_setup(self, user_input: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    async def async_step_presets_setup(self, user_input: dict[str, Any] | None = None) -> ConfigFlowResult:
         """Handle temperature presets configuration."""
-        errors: Dict[str, str] = {}
+        errors: dict[str, str] = {}
         if user_input is not None:
             try:
                 validated_input = _validate_input(user_input, STEP_PRESETS_SCHEMA)
@@ -292,7 +362,7 @@ class AdaptiveThermostatConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                 for error in e.errors:
                     path = error.path[0] if error.path else "base"
                     errors[path if isinstance(path, str) else "base"] = "invalid_input"
-            except Exception: # pylint: disable=broad-except
+            except Exception:  # pylint: disable=broad-except
                 _LOGGER.exception("Unexpected exception in presets_setup")
                 errors["base"] = "unknown"
 
@@ -309,52 +379,54 @@ class AdaptiveThermostatConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         _LOGGER.debug(f"Final config data for entry: {final_data}")
         return self.async_create_entry(title=final_data[CONF_NAME], data=final_data)
 
-    async def async_step_reconfigure(self, user_input: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    async def async_step_reconfigure(self, user_input: dict[str, Any] | None = None) -> ConfigFlowResult:
         """Handle reconfiguration of the integration."""
         config_entry = self._get_reconfigure_entry()
-        
+
         _LOGGER.info(f"[RECONFIGURE] Starting full reconfiguration for {config_entry.title}")
-        
+
         # Initialize with current config data for reconfiguration
         self._config_data = dict(config_entry.data)
-        
+
         _LOGGER.debug(f"[RECONFIGURE] Current config data: {self._config_data}")
-        
+
         # Always start with name setup for full reconfiguration
         return await self.async_step_reconfigure_name_setup()
 
-    async def async_step_reconfigure_name_setup(self, user_input: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    async def async_step_reconfigure_name_setup(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
         """Handle reconfiguration of the thermostat name."""
         config_entry = self._get_reconfigure_entry()
-        errors: Dict[str, str] = {}
-        
+        errors: dict[str, str] = {}
+
         _LOGGER.info(f"[RECONFIGURE] Name setup step for {config_entry.title}")
-        
+
         if user_input is not None:
             _LOGGER.debug(f"[RECONFIGURE] Name setup received input: {user_input}")
             try:
                 validated_input = _validate_input(user_input, STEP_USER_DATA_SCHEMA)
                 self._config_data.update(validated_input)
-                
-                _LOGGER.info(f"[RECONFIGURE] Name updated, proceeding to zone setup")
+
+                _LOGGER.info("[RECONFIGURE] Name updated, proceeding to zone setup")
                 # Always continue to zone setup
                 return await self.async_step_reconfigure_zone_setup()
-                
+
             except vol.MultipleInvalid as e:
                 _LOGGER.error(f"Validation error in reconfigure name setup: {e}")
                 for error in e.errors:
                     path = error.path[0] if error.path else "base"
                     errors[path if isinstance(path, str) else "base"] = "invalid_input"
-            except Exception: # pylint: disable=broad-except
+            except Exception:  # pylint: disable=broad-except
                 _LOGGER.exception("Unexpected exception in reconfigure name setup")
                 errors["base"] = "unknown"
 
         # Create simple schema with current name
         current_data = config_entry.data
         current_name = current_data.get(CONF_NAME, config_entry.title)
-        
+
         _LOGGER.debug(f"[RECONFIGURE] Showing name form with current name: {current_name}")
-        
+
         schema_dict = {vol.Required(CONF_NAME, default=current_name): str}
 
         return self.async_show_form(
@@ -363,65 +435,77 @@ class AdaptiveThermostatConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             errors=errors,
         )
 
-    async def async_step_reconfigure_zone_setup(self, user_input: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    async def async_step_reconfigure_zone_setup(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
         """Handle reconfiguration of zone setup."""
         config_entry = self._get_reconfigure_entry()
-        errors: Dict[str, str] = {}
-        
+        errors: dict[str, str] = {}
+
         if user_input is not None:
             try:
                 # Ensure unique ID remains the same
                 await self.async_set_unique_id(config_entry.unique_id)
                 self._abort_if_unique_id_mismatch()
-                
+
                 validated_input = _validate_input(user_input, STEP_ZONE_DATA_SCHEMA)
                 self._config_data.update(validated_input)
-                
+
                 # Check if central heater is configured to determine next step
                 central_heater = self._config_data.get(CONF_CENTRAL_HEATER)
                 if central_heater and central_heater.strip():  # Only if central heater is actually selected
-                    _LOGGER.debug(f"[RECONFIGURE] Central heater configured: {central_heater}, showing timing setup")
+                    _LOGGER.debug(
+                        f"[RECONFIGURE] Central heater configured: {central_heater}, showing timing setup"
+                    )
                     return await self.async_step_reconfigure_timing_setup()
                 else:
                     _LOGGER.debug("[RECONFIGURE] No central heater configured, skipping timing setup")
                     return await self.async_step_reconfigure_auto_onoff_setup()
-                
+
             except vol.MultipleInvalid as e:
                 _LOGGER.error(f"Validation error in reconfigure zone setup: {e}")
                 for error in e.errors:
                     path = error.path[0] if error.path else "base"
                     errors[path if isinstance(path, str) else "base"] = "invalid_input"
-            except Exception: # pylint: disable=broad-except
+            except Exception:  # pylint: disable=broad-except
                 _LOGGER.exception("Unexpected exception in reconfigure zone setup")
                 errors["base"] = "unknown"
 
         # Pre-populate form with current values
         current_data = config_entry.data
         schema_dict = {}
-        
+
         for key_obj, selector_config in STEP_ZONE_DATA_SCHEMA.schema.items():
             key_str = key_obj.schema if isinstance(key_obj, vol.Marker) else key_obj
             current_value = current_data.get(key_str)
-            
+
             if isinstance(key_obj, vol.Optional):
-                schema_dict[vol.Optional(key_str, description={"suggested_value": current_value or ""})] = selector_config
+                schema_dict[vol.Optional(key_str, description={"suggested_value": current_value or ""})] = (
+                    selector_config
+                )
             else:
                 default_value = current_value
-                if default_value is None and hasattr(key_obj, 'default') and key_obj.default is not vol.UNDEFINED:
+                if (
+                    default_value is None
+                    and hasattr(key_obj, "default")
+                    and key_obj.default is not vol.UNDEFINED
+                ):
                     default_value = key_obj.default() if callable(key_obj.default) else key_obj.default
                 schema_dict[vol.Required(key_str, default=default_value)] = selector_config
-        
+
         return self.async_show_form(
             step_id="reconfigure_zone_setup",
             data_schema=vol.Schema(schema_dict),
             errors=errors,
         )
 
-    async def async_step_reconfigure_timing_setup(self, user_input: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    async def async_step_reconfigure_timing_setup(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
         """Handle reconfiguration of central heater timing."""
         config_entry = self._get_reconfigure_entry()
-        errors: Dict[str, str] = {}
-        
+        errors: dict[str, str] = {}
+
         if user_input is not None:
             try:
                 validated_input = _validate_input(user_input, STEP_TIMING_SCHEMA)
@@ -432,7 +516,7 @@ class AdaptiveThermostatConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                 for error in e.errors:
                     path = error.path[0] if error.path else "base"
                     errors[path if isinstance(path, str) else "base"] = "invalid_input"
-            except Exception: # pylint: disable=broad-except
+            except Exception:  # pylint: disable=broad-except
                 _LOGGER.exception("Unexpected exception in reconfigure timing setup")
                 errors["base"] = "unknown"
 
@@ -442,24 +526,26 @@ class AdaptiveThermostatConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         for key_obj, selector_config in STEP_TIMING_SCHEMA.schema.items():
             key_str = key_obj.schema if isinstance(key_obj, vol.Marker) else key_obj
             current_value = current_data.get(key_str)
-            
+
             # Use current value or fall back to schema default
-            if current_value is None and hasattr(key_obj, 'default') and key_obj.default is not vol.UNDEFINED:
+            if current_value is None and hasattr(key_obj, "default") and key_obj.default is not vol.UNDEFINED:
                 current_value = key_obj.default() if callable(key_obj.default) else key_obj.default
-            
+
             schema_dict[vol.Required(key_str, default=current_value)] = selector_config
-        
+
         return self.async_show_form(
             step_id="reconfigure_timing_setup",
             data_schema=vol.Schema(schema_dict),
             errors=errors,
         )
 
-    async def async_step_reconfigure_auto_onoff_setup(self, user_input: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    async def async_step_reconfigure_auto_onoff_setup(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
         """Handle reconfiguration of auto on/off settings."""
         config_entry = self._get_reconfigure_entry()
-        errors: Dict[str, str] = {}
-        
+        errors: dict[str, str] = {}
+
         if user_input is not None:
             try:
                 validated_input = _validate_input(user_input, STEP_AUTO_ONOFF_SCHEMA)
@@ -470,7 +556,7 @@ class AdaptiveThermostatConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                 for error in e.errors:
                     path = error.path[0] if error.path else "base"
                     errors[path if isinstance(path, str) else "base"] = "invalid_input"
-            except Exception: # pylint: disable=broad-except
+            except Exception:  # pylint: disable=broad-except
                 _LOGGER.exception("Unexpected exception in reconfigure auto on/off setup")
                 errors["base"] = "unknown"
 
@@ -480,23 +566,25 @@ class AdaptiveThermostatConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         for key_obj, selector_config in STEP_AUTO_ONOFF_SCHEMA.schema.items():
             key_str = key_obj.schema if isinstance(key_obj, vol.Marker) else key_obj
             current_value = current_data.get(key_str)
-            
+
             # Use current value or fall back to schema default
-            if current_value is None and hasattr(key_obj, 'default') and key_obj.default is not vol.UNDEFINED:
+            if current_value is None and hasattr(key_obj, "default") and key_obj.default is not vol.UNDEFINED:
                 current_value = key_obj.default() if callable(key_obj.default) else key_obj.default
-            
+
             schema_dict[vol.Required(key_str, default=current_value)] = selector_config
-        
+
         return self.async_show_form(
             step_id="reconfigure_auto_onoff_setup",
             data_schema=vol.Schema(schema_dict),
             errors=errors,
         )
 
-    async def async_step_reconfigure_adaptive_setup(self, user_input: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    async def async_step_reconfigure_adaptive_setup(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
         """Handle reconfiguration of adaptive control settings."""
         config_entry = self._get_reconfigure_entry()
-        errors: Dict[str, str] = {}
+        errors: dict[str, str] = {}
 
         if user_input is not None:
             try:
@@ -529,18 +617,20 @@ class AdaptiveThermostatConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             errors=errors,
         )
 
-    async def async_step_reconfigure_presets_setup(self, user_input: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    async def async_step_reconfigure_presets_setup(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
         """Handle reconfiguration of temperature presets."""
         config_entry = self._get_reconfigure_entry()
-        errors: Dict[str, str] = {}
-        
+        errors: dict[str, str] = {}
+
         if user_input is not None:
             try:
                 validated_input = _validate_input(user_input, STEP_PRESETS_SCHEMA)
                 self._config_data.update(validated_input)
-                
-                # Complete reconfiguration
-                return self.async_update_reload_and_abort(
+
+                # Complete reconfiguration; the entry's update listener reloads it.
+                return self.async_update_and_abort(
                     config_entry,
                     data_updates=self._config_data,
                 )
@@ -549,7 +639,7 @@ class AdaptiveThermostatConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                 for error in e.errors:
                     path = error.path[0] if error.path else "base"
                     errors[path if isinstance(path, str) else "base"] = "invalid_input"
-            except Exception: # pylint: disable=broad-except
+            except Exception:  # pylint: disable=broad-except
                 _LOGGER.exception("Unexpected exception in reconfigure presets setup")
                 errors["base"] = "unknown"
 
@@ -559,13 +649,13 @@ class AdaptiveThermostatConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         for key_obj, selector_config in STEP_PRESETS_SCHEMA.schema.items():
             key_str = key_obj.schema if isinstance(key_obj, vol.Marker) else key_obj
             current_value = current_data.get(key_str)
-            
+
             # Use current value or fall back to schema default
-            if current_value is None and hasattr(key_obj, 'default') and key_obj.default is not vol.UNDEFINED:
+            if current_value is None and hasattr(key_obj, "default") and key_obj.default is not vol.UNDEFINED:
                 current_value = key_obj.default() if callable(key_obj.default) else key_obj.default
-            
+
             schema_dict[vol.Required(key_str, default=current_value)] = selector_config
-        
+
         return self.async_show_form(
             step_id="reconfigure_presets_setup",
             data_schema=vol.Schema(schema_dict),

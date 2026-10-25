@@ -11,7 +11,7 @@ reset_manual_override:
           domain: climate
 reset_adaptive_profile:
   name: Reset Adaptive Profile
-  description: Clear learned heating and cooling calibration data so the controller can relearn from scratch
+  description: Forget the learned thermal model of this zone and relearn it from scratch (fallback control is used meanwhile)
   fields:
     entity_id:
       name: Entity

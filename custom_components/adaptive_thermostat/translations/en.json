@@ -28,7 +28,9 @@
         "description": "Configure the timing delays for central heater coordination. These settings help protect your heating system.",
         "data": {
           "central_heater_turn_on_delay": "Turn On Delay (seconds after valve opens)",
-          "central_heater_turn_off_delay": "Turn Off Delay (seconds to wait before closing valve)"
+          "central_heater_turn_off_delay": "Turn Off Delay (seconds to wait before closing valve)",
+          "central_heater_min_on": "Boiler minimum on time (seconds, anti short-cycling)",
+          "central_heater_min_off": "Boiler minimum off time (seconds, anti short-cycling)"
         }
       },
       "auto_onoff_setup": {
@@ -42,12 +44,15 @@
       },
       "adaptive_setup": {
         "title": "Adaptive Control",
-        "description": "Fine-tune the adaptive controller behaviour, including allowable temperature deviation and cycling windows.",
+        "description": "Comfort band, open-window detection, sensor safety and burst limits. Defaults suit most hydronic radiators.",
         "data": {
           "target_tolerance": "Target Tolerance (±°C)",
-          "control_window": "Control Window Length (seconds)",
           "window_detection_enabled": "Detect Open Window Events",
-          "window_slope_threshold": "Open Window Slope Threshold (°C/h)"
+          "window_slope_threshold": "Open Window Slope Threshold (°C/h)",
+          "sensor_stale_timeout": "Stale temperature sensor timeout (minutes)",
+          "min_burst_seconds": "Minimum heating burst (seconds)",
+          "max_burst_minutes": "Maximum heating burst (minutes)",
+          "model_control_enabled": "Use the learned thermal model (off = simple fallback control)"
         }
       },
       "presets_setup": {
@@ -102,7 +107,9 @@
         "description": "Configure the timing delays for central heater coordination. These settings help protect your heating system.",
         "data": {
           "central_heater_turn_on_delay": "Turn On Delay (seconds after valve opens)",
-          "central_heater_turn_off_delay": "Turn Off Delay (seconds to wait before closing valve)"
+          "central_heater_turn_off_delay": "Turn Off Delay (seconds to wait before closing valve)",
+          "central_heater_min_on": "Boiler minimum on time (seconds, anti short-cycling)",
+          "central_heater_min_off": "Boiler minimum off time (seconds, anti short-cycling)"
         }
       },
       "reconfigure_auto_onoff_setup": {
@@ -116,12 +123,15 @@
       },
       "reconfigure_adaptive_setup": {
         "title": "Step 5/6: Adaptive Control",
-        "description": "Fine-tune the adaptive controller behaviour, including allowable temperature deviation and cycling windows.",
+        "description": "Comfort band, open-window detection, sensor safety and burst limits. Defaults suit most hydronic radiators.",
         "data": {
           "target_tolerance": "Target Tolerance (±°C)",
-          "control_window": "Control Window Length (seconds)",
           "window_detection_enabled": "Detect Open Window Events",
-          "window_slope_threshold": "Open Window Slope Threshold (°C/h)"
+          "window_slope_threshold": "Open Window Slope Threshold (°C/h)",
+          "sensor_stale_timeout": "Stale temperature sensor timeout (minutes)",
+          "min_burst_seconds": "Minimum heating burst (seconds)",
+          "max_burst_minutes": "Maximum heating burst (minutes)",
+          "model_control_enabled": "Use the learned thermal model (off = simple fallback control)"
         }
       },
       "reconfigure_presets_setup": {
@@ -145,7 +155,9 @@
     },
     "abort": {
       "already_configured": "Zone already configured",
-      "single_instance_allowed": "Only a single configuration of Adaptive Thermostat is allowed."
+      "single_instance_allowed": "Only a single configuration of Adaptive Thermostat is allowed.",
+      "reconfigure_successful": "Reconfiguration successful",
+      "unique_id_mismatch": "The zone being reconfigured does not match"
     }
   },
   "options": {
@@ -187,7 +199,7 @@
     },
     "reset_adaptive_profile": {
       "name": "Reset Adaptive Profile",
-      "description": "Clear learned calibration data so the thermostat can relearn from scratch",
+      "description": "Forget the learned thermal model of this zone and relearn it from scratch (fallback control is used meanwhile)",
       "fields": {
         "entity_id": {
           "name": "Entity",

@@ -1,14 +1,17 @@
 {
   "domain": "adaptive_thermostat",
   "name": "Adaptive Thermostat",
-  "documentation": "https://github.com/Horia73/adaptive_thermostat",
-  "issue_tracker": "https://github.com/Horia73/adaptive_thermostat/issues",
-  "dependencies": [],
-  "after_dependencies": ["logbook"],
-  "codeowners": ["@Horia73"],
-  "requirements": [],
+  "after_dependencies": [
+    "logbook"
+  ],
+  "codeowners": [
+    "@Horia73"
+  ],
   "config_flow": true,
-  "reconfigure": true,
-  "version": "1.1.6",
-  "iot_class": "calculated"
-} 
+  "dependencies": [],
+  "documentation": "https://github.com/Horia73/adaptive_thermostat",
+  "iot_class": "calculated",
+  "issue_tracker": "https://github.com/Horia73/adaptive_thermostat/issues",
+  "requirements": [],
+  "version": "2.0.0"
+}
