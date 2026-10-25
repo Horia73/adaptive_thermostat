@@ -1,0 +1,36 @@
+{
+ "climate.birou": {
+  "heater_entity_ids": [
+   "valve.valva_incalzire_0"
+  ],
+  "central_heater_entity_id": "switch.centrala2",
+  "temp_sensor_entity_id": "sensor.birou",
+  "outdoor_sensor": "sensor.balcon_1",
+  "backup_outdoor_sensor": "sensor.acasa_temperatura",
+  "window_detection_enabled": true,
+  "window_slope_threshold": 2.5
+ },
+ "climate.dormitor": {
+  "heater_entity_ids": [
+   "valve.valva_dormitor_1",
+   "valve.valva_dormitor_2"
+  ],
+  "central_heater_entity_id": "switch.centrala3",
+  "temp_sensor_entity_id": "sensor.dormitor_temperatura",
+  "outdoor_sensor": "sensor.balcon_1",
+  "backup_outdoor_sensor": "sensor.acasa_temperatura",
+  "window_detection_enabled": true,
+  "window_slope_threshold": 2.5
+ },
+ "climate.baie_2": {
+  "heater_entity_ids": [
+   "valve.valva_baie_2"
+  ],
+  "central_heater_entity_id": "switch.centrala3",
+  "temp_sensor_entity_id": "sensor.baie_2",
+  "outdoor_sensor": "sensor.balcon_1",
+  "backup_outdoor_sensor": "sensor.acasa_temperatura",
+  "window_detection_enabled": true,
+  "window_slope_threshold": 2.5
+ }
+}
