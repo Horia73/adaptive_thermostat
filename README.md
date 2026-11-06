@@ -313,4 +313,4 @@ uv pip install --python .venv "pytest-homeassistant-custom-component==0.13.374" 
 
 ## License
 
-This project is licensed under the MIT License (no LICENSE file is committed yet).
+This project is licensed under the [MIT License](LICENSE).
