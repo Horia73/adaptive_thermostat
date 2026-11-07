@@ -84,6 +84,7 @@ from .const import (
     CONF_HEATER,
     CONF_HOME_PRESET,
     CONF_HUMIDITY_SENSOR,
+    CONF_LINKED_WINDOW_ZONES,
     CONF_MAX_BURST,
     CONF_MIN_BURST,
     CONF_MODEL_CONTROL,
@@ -144,6 +145,19 @@ def _clamp(value: float, low: float, high: float) -> float:
     return max(low, min(high, value))
 
 
+def _entity_list(value: Any) -> list[str]:
+    """One entity id (1.x / 2.0 entries) or a list of them, cleaned."""
+    if isinstance(value, str):
+        value = [value]
+    if not isinstance(value, (list, tuple)):
+        return []
+    out: list[str] = []
+    for item in value:
+        if isinstance(item, str) and item.strip() and item.strip() not in out:
+            out.append(item.strip())
+    return out
+
+
 def _float_state(state: State | None) -> float | None:
     if state is None or state.state in (STATE_UNAVAILABLE, STATE_UNKNOWN, ""):
         return None
@@ -177,7 +191,8 @@ class ZoneRuntime:
         self.humidity_sensor_id = entity(CONF_HUMIDITY_SENSOR)
         self.outdoor_sensor_id = entity(CONF_OUTDOOR_SENSOR)
         self.backup_outdoor_sensor_id = entity(CONF_BACKUP_OUTDOOR_SENSOR)
-        self.door_window_sensor_id = entity(CONF_DOOR_WINDOW_SENSOR)
+        self.door_window_sensor_ids: list[str] = _entity_list(config.get(CONF_DOOR_WINDOW_SENSOR))
+        self.linked_window_zone_ids: list[str] = _entity_list(config.get(CONF_LINKED_WINDOW_ZONES))
         self.motion_sensor_id = entity(CONF_MOTION_SENSOR)
         self.central_heater_id = entity(CONF_CENTRAL_HEATER)
 
@@ -229,6 +244,7 @@ class ZoneRuntime:
         self.current_humidity: float | None = None
         self.current_outdoor: float | None = None
         self.door_window_open: bool | None = None
+        self.linked_window_open_zones: tuple[str, ...] = ()
 
         # Engine and HA plumbing.
         self.core: ZoneCore | None = None
@@ -312,7 +328,7 @@ class ZoneRuntime:
                 self.humidity_sensor_id,
                 self.outdoor_sensor_id,
                 self.backup_outdoor_sensor_id,
-                self.door_window_sensor_id,
+                *self.door_window_sensor_ids,
                 self.central_heater_id,
                 *self.heater_ids,
             )
@@ -327,6 +343,12 @@ class ZoneRuntime:
             )
         if tracked:
             self._unsubs.append(async_track_state_change_event(self.hass, tracked, self._other_changed))
+        if self.linked_window_zone_ids:
+            # Neighbouring zones publish their own window state on their
+            # climate entity; zones that are not loaded yet report later.
+            self._unsubs.append(
+                async_track_state_change_event(self.hass, self.linked_window_zone_ids, self._linked_changed)
+            )
         self._persist_intent()
         self.wake()
 
@@ -470,6 +492,7 @@ class ZoneRuntime:
             self.hass.states.get(self.humidity_sensor_id) if self.humidity_sensor_id else None
         )
         self._update_window_contact(now)
+        self._update_linked_windows(now)
 
     def _outdoor_value(self) -> float | None:
         value = _float_state(self.hass.states.get(self.outdoor_sensor_id)) if self.outdoor_sensor_id else None
@@ -478,16 +501,45 @@ class ZoneRuntime:
         return value
 
     def _update_window_contact(self, now: float) -> None:
-        if not self.door_window_sensor_id or self.core is None:
+        """Open if any available contact is on; None if none is available."""
+        if not self.door_window_sensor_ids or self.core is None:
             return
-        state = self.hass.states.get(self.door_window_sensor_id)
-        if state is None or state.state in (STATE_UNAVAILABLE, STATE_UNKNOWN):
-            is_open = None
-        else:
-            is_open = state.state == STATE_ON
+        available = [
+            state.state == STATE_ON
+            for state in (self.hass.states.get(e) for e in self.door_window_sensor_ids)
+            if state is not None and state.state not in (STATE_UNAVAILABLE, STATE_UNKNOWN)
+        ]
+        is_open = any(available) if available else None
         if is_open != self.door_window_open:
+            if is_open is None:
+                _LOGGER.warning(
+                    "[%s] All window contacts unavailable; %s",
+                    self.name,
+                    "using open-window autodetection" if self.window_detection else "no window detection",
+                )
             self.door_window_open = is_open
             self.core.set_window_contact(now, is_open)
+
+    def _update_linked_windows(self, now: float) -> None:
+        """Linked zones whose *own* window is open (unavailable/missing = closed)."""
+        if not self.linked_window_zone_ids or self.core is None:
+            return
+        open_zones = tuple(
+            entity_id
+            for entity_id in self.linked_window_zone_ids
+            if entity_id != self.entity_id
+            and (state := self.hass.states.get(entity_id)) is not None
+            and state.state not in (STATE_UNAVAILABLE, STATE_UNKNOWN)
+            and state.attributes.get("window_open_detected") is True
+        )
+        if open_zones != self.linked_window_open_zones:
+            _LOGGER.info(
+                "[%s] Linked window %s",
+                self.name,
+                f"open in {', '.join(open_zones)}: heating paused" if open_zones else "closed",
+            )
+            self.linked_window_open_zones = open_zones
+            self.core.set_linked_windows(now, open_zones)
 
     @callback
     def _temp_changed(self, event: Event[EventStateChangedData]) -> None:
@@ -528,9 +580,18 @@ class ZoneRuntime:
                 self.current_outdoor = out
         elif entity_id == self.humidity_sensor_id:
             self.current_humidity = _float_state(event.data["new_state"])
-        elif entity_id == self.door_window_sensor_id:
+        elif entity_id in self.door_window_sensor_ids:
             self._update_window_contact(now)
         self.wake()
+
+    @callback
+    def _linked_changed(self, event: Event[EventStateChangedData]) -> None:
+        if self.core is None or self._stopping:
+            return
+        before = self.linked_window_open_zones
+        self._update_linked_windows(self._now())
+        if self.linked_window_open_zones != before:
+            self.wake()
 
     # ----------------------------------------------------------- scheduler
     @callback
@@ -833,6 +894,20 @@ class ZoneRuntime:
         return self.status.window_alert if self.status else None
 
     @property
+    def linked_window_open(self) -> bool:
+        return bool(self.linked_window_open_zones)
+
+    @property
+    def window_source(self) -> str | None:
+        """Which mechanism decides the zone's own window state."""
+        return self.core.window_source if self.core is not None else None
+
+    @property
+    def window_contacts_unavailable(self) -> bool:
+        """Contacts configured but none reports (degraded: autodetect or nothing)."""
+        return bool(self.door_window_sensor_ids) and self.door_window_open is None
+
+    @property
     def fault(self) -> str | None:
         return self.status.fault if self.status else None
 
@@ -879,8 +954,11 @@ class ZoneRuntime:
         if event is None:
             return
         if event.opened:
-            _LOGGER.warning("[%s] %s - heating paused", self.name, status.window_alert)
-            self._fire_logbook(status.window_alert or "window open detected")
+            message = (
+                "window contact open" if event.reason == "contact" else status.window_alert
+            ) or "window open detected"
+            _LOGGER.warning("[%s] %s - heating paused", self.name, message)
+            self._fire_logbook(f"{message} - heating paused")
         else:
             _LOGGER.info("[%s] Window event cleared (%s)", self.name, event.reason)
 
@@ -896,6 +974,9 @@ class ZoneRuntime:
             self.current_humidity,
             self.window_open,
             self.window_alert,
+            self.linked_window_open_zones,
+            self.window_source,
+            self.window_contacts_unavailable,
             self.valve_error,
             self.fault,
             self.fault_message,

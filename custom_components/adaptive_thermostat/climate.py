@@ -40,6 +40,8 @@ UNRECORDED_ATTRIBUTES = frozenset(
         "temp_sensor_entity_id",
         "backup_outdoor_sensor",
         "door_window_sensor",
+        "door_window_sensors",
+        "linked_window_zones",
         "motion_sensor",
         "auto_on_off_enabled",
         "window_detection_enabled",
@@ -159,6 +161,8 @@ class AdaptiveThermostat(ClimateEntity):
             # Read by the Lovelace card.
             "humidity_sensor": rt.humidity_sensor_id,
             "outdoor_sensor": rt.outdoor_sensor_id,
+            # Own window only (contact, or autodetect without one): linked
+            # zones read it, so it must never include the linked state.
             "window_open_detected": rt.window_open,
             "window_alert": rt.window_alert,
             "valve_error": valve_error,
@@ -167,13 +171,19 @@ class AdaptiveThermostat(ClimateEntity):
             # State that matters for automations.
             "manual_override": rt.manual_override,
             "zone_heater_on": rt.zone_heater_on,
+            "window_source": rt.window_source,
+            "window_contacts_unavailable": rt.window_contacts_unavailable,
+            "linked_window_open": rt.linked_window_open,
+            "linked_window_open_zones": list(rt.linked_window_open_zones),
             # Static configuration (unrecorded).
             "heater_entity_id": rt.heater_ids[0] if rt.heater_ids else None,
             "heater_entity_ids": rt.heater_ids,
             "central_heater_entity_id": rt.central_heater_id,
             "temp_sensor_entity_id": rt.temp_sensor_id,
             "backup_outdoor_sensor": rt.backup_outdoor_sensor_id,
-            "door_window_sensor": rt.door_window_sensor_id,
+            "door_window_sensor": rt.door_window_sensor_ids[0] if rt.door_window_sensor_ids else None,
+            "door_window_sensors": rt.door_window_sensor_ids,
+            "linked_window_zones": rt.linked_window_zone_ids,
             "motion_sensor": rt.motion_sensor_id,
             "auto_on_off_enabled": rt.auto_on_off,
             "window_detection_enabled": rt.window_detection,

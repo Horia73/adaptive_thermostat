@@ -34,6 +34,10 @@ from .observer import ObserverConfig, ZoneObserver, overrun_profile
 from .safety import FAULT_SENSOR_STALE, FAULT_SENSOR_UNAVAILABLE, SafetyConfig, SensorHealth
 from .window import WindowConfig, WindowDetector, WindowEvent
 
+WINDOW_SOURCE_CONTACT = "contact"
+WINDOW_SOURCE_AUTODETECT = "autodetect"
+WINDOW_SOURCE_NONE = "none"
+
 FAULT_VALVE_MISMATCH = "valve_mismatch"
 FAULT_VALVE_UNAVAILABLE = "valve_unavailable"
 FAULT_CENTRAL_UNAVAILABLE = "central_unavailable"
@@ -113,7 +117,7 @@ class ZoneStatus:
     time_to_peak_s: float | None
     fault: str | None
     fault_message: str | None
-    window_open: bool
+    window_open: bool  # own window only (contact or autodetect)
     window_alert: str | None
     learning: bool
     next_wake: float
@@ -121,6 +125,9 @@ class ZoneStatus:
     slope_instant: float
     slope_hourly: float
     window_event: WindowEvent | None = None
+    window_source: str = WINDOW_SOURCE_NONE
+    linked_window_open: bool = False
+    linked_window_open_zones: tuple[str, ...] = ()
 
 
 class ZoneCore:
@@ -147,8 +154,13 @@ class ZoneCore:
         self.last_burst_end: float | None = None
         self.last_burst_tail_until: float | None = None
         self.actuator_fault: tuple[str, str] | None = None
+        # Aggregated own contact sensors: None = none configured or none
+        # available (then the slope detector decides, if enabled).
         self.window_contact_open: bool | None = None
         self.window_alert: str | None = None
+        # Other zones whose own window is open (only their own state, so no
+        # chains or cycles).
+        self.linked_open: tuple[str, ...] = ()
         self.start_delay_s = 30.0
         self.shared_duty = 0.0
         self.mode_block_until = now + config.mode_change_block_s
@@ -206,7 +218,7 @@ class ZoneCore:
                 pending.observed_max = (
                     value if pending.observed_max is None else max(pending.observed_max, value)
                 )
-        if self.config.window_detection and self.window_contact_open is None:
+        if self._autodetect_active:
             event = self.window.evaluate(t, self.observer.history)
             if event is not None:
                 self._on_window_event(t, event)
@@ -228,13 +240,42 @@ class ZoneCore:
         self.target = target
 
     def set_window_contact(self, t: float, is_open: bool | None) -> None:
-        """Contact sensor state (None = no sensor / unavailable)."""
-        self.window_contact_open = is_open
-        if not self.config.window_detection or is_open is None:
+        """Own contact sensors (any open = open; None = none configured / available).
+
+        Contacts are authoritative regardless of ``window_detection``: they
+        block heating immediately, never time out and raise no dismissable
+        alert.  While they report, the slope detector is off.
+        """
+        was = self.window_contact_open
+        if is_open == was:
             return
-        event = self.window.force_open(t, "contact") if is_open else self.window.force_close(t, "contact")
-        if event is not None:
-            self._on_window_event(t, event)
+        self.window_contact_open = is_open
+        if is_open is not None and self.window.is_open:
+            # The contacts take over from an autodetected window.
+            event = self.window.force_close(t, "contact")
+            if event is not None:
+                self._on_window_event(t, event)
+        if bool(was) == bool(is_open):
+            return
+        if is_open:
+            self._on_block_start()
+        else:
+            self.window_block_until = max(self.window_block_until, t + self.config.window_data_block_s)
+        self._last_window_event = WindowEvent(bool(is_open), t, 0.0, 0.0, "contact")
+        self._apply_gates(t)
+
+    def set_linked_windows(self, t: float, open_zones: list[str] | tuple[str, ...]) -> None:
+        """Linked zones whose own window is open (empty = all closed or unknown)."""
+        zones = tuple(sorted(set(open_zones)))
+        if zones == self.linked_open:
+            return
+        was_open = bool(self.linked_open)
+        self.linked_open = zones
+        if zones and not was_open:
+            self._on_block_start()
+        elif was_open and not zones:
+            self.window_block_until = max(self.window_block_until, t + self.config.window_data_block_s)
+        self._apply_gates(t)
 
     def set_actuator_fault(self, fault: tuple[str, str] | None) -> None:
         self.actuator_fault = fault
@@ -258,6 +299,34 @@ class ZoneCore:
     @property
     def estimator(self) -> ZoneEstimator:
         return self.observer.estimator
+
+    @property
+    def _autodetect_active(self) -> bool:
+        """Slope detector runs only when enabled and no contact reports."""
+        return self.config.window_detection and self.window_contact_open is None
+
+    @property
+    def own_window_open(self) -> bool:
+        if self.window_contact_open is not None:
+            return self.window_contact_open
+        return self.window.is_open
+
+    @property
+    def window_source(self) -> str:
+        if self.window_contact_open is not None:
+            return WINDOW_SOURCE_CONTACT
+        if self.config.window_detection:
+            return WINDOW_SOURCE_AUTODETECT
+        return WINDOW_SOURCE_NONE
+
+    @property
+    def window_blocked(self) -> bool:
+        """Own or linked window open: no heating, no learning."""
+        return self.own_window_open or bool(self.linked_open)
+
+    def _on_block_start(self) -> None:
+        # A burst tail observed with a window open says nothing about the model.
+        self._pending_validation.clear()
 
     def _account_heat(self, t: float) -> None:
         dt = t - self._heat_acc_t
@@ -342,20 +411,19 @@ class ZoneCore:
         ok = (
             sensor_fault is None
             and not self.health.suspect
-            and not self.window.is_open
+            and not self.window_blocked
             and t >= self.window_block_until
             and t >= self.mode_block_until
             and (self.actuator_fault is None or self.actuator_fault[0] == FAULT_VALVE_MISMATCH)
         )
         self.observer.learn_params = ok
-        self.observer.learn_d = not self.window.is_open and sensor_fault is None and not self.health.suspect
+        self.observer.learn_d = not self.window_blocked and sensor_fault is None and not self.health.suspect
 
     def _on_window_event(self, t: float, event: WindowEvent) -> None:
+        """Slope detector transition (contacts never raise an alert)."""
         if event.opened:
-            if event.reason == "contact":
-                self.window_alert = "Door/window sensor reported open"
-            else:
-                self.window_alert = f"Open window detected (drop {abs(event.slope_per_hour):.2f}°C/h)"
+            self.window_alert = f"Open window detected (drop {abs(event.slope_per_hour):.2f}°C/h)"
+            self._on_block_start()
         else:
             self.window_alert = None
             self.window_block_until = t + self.config.window_data_block_s
@@ -448,18 +516,17 @@ class ZoneCore:
         self._apply_gates(t)
         self.observer.tick(t)
         self._finish_validations(t)
-        window_event: WindowEvent | None = None
-        if self.config.window_detection:
-            if self.window.is_open and self.window_contact_open is None:
+        if self._autodetect_active:
+            if self.window.is_open:
                 event = self.window.evaluate(t, self.observer.history)
                 if event is not None:
                     self._on_window_event(t, event)
-            window_event = self._last_window_event
-            self._last_window_event = None
         elif self.window.is_open:
             event = self.window.force_close(t, "disabled")
             if event is not None:
                 self._on_window_event(t, event)
+        window_event = self._last_window_event
+        self._last_window_event = None
         fault = self._fault(t)
         if fault is not None and fault[0] != self.last_fault:
             self.last_fault = fault[0]
@@ -470,8 +537,10 @@ class ZoneCore:
         blocked_reason = None
         if not self.hvac_on:
             blocked_reason = "off"
-        elif self.window.is_open:
-            blocked_reason = "window open"
+        elif self.own_window_open:
+            blocked_reason = f"window open ({self.window_source})"
+        elif self.linked_open:
+            blocked_reason = "linked window open: " + ", ".join(self.linked_open)
         elif fault is not None:
             blocked_reason = fault[0]
         if blocked_reason is not None and self.burst is not None:
@@ -516,7 +585,7 @@ class ZoneCore:
         if burst is not None and burst.heat_started_at is not None and heat_flowing:
             remaining = burst.planned_s - burst.heat_elapsed_s
             next_wake = min(next_wake, t + max(1.0, remaining))
-        window_open = self.window.is_open
+        window_open = self.own_window_open
         history = self.observer.history
         return ZoneStatus(
             want_heat=burst is not None,
@@ -533,13 +602,16 @@ class ZoneCore:
             fault=fault[0] if fault else None,
             fault_message=fault[1] if fault else None,
             window_open=window_open,
-            window_alert=self.window_alert if window_open else None,
+            window_alert=self.window_alert if self.window.is_open and self._autodetect_active else None,
             learning=self.observer.learn_params,
             next_wake=next_wake,
             reason=reason,
             slope_instant=history.slope_per_hour(t, 1800.0),
             slope_hourly=history.slope_per_hour(t, 3600.0),
             window_event=window_event,
+            window_source=self.window_source,
+            linked_window_open=bool(self.linked_open),
+            linked_window_open_zones=self.linked_open,
         )
 
     def _control_input(self, t: float) -> ControlInput:

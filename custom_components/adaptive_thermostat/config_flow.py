@@ -28,6 +28,7 @@ from .const import (
     CONF_HEATER,
     CONF_HOME_PRESET,
     CONF_HUMIDITY_SENSOR,
+    CONF_LINKED_WINDOW_ZONES,
     CONF_MAX_BURST,
     CONF_MIN_BURST,
     CONF_MODEL_CONTROL,
@@ -88,8 +89,11 @@ STEP_ZONE_DATA_SCHEMA = vol.Schema(
         ),
         vol.Optional(CONF_DOOR_WINDOW_SENSOR): selector.EntitySelector(
             selector.EntitySelectorConfig(
-                domain=["binary_sensor"], device_class=["door", "window"], multiple=False
+                domain=["binary_sensor"], device_class=["door", "window"], multiple=True
             )
+        ),
+        vol.Optional(CONF_LINKED_WINDOW_ZONES): selector.EntitySelector(
+            selector.EntitySelectorConfig(domain=["climate"], integration=DOMAIN, multiple=True)
         ),
         vol.Optional(CONF_MOTION_SENSOR): selector.EntitySelector(
             selector.EntitySelectorConfig(domain=["binary_sensor"], device_class="motion", multiple=False)
@@ -199,9 +203,57 @@ STEP_PRESETS_SCHEMA = vol.Schema(
 )
 
 
+# Fields stored as a list; 2.0 stored the contact sensor as a single string.
+LIST_FIELDS = (CONF_DOOR_WINDOW_SENSOR, CONF_LINKED_WINDOW_ZONES)
+
+
+def _as_list(value: Any) -> list[str]:
+    if isinstance(value, str):
+        return [value] if value.strip() else []
+    if isinstance(value, (list, tuple)):
+        return [v for v in value if isinstance(v, str) and v.strip()]
+    return []
+
+
+def _normalize_lists(data: dict) -> dict:
+    """Accept a single entity id where a list is expected (older entries, REST)."""
+    out = dict(data)
+    for key in LIST_FIELDS:
+        if key in out and out[key] is not None:
+            out[key] = _as_list(out[key])
+    return out
+
+
+def _schema_with_current(
+    schema: vol.Schema, current: dict[str, Any], overrides: dict[str, Any] | None = None
+) -> vol.Schema:
+    """``schema`` with every field defaulting to the entry's current value.
+
+    Required fields get ``default`` (current value, else the schema default),
+    so submitting ``{}`` keeps them.  Optional fields get a suggested value:
+    an omitted optional field is not touched either, because the step only
+    updates the keys it receives.
+    """
+    schema_dict: dict[Any, Any] = {}
+    for key_obj, selector_config in schema.schema.items():
+        key_str = key_obj.schema if isinstance(key_obj, vol.Marker) else key_obj
+        selector_config = (overrides or {}).get(key_str, selector_config)
+        current_value = current.get(key_str)
+        if key_str in LIST_FIELDS:
+            current_value = _as_list(current_value)
+        if isinstance(key_obj, vol.Optional):
+            suggested = current_value if current_value is not None else ""
+            schema_dict[vol.Optional(key_str, description={"suggested_value": suggested})] = selector_config
+            continue
+        if current_value is None and hasattr(key_obj, "default") and key_obj.default is not vol.UNDEFINED:
+            current_value = key_obj.default() if callable(key_obj.default) else key_obj.default
+        schema_dict[vol.Required(key_str, default=current_value)] = selector_config
+    return vol.Schema(schema_dict)
+
+
 def _validate_input(user_input: dict, schema: vol.Schema) -> dict:
     """Validate user input against schema, clean up empty optional fields."""
-    validated_input = schema(user_input)
+    validated_input = schema(_normalize_lists(user_input))
     cleaned_input = validated_input.copy()
 
     for key_marker in schema.schema:
@@ -380,18 +432,35 @@ class AdaptiveThermostatConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         return self.async_create_entry(title=final_data[CONF_NAME], data=final_data)
 
     async def async_step_reconfigure(self, user_input: dict[str, Any] | None = None) -> ConfigFlowResult:
-        """Handle reconfiguration of the integration."""
+        """Handle reconfiguration of the integration.
+
+        Steps: reconfigure_name_setup -> reconfigure_zone_setup ->
+        [reconfigure_timing_setup, only with a central heater] ->
+        reconfigure_auto_onoff_setup -> reconfigure_adaptive_setup ->
+        reconfigure_presets_setup.  Every field defaults to the entry's
+        current value, so ``{}`` keeps a step unchanged.
+        """
         config_entry = self._get_reconfigure_entry()
 
         _LOGGER.info(f"[RECONFIGURE] Starting full reconfiguration for {config_entry.title}")
 
-        # Initialize with current config data for reconfiguration
-        self._config_data = dict(config_entry.data)
+        # Current configuration as the zone runs it (options written by the
+        # 1.x options flow override data); saved back into data at the end.
+        self._config_data = {**config_entry.data, **config_entry.options}
 
         _LOGGER.debug(f"[RECONFIGURE] Current config data: {self._config_data}")
 
         # Always start with name setup for full reconfiguration
         return await self.async_step_reconfigure_name_setup()
+
+    @staticmethod
+    def _invalid_errors(step: str, err: vol.MultipleInvalid) -> dict[str, str]:
+        _LOGGER.error(f"Validation error in reconfigure {step}: {err}")
+        errors: dict[str, str] = {}
+        for error in err.errors:
+            path = error.path[0] if error.path else "base"
+            errors[path if isinstance(path, str) else "base"] = "invalid_input"
+        return errors
 
     async def async_step_reconfigure_name_setup(
         self, user_input: dict[str, Any] | None = None
@@ -400,45 +469,28 @@ class AdaptiveThermostatConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         config_entry = self._get_reconfigure_entry()
         errors: dict[str, str] = {}
 
-        _LOGGER.info(f"[RECONFIGURE] Name setup step for {config_entry.title}")
-
         if user_input is not None:
-            _LOGGER.debug(f"[RECONFIGURE] Name setup received input: {user_input}")
             try:
                 validated_input = _validate_input(user_input, STEP_USER_DATA_SCHEMA)
                 self._config_data.update(validated_input)
-
-                _LOGGER.info("[RECONFIGURE] Name updated, proceeding to zone setup")
-                # Always continue to zone setup
                 return await self.async_step_reconfigure_zone_setup()
-
-            except vol.MultipleInvalid as e:
-                _LOGGER.error(f"Validation error in reconfigure name setup: {e}")
-                for error in e.errors:
-                    path = error.path[0] if error.path else "base"
-                    errors[path if isinstance(path, str) else "base"] = "invalid_input"
+            except vol.MultipleInvalid as err:
+                errors = self._invalid_errors("name setup", err)
             except Exception:  # pylint: disable=broad-except
                 _LOGGER.exception("Unexpected exception in reconfigure name setup")
                 errors["base"] = "unknown"
 
-        # Create simple schema with current name
-        current_data = config_entry.data
-        current_name = current_data.get(CONF_NAME, config_entry.title)
-
-        _LOGGER.debug(f"[RECONFIGURE] Showing name form with current name: {current_name}")
-
-        schema_dict = {vol.Required(CONF_NAME, default=current_name): str}
-
+        current = {CONF_NAME: config_entry.title, **self._config_data}
         return self.async_show_form(
             step_id="reconfigure_name_setup",
-            data_schema=vol.Schema(schema_dict),
+            data_schema=_schema_with_current(STEP_USER_DATA_SCHEMA, current),
             errors=errors,
         )
 
     async def async_step_reconfigure_zone_setup(
         self, user_input: dict[str, Any] | None = None
     ) -> ConfigFlowResult:
-        """Handle reconfiguration of zone setup."""
+        """Handle reconfiguration of zone setup (entities, contacts, linked zones)."""
         config_entry = self._get_reconfigure_entry()
         errors: dict[str, str] = {}
 
@@ -454,48 +506,29 @@ class AdaptiveThermostatConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                 # Check if central heater is configured to determine next step
                 central_heater = self._config_data.get(CONF_CENTRAL_HEATER)
                 if central_heater and central_heater.strip():  # Only if central heater is actually selected
-                    _LOGGER.debug(
-                        f"[RECONFIGURE] Central heater configured: {central_heater}, showing timing setup"
-                    )
                     return await self.async_step_reconfigure_timing_setup()
-                else:
-                    _LOGGER.debug("[RECONFIGURE] No central heater configured, skipping timing setup")
-                    return await self.async_step_reconfigure_auto_onoff_setup()
-
-            except vol.MultipleInvalid as e:
-                _LOGGER.error(f"Validation error in reconfigure zone setup: {e}")
-                for error in e.errors:
-                    path = error.path[0] if error.path else "base"
-                    errors[path if isinstance(path, str) else "base"] = "invalid_input"
+                return await self.async_step_reconfigure_auto_onoff_setup()
+            except vol.MultipleInvalid as err:
+                errors = self._invalid_errors("zone setup", err)
             except Exception:  # pylint: disable=broad-except
                 _LOGGER.exception("Unexpected exception in reconfigure zone setup")
                 errors["base"] = "unknown"
 
-        # Pre-populate form with current values
-        current_data = config_entry.data
-        schema_dict = {}
-
-        for key_obj, selector_config in STEP_ZONE_DATA_SCHEMA.schema.items():
-            key_str = key_obj.schema if isinstance(key_obj, vol.Marker) else key_obj
-            current_value = current_data.get(key_str)
-
-            if isinstance(key_obj, vol.Optional):
-                schema_dict[vol.Optional(key_str, description={"suggested_value": current_value or ""})] = (
-                    selector_config
-                )
-            else:
-                default_value = current_value
-                if (
-                    default_value is None
-                    and hasattr(key_obj, "default")
-                    and key_obj.default is not vol.UNDEFINED
-                ):
-                    default_value = key_obj.default() if callable(key_obj.default) else key_obj.default
-                schema_dict[vol.Required(key_str, default=default_value)] = selector_config
-
+        # A zone cannot be linked to itself.
+        own_entity = self.hass.data.get(DOMAIN, {}).get("entry_to_entity_id", {}).get(config_entry.entry_id)
+        linked_selector = selector.EntitySelector(
+            selector.EntitySelectorConfig(
+                domain=["climate"],
+                integration=DOMAIN,
+                multiple=True,
+                exclude_entities=[own_entity] if own_entity else [],
+            )
+        )
         return self.async_show_form(
             step_id="reconfigure_zone_setup",
-            data_schema=vol.Schema(schema_dict),
+            data_schema=_schema_with_current(
+                STEP_ZONE_DATA_SCHEMA, self._config_data, {CONF_LINKED_WINDOW_ZONES: linked_selector}
+            ),
             errors=errors,
         )
 
@@ -503,7 +536,6 @@ class AdaptiveThermostatConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         self, user_input: dict[str, Any] | None = None
     ) -> ConfigFlowResult:
         """Handle reconfiguration of central heater timing."""
-        config_entry = self._get_reconfigure_entry()
         errors: dict[str, str] = {}
 
         if user_input is not None:
@@ -511,31 +543,15 @@ class AdaptiveThermostatConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                 validated_input = _validate_input(user_input, STEP_TIMING_SCHEMA)
                 self._config_data.update(validated_input)
                 return await self.async_step_reconfigure_auto_onoff_setup()
-            except vol.MultipleInvalid as e:
-                _LOGGER.error(f"Validation error in reconfigure timing setup: {e}")
-                for error in e.errors:
-                    path = error.path[0] if error.path else "base"
-                    errors[path if isinstance(path, str) else "base"] = "invalid_input"
+            except vol.MultipleInvalid as err:
+                errors = self._invalid_errors("timing setup", err)
             except Exception:  # pylint: disable=broad-except
                 _LOGGER.exception("Unexpected exception in reconfigure timing setup")
                 errors["base"] = "unknown"
 
-        # Pre-populate form with current values or defaults
-        current_data = config_entry.data
-        schema_dict = {}
-        for key_obj, selector_config in STEP_TIMING_SCHEMA.schema.items():
-            key_str = key_obj.schema if isinstance(key_obj, vol.Marker) else key_obj
-            current_value = current_data.get(key_str)
-
-            # Use current value or fall back to schema default
-            if current_value is None and hasattr(key_obj, "default") and key_obj.default is not vol.UNDEFINED:
-                current_value = key_obj.default() if callable(key_obj.default) else key_obj.default
-
-            schema_dict[vol.Required(key_str, default=current_value)] = selector_config
-
         return self.async_show_form(
             step_id="reconfigure_timing_setup",
-            data_schema=vol.Schema(schema_dict),
+            data_schema=_schema_with_current(STEP_TIMING_SCHEMA, self._config_data),
             errors=errors,
         )
 
@@ -543,7 +559,6 @@ class AdaptiveThermostatConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         self, user_input: dict[str, Any] | None = None
     ) -> ConfigFlowResult:
         """Handle reconfiguration of auto on/off settings."""
-        config_entry = self._get_reconfigure_entry()
         errors: dict[str, str] = {}
 
         if user_input is not None:
@@ -551,31 +566,15 @@ class AdaptiveThermostatConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                 validated_input = _validate_input(user_input, STEP_AUTO_ONOFF_SCHEMA)
                 self._config_data.update(validated_input)
                 return await self.async_step_reconfigure_adaptive_setup()
-            except vol.MultipleInvalid as e:
-                _LOGGER.error(f"Validation error in reconfigure auto on/off setup: {e}")
-                for error in e.errors:
-                    path = error.path[0] if error.path else "base"
-                    errors[path if isinstance(path, str) else "base"] = "invalid_input"
+            except vol.MultipleInvalid as err:
+                errors = self._invalid_errors("auto on/off setup", err)
             except Exception:  # pylint: disable=broad-except
                 _LOGGER.exception("Unexpected exception in reconfigure auto on/off setup")
                 errors["base"] = "unknown"
 
-        # Pre-populate form with current values or defaults
-        current_data = config_entry.data
-        schema_dict = {}
-        for key_obj, selector_config in STEP_AUTO_ONOFF_SCHEMA.schema.items():
-            key_str = key_obj.schema if isinstance(key_obj, vol.Marker) else key_obj
-            current_value = current_data.get(key_str)
-
-            # Use current value or fall back to schema default
-            if current_value is None and hasattr(key_obj, "default") and key_obj.default is not vol.UNDEFINED:
-                current_value = key_obj.default() if callable(key_obj.default) else key_obj.default
-
-            schema_dict[vol.Required(key_str, default=current_value)] = selector_config
-
         return self.async_show_form(
             step_id="reconfigure_auto_onoff_setup",
-            data_schema=vol.Schema(schema_dict),
+            data_schema=_schema_with_current(STEP_AUTO_ONOFF_SCHEMA, self._config_data),
             errors=errors,
         )
 
@@ -583,7 +582,6 @@ class AdaptiveThermostatConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         self, user_input: dict[str, Any] | None = None
     ) -> ConfigFlowResult:
         """Handle reconfiguration of adaptive control settings."""
-        config_entry = self._get_reconfigure_entry()
         errors: dict[str, str] = {}
 
         if user_input is not None:
@@ -591,29 +589,15 @@ class AdaptiveThermostatConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                 validated_input = _validate_input(user_input, STEP_ADAPTIVE_SCHEMA)
                 self._config_data.update(validated_input)
                 return await self.async_step_reconfigure_presets_setup()
-            except vol.MultipleInvalid as e:
-                _LOGGER.error(f"Validation error in reconfigure adaptive setup: {e}")
-                for error in e.errors:
-                    path = error.path[0] if error.path else "base"
-                    errors[path if isinstance(path, str) else "base"] = "invalid_input"
+            except vol.MultipleInvalid as err:
+                errors = self._invalid_errors("adaptive setup", err)
             except Exception:  # pylint: disable=broad-except
                 _LOGGER.exception("Unexpected exception in reconfigure adaptive setup")
                 errors["base"] = "unknown"
 
-        current_data = config_entry.data
-        schema_dict = {}
-        for key_obj, selector_config in STEP_ADAPTIVE_SCHEMA.schema.items():
-            key_str = key_obj.schema if isinstance(key_obj, vol.Marker) else key_obj
-            current_value = current_data.get(key_str)
-
-            if current_value is None and hasattr(key_obj, "default") and key_obj.default is not vol.UNDEFINED:
-                current_value = key_obj.default() if callable(key_obj.default) else key_obj.default
-
-            schema_dict[vol.Required(key_str, default=current_value)] = selector_config
-
         return self.async_show_form(
             step_id="reconfigure_adaptive_setup",
-            data_schema=vol.Schema(schema_dict),
+            data_schema=_schema_with_current(STEP_ADAPTIVE_SCHEMA, self._config_data),
             errors=errors,
         )
 
@@ -628,36 +612,28 @@ class AdaptiveThermostatConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             try:
                 validated_input = _validate_input(user_input, STEP_PRESETS_SCHEMA)
                 self._config_data.update(validated_input)
+                self._config_data = _normalize_lists(self._config_data)
 
                 # Complete reconfiguration; the entry's update listener reloads it.
+                if config_entry.options:
+                    # Fold legacy options into data so the new values take effect.
+                    return self.async_update_and_abort(
+                        config_entry,
+                        data={**config_entry.data, **self._config_data},
+                        options={},
+                    )
                 return self.async_update_and_abort(
                     config_entry,
                     data_updates=self._config_data,
                 )
-            except vol.MultipleInvalid as e:
-                _LOGGER.error(f"Validation error in reconfigure presets setup: {e}")
-                for error in e.errors:
-                    path = error.path[0] if error.path else "base"
-                    errors[path if isinstance(path, str) else "base"] = "invalid_input"
+            except vol.MultipleInvalid as err:
+                errors = self._invalid_errors("presets setup", err)
             except Exception:  # pylint: disable=broad-except
                 _LOGGER.exception("Unexpected exception in reconfigure presets setup")
                 errors["base"] = "unknown"
 
-        # Pre-populate form with current values or defaults
-        current_data = config_entry.data
-        schema_dict = {}
-        for key_obj, selector_config in STEP_PRESETS_SCHEMA.schema.items():
-            key_str = key_obj.schema if isinstance(key_obj, vol.Marker) else key_obj
-            current_value = current_data.get(key_str)
-
-            # Use current value or fall back to schema default
-            if current_value is None and hasattr(key_obj, "default") and key_obj.default is not vol.UNDEFINED:
-                current_value = key_obj.default() if callable(key_obj.default) else key_obj.default
-
-            schema_dict[vol.Required(key_str, default=current_value)] = selector_config
-
         return self.async_show_form(
             step_id="reconfigure_presets_setup",
-            data_schema=vol.Schema(schema_dict),
+            data_schema=_schema_with_current(STEP_PRESETS_SCHEMA, self._config_data),
             errors=errors,
         )
