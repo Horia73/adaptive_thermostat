@@ -48,14 +48,16 @@ unchanged; options added in 2.0 use the defaults below until you change them.
 |---|---|---|---|
 | Zone | Zone heater/valve(s) | - | `valve`, `switch`, `input_boolean` or `climate`; several valves per zone are supported |
 | | Central heater (boiler) | - | optional `switch`/`input_boolean`/`climate`; zones sharing it are coordinated |
-| | Temperature, outdoor, backup outdoor, humidity, door/window, motion sensors | - | as before |
+| | Temperature, outdoor, backup outdoor, humidity, motion sensors | - | as before |
+| | **Window/door contact sensor(s)** *(2.1: several allowed)* | - | see [windows and contacts](#windows-contacts-and-linked-zones) |
+| | **Linked window zones** *(2.1)* | - | other Adaptive Thermostat zones; see [linked zones](#windows-contacts-and-linked-zones) |
 | Timing | Turn-on delay | 10 s | boiler starts this long after the valves are confirmed open |
 | | Turn-off delay | 120 s | pump overrun: the last zone's valves stay open this long after the boiler stops |
 | | **Boiler minimum on time** *(2.0)* | 120 s | anti short-cycling (largest value of all zones on that boiler wins) |
 | | **Boiler minimum off time** *(2.0)* | 180 s | anti short-cycling |
 | Auto on/off | Enable, on below, off above | off, 10 °C, 18 °C | uses a 20-minute time-based filter of the outdoor temperature |
 | Adaptive | Target tolerance | 0.1 °C | comfort band half-width (now actually used, it was ignored in 1.x) |
-| | Window detection, slope threshold | off, 2.5 °C/h | see [window detection](#window-detection) |
+| | Window detection, slope threshold | off, 2.5 °C/h | slope autodetection only, see [window detection](#window-detection) |
 | | **Stale sensor timeout** *(2.0)* | 180 min | see [safety](#safety-and-faults) |
 | | **Minimum burst** *(2.0)* | 120 s | shortest heat time per burst |
 | | **Maximum burst** *(2.0)* | 45 min | longest heat time per burst |
@@ -163,7 +165,8 @@ the parameters from **every** sensor report:
   was not heated recently, wide right after heating), a trust region on every
   parameter step, a floor on parameter uncertainty (a disturbed episode cannot
   lock the model onto wrong values), physical bounds;
-* learning stops during window events, sensor or actuator faults, when heat
+* learning stops during window events (own window or a linked zone's, and
+  for 30 minutes after they end), sensor or actuator faults, when heat
   produced no response, and for 15 minutes after mode changes and start-up.
 
 The **model confidence** combines the uncertainty of the heat delivered by a
@@ -216,8 +219,32 @@ below the window maximum, and a fall back from a short heat spike (oven,
 shower) is ignored unless it goes below the pre-spike level.  The alert clears
 when the temperature stops falling (slope >= -0.3 °C/h over 15 min) or after
 2 hours; `dismiss_window_alert` clears it and keeps the detector quiet for 30
-minutes.  A configured door/window contact sensor opens/closes the alert
-directly (only when window detection is enabled, as in 1.x).
+minutes.  *Window detection* enables only this slope autodetection; contact
+sensors work regardless (below).
+
+### Windows, contacts and linked zones
+
+* **Contact sensors** (one or several `binary_sensor`s per zone): the window is
+  open while any available contact is on.  Opening stops heating immediately
+  (valves closed, boiler demand dropped); closing resumes normal control at
+  once (the usual lock-out after a burst that was cut short still applies).
+  Contacts never time out and raise no alert to dismiss.  While at least one
+  contact reports, the slope autodetection is off for the zone.  If all of
+  them are unavailable/unknown, the zone falls back to the autodetection (if
+  enabled) and shows `window_contacts_unavailable: true`.
+* **Linked window zones**: a zone without a window of its own (a corridor
+  between rooms) stops heating while any linked zone's *own* window is open -
+  its contacts, or its autodetection if it has none.  Only a zone's own state
+  propagates, never its linked state, so there are no chains or cycles.  Linked
+  zones that are unavailable or not loaded yet count as closed.  The zone's own
+  contacts/autodetection keep working independently.
+
+Attributes: `window_open_detected` (own window only), `window_source`
+(`contact`, `autodetect` or `none`: what decides the own window right now),
+`window_contacts_unavailable`, `linked_window_open`,
+`linked_window_open_zones` (entity IDs), and `control_reason` says why heating
+is blocked (`window open (contact)`, `window open (autodetect)`,
+`linked window open: climate.living, ...`).
 
 ## Entities, attributes and services
 
@@ -249,7 +276,7 @@ Tail Duration, Cycle Time To Target (existing entity IDs kept), Heater Active
   zone (fallback control is used until it is relearned).
 
 A logbook entry is written for every real heating start/stop, for window
-detections and for corrected valve drift.
+detections and contact openings, and for corrected valve drift.
 
 ## Upgrading from 1.x and rollback
 

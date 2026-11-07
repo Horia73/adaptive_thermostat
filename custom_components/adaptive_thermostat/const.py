@@ -36,6 +36,9 @@ CONF_MIN_BURST = "min_burst_seconds"
 CONF_MAX_BURST = "max_burst_minutes"
 CONF_MODEL_CONTROL = "model_control_enabled"
 
+# Added in 2.1
+CONF_LINKED_WINDOW_ZONES = "linked_window_zones"
+
 # Default values
 DEFAULT_NAME = "Adaptive Thermostat"
 DEFAULT_HOME_PRESET = 23.0
