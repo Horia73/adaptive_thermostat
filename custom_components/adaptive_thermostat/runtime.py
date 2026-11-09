@@ -141,6 +141,10 @@ PRESETS = ("sleep", "home", "away")
 DIAGNOSTIC_WRITE_INTERVAL = 900.0
 
 
+def _round_or_none(value: float | None, digits: int) -> float | None:
+    return round(value, digits) if value is not None else None
+
+
 def _clamp(value: float, low: float, high: float) -> float:
     return max(low, min(high, value))
 
@@ -681,8 +685,10 @@ class ZoneRuntime:
             core.set_start_conditions(
                 self.coordinator.start_delay(now, self.turn_on_delay), self.coordinator.shared_duty()
             )
+            core.set_boiler_firing(bool(self.coordinator.actual_on))
         else:
             core.set_start_conditions(25.0, 0.0)
+            core.set_boiler_firing(False)
         status = core.update(now)
         self.status = status
         if status.window_event is not None:
@@ -1019,6 +1025,15 @@ class ZoneRuntime:
         out["heat_flowing"] = bool(status and status.heat_flowing)
         out["learning"] = bool(status and status.learning)
         out["control_reason"] = status.reason if status else None
+        # Reading-space band of the model controller: heat is requested before
+        # the room would fall below ``heat_trigger_below``; bursts aim their
+        # peak at ``aim_peak``; ``min_burst_rise`` is the lift of the smallest
+        # burst and ``band_feasible`` whether target +/- tolerance can be held.
+        out["heat_trigger_below"] = _round_or_none(status.heat_trigger_below if status else None, 2)
+        out["aim_peak"] = _round_or_none(status.aim_peak if status else None, 2)
+        out["min_burst_rise"] = _round_or_none(status.min_burst_rise if status else None, 2)
+        out["band_feasible"] = status.band_feasible if status else None
+        out["trigger_correction"] = round(core.trigger_correction, 3)
         out["temperature_slope_instant_per_hour"] = round(status.slope_instant, 3) if status else 0.0
         out["temperature_slope_per_hour"] = round(status.slope_hourly, 3) if status else 0.0
         out["current_outdoor_temp"] = self.current_outdoor

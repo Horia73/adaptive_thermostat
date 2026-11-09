@@ -13,13 +13,18 @@ Everything here is plain Python so the harness runs without Home Assistant.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import UTC, datetime
 import json
 import os
 from pathlib import Path
 from typing import Any
 
 EXPORT_ENV = "ADAPTIVE_THERMOSTAT_EXPORT"
+# The 15-25 Oct 2026 export of the old (1.x) controller: the replay tests'
+# legacy thresholds (window detections old vs new, frozen birou sensor, baie_2
+# valve drift) were calibrated on it.
+LEGACY_EXPORT_ENV = "ADAPTIVE_THERMOSTAT_LEGACY_EXPORT"
+LEGACY_END = datetime(2026, 10, 27, tzinfo=UTC).timestamp()  # 2.0 went live after this
 UNAVAILABLE = ("unavailable", "unknown", "")
 
 
@@ -83,6 +88,23 @@ def find_export(explicit: str | os.PathLike[str] | None = None) -> Path | None:
     return None
 
 
+def is_legacy_export(export: Export) -> bool:
+    """True for an export recorded entirely with the old (pre-2.0) controller."""
+    return export.end < LEGACY_END
+
+
+def find_legacy_export() -> Path | None:
+    """The old-controller export: ``$ADAPTIVE_THERMOSTAT_LEGACY_EXPORT``, else ``find_export()`` if legacy."""
+    explicit = os.environ.get(LEGACY_EXPORT_ENV)
+    if explicit:
+        given = Path(explicit)
+        return given if (given / "raw_noattr.json").is_file() else None
+    found = find_export()
+    if found is None:
+        return None
+    return found if is_legacy_export(load_export(found)) else None
+
+
 def _dedupe(series: list[tuple[float, Any]]) -> list[tuple[float, Any]]:
     """Sort by time and drop consecutive duplicates (keeps the first occurrence)."""
     series.sort(key=lambda item: item[0])
@@ -107,6 +129,8 @@ def load_export(path: str | os.PathLike[str]) -> Export:
     start = float("inf")
     end = float("-inf")
     for climate_id, cfg in config.items():
+        if not isinstance(cfg, dict) or not cfg.get("temp_sensor_entity_id"):
+            continue  # not a zone (e.g. extra metadata stored next to the zones)
         zone = ZoneHistory(
             climate_id=climate_id,
             temp_sensor=cfg["temp_sensor_entity_id"],
@@ -137,7 +161,7 @@ def load_export(path: str | os.PathLike[str]) -> Export:
                 start = min(start, series[0][0])
                 end = max(end, series[-1][0])
         zones[climate_id] = zone
-    climate_raw = [_ts(t) for cid in config for t, _ in raw.get(cid, [])[-1:]]
+    climate_raw = [_ts(t) for cid in zones for t, _ in raw.get(cid, [])[-1:]]
     if climate_raw:
         end = max(end, *climate_raw)
     return Export(zones=zones, start=start, end=end)

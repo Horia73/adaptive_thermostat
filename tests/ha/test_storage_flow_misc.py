@@ -273,8 +273,14 @@ async def test_card_contract_and_recorder_footprint(hass: HomeAssistant, plant: 
         "predicted_peak",
         "heater_entity_ids",
         "control_reason",
+        "heat_trigger_below",
+        "aim_peak",
+        "min_burst_rise",
+        "band_feasible",
+        "trigger_correction",
     ):
         assert key in unrecorded
+        assert key in state.attributes, key
     for key in ("fault", "fault_message", "valve_error", "window_alert", "temperature"):
         assert key not in unrecorded
     assert "last_updated" not in state.attributes

@@ -243,6 +243,11 @@ class ZoneEstimator:
         return self.x[IT]
 
     @property
+    def temperature_sd(self) -> float:
+        """Standard deviation of the room temperature estimate (K)."""
+        return math.sqrt(max(0.0, self.p[IT][IT]))
+
+    @property
     def flux(self) -> float:
         return self.x[IQ]
 

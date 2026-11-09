@@ -56,7 +56,7 @@ unchanged; options added in 2.0 use the defaults below until you change them.
 | | **Boiler minimum on time** *(2.0)* | 120 s | anti short-cycling (largest value of all zones on that boiler wins) |
 | | **Boiler minimum off time** *(2.0)* | 180 s | anti short-cycling |
 | Auto on/off | Enable, on below, off above | off, 10 °C, 18 °C | uses a 20-minute time-based filter of the outdoor temperature |
-| Adaptive | Target tolerance | 0.1 °C | comfort band half-width (now actually used, it was ignored in 1.x) |
+| Adaptive | Target tolerance | 0.1 °C | comfort band half-width *of the displayed reading* (2.2: see [tight band](#tight-band-in-reading-space-22)) |
 | | Window detection, slope threshold | off, 2.5 °C/h | slope autodetection only, see [window detection](#window-detection) |
 | | **Stale sensor timeout** *(2.0)* | 180 min | see [safety](#safety-and-faults) |
 | | **Minimum burst** *(2.0)* | 120 s | shortest heat time per burst |
@@ -157,7 +157,11 @@ the parameters from **every** sensor report:
 * irregular sampling needs no special handling: the filter advances with the
   exact model to each event, splitting at actuator changes;
 * reports are 0.1 °C-quantised; a report that jumps by >= 0.15 °C is a
-  threshold crossing and is corrected to the bin edge;
+  threshold crossing and is corrected to the bin edge; *(2.2)* after every
+  changed report the estimate is also kept inside the reported bin (+/-0.06
+  °C), because the installation's sensors report single 0.1 °C steps only with
+  their 30-minute periodic report, so a new value is not necessarily a fresh
+  crossing;
 * silence is information: a report-on-change sensor that stays quiet keeps the
   estimate inside a +/-0.15 °C band (inequality pseudo-measurement, applied only
   when the estimate leaves the band);
@@ -178,13 +182,17 @@ correction of predicted peaks.
 ### Controller
 
 * **Model control** (confidence >= 60 %, back to fallback below 40 %): every
-  tick it simulates "fire now" and "fire in 10 minutes".  If waiting would let
-  the room drop below the band, it fires; the burst is the shortest one whose
-  predicted peak *including the radiator tail and pump overrun* reaches the
-  target.  The firing level is set half a minimum-burst rise below the target
-  so the oscillation is centred.  While heating it re-plans and stops as soon
-  as the predicted peak reaches the target.  After a burst it waits for the
-  predicted tail before firing again (unless the room is 0.6 °C below target).
+  tick it simulates "fire after a short lookahead" (start delay of the boiler
+  included).  If waiting would let the predicted minimum drop below the
+  trigger level, it fires; the burst is the shortest one whose predicted peak
+  *including the radiator tail and pump overrun* reaches the aim.  Both levels
+  are defined on what the sensor will display, see
+  [tight band](#tight-band-in-reading-space-22).  While heating it re-plans
+  and stops as soon as the predicted peak reaches the aim.  After a burst it
+  waits for the predicted tail before firing again (unless the room is 0.6 °C
+  below target).  While the shared boiler already fires for another zone, a
+  zone that will need heat within 20 minutes joins in (*piggyback*), with a
+  burst that may be as short as 60 s: one boiler start serves both zones.
 * **Fallback** (fresh install, after a model reset, or when disabled): fire
   at `target - tolerance`, burst length proportional to the error, long
   lock-out after each burst, early stop at `target + tolerance`, and a relay
@@ -192,6 +200,38 @@ correction of predicted peaks.
   them after an overshoot.  It is what the model learns from on day one.
 * Limits: minimum/maximum burst, minimum off time, valve travel, boiler delays
   and anti short-cycling.  Heat time counts only while heat actually flows.
+
+### Tight band in reading space (2.2)
+
+The goal is that the **displayed** temperature stays within `target +/-
+tolerance` (23 +/- 0.1: readings 22.9-23.1).  A 0.1 °C sensor shows 22.9 while
+the room is 22.85-22.95, so the room may move between a floor of
+`target - tolerance - 0.05` and a ceiling of `target + tolerance + 0.05`
+(22.85-23.15, a 0.3 K window):
+
+* **Trigger** (`heat_trigger_below`) = floor + 0.01 + half the estimator's
+  temperature uncertainty (it grows while the sensor is silent, up to +0.06 K)
+  + a learned correction (`trigger_correction`, +0.02 K whenever a reading
+  below the band still appears after a burst the controller timed itself,
+  -0.002 K after each clean one, at most 0.1 K).  Heat is requested when the
+  predicted minimum, including the boiler's start delay and five minutes of
+  lookahead, would fall below it.
+* **Aim** (`aim_peak`): the burst is sized so the predicted peak reaches the
+  target.  Simulations of the installation showed that aiming higher inside
+  [target, target + tolerance] puts too many peaks above the band (peaks
+  scatter by about 0.1 K and passive gains only push upwards).
+* **Feasibility** (`min_burst_rise`, `band_feasible`): if even the smallest
+  burst lifts the room by more than ceiling - trigger, the band cannot be
+  held.  The trigger is then lowered so that the unavoidable oscillation is
+  centred on the band (both edges exceeded by the same amount, never more
+  than 0.25 °C below the target), and `band_feasible` is false.
+* Time above the band caused by sun, neighbours, cooking or the shared pipes
+  is passive: without cooling no controller can remove it.
+
+[docs/TIGHT_BAND.md](docs/TIGHT_BAND.md) has the root-cause analysis of the
+09.11 living-room incident, the per-zone feasibility and the simulation
+results; `tools/tightband/report.py` reproduces them (and runs them on a
+recorder export).
 
 ### Safety and faults
 
@@ -255,7 +295,13 @@ card: `current_temperature`, `hvac_action`, `hvac_modes`, `min_temp`,
 `target_temp_step`, `friendly_name`, and new `fault` / `fault_message`.  Also
 `manual_override` and `zone_heater_on`.  Diagnostics (model confidence,
 predicted peak, planned burst, learned parameters, ...) are attributes too but
-are excluded from the recorder.  The climate now belongs to the zone's device
+are excluded from the recorder.  The card reads `heat_flowing`,
+`cycle_tail_duration_s`, `control_reason` and `predicted_peak`.  *(2.2)*
+`heat_trigger_below` (°C, heat is requested before the room would fall below
+it), `aim_peak` (°C, peak the burst is sized for), `min_burst_rise` (K, lift
+of the smallest burst), `band_feasible` and `trigger_correction` show the
+reading-space plan; the *Predicted peak* sensor carries `heat_trigger_below`
+and `aim_peak` as attributes too (that sensor is recorded).  The climate now belongs to the zone's device
 and supports `climate.turn_on` / `turn_off`.
 
 **Recorder footprint.**  1.x wrote the climate state every ~18 s with ~60
@@ -279,6 +325,11 @@ A logbook entry is written for every real heating start/stop, for window
 detections and contact openings, and for corrected valve drift.
 
 ## Upgrading from 1.x and rollback
+
+**2.1 -> 2.2.**  No migration: the learned models are kept, and the stored
+zone state gains one key (`trigger_correction`, starts at 0).  Rolling back to
+2.1.0 ignores that key.  Options are unchanged; the reading-space band uses
+the existing *Target tolerance*.
 
 **Upgrade.** Install 2.0.0 and restart.  The stored state
 (`.storage/adaptive_thermostat_runtime_state`) is migrated from version 1.1 to
@@ -321,7 +372,17 @@ uv pip install --python .venv "pytest-homeassistant-custom-component==0.13.374" 
   `--export DIR` or `ADAPTIVE_THERMOSTAT_EXPORT`; without one it exits (the
   full-export test is skipped).  `tests/fixtures/export_mini` is a small trimmed
   fixture used by the replay tests.  Results on the 9-zone, 10-day export are
-  in [docs/REPLAY.md](docs/REPLAY.md).
+  in [docs/REPLAY.md](docs/REPLAY.md).  The legacy thresholds of the replay
+  test belong to that 15-25 Oct export of the 1.x controller: point
+  `ADAPTIVE_THERMOSTAT_LEGACY_EXPORT` at it (`ADAPTIVE_THERMOSTAT_EXPORT` may
+  then be a newer export).
+* `tools/tightband/` - reading-space analysis and closed-loop comparison of
+  controller versions on the whole installation (rooms derived from the
+  learned models, the recorded sensors' report behaviour, shared boilers):
+  `report.py --export DIR --out OUT` measures the recorded history, calibrates
+  the simulator to it and compares the released controller with the current
+  one; `report.py --synthetic --out OUT` runs the scenario ensemble without
+  data.  See [docs/TIGHT_BAND.md](docs/TIGHT_BAND.md).
 
 ## Troubleshooting
 
