@@ -135,6 +135,7 @@ def test_zone_switched_off_gets_no_heat() -> None:
     plant.run(12)
     off_zone = plant.zones[1]
     off_zone.core.set_hvac(plant.t, False)
+    plant.wake()
     switched = plant.t
     plant.run(12)
     heated_after = sum(

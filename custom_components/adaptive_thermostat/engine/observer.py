@@ -11,7 +11,8 @@ inputs:
 * both from the *measured* actuator states, applied after a transport delay;
 * outdoor temperature through a time-based filter;
 * temperature reports as measurements (threshold crossings corrected to the
-  bin edge), and silence as a band constraint.
+  bin edge) plus a constraint to the reported 0.1 °C bin, and silence as a
+  band constraint.
 
 The caller (``ZoneCore`` or the replay harness) decides when learning is
 allowed by setting :attr:`ZoneObserver.learn_params` / :attr:`learn_d`.
@@ -42,6 +43,11 @@ class ObserverConfig:
     crossing_offset_large: float = 0.05
     crossing_offset_small: float = 0.025
     silence_half_width: float = 0.15  # K, band a silent sensor is assumed to stay in
+    # A report says the room is within half a display step of the value (plus
+    # sensor noise).  Many sensors report single steps only periodically, so
+    # a changed value is not necessarily a fresh crossing: after the soft
+    # measurement update the estimate is kept inside the reported bin.
+    report_half_width: float | None = 0.06
     silence_check_s: float = 600.0
     outdoor_tau_s: float = 1200.0
     default_outdoor: float = 10.0
@@ -196,6 +202,10 @@ class ZoneObserver:
             learn_d=self.learn_d,
             robust=not self.recently_heated(t),
         )
+        if self.config.report_half_width is not None:
+            est.apply_silence_bound(
+                t, value, self.config.report_half_width, learn_params=self.learn_params, learn_d=self.learn_d
+            )
         self._set_displayed(t, value)
         return innov
 

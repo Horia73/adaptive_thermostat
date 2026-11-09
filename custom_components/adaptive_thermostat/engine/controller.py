@@ -4,13 +4,47 @@ Hydronic radiators keep heating the room after the valve closes (the "tail"),
 so a thermostat that simply waits for the target overshoots.  This controller
 plans bursts by forward simulation of the zone model (receding horizon):
 
-*Idle* - simulate "fire now" and "fire in ``lookahead``".  If waiting would
-let the room drop below ``target - deadband`` (or it already is), fire now.
-The burst length is the shortest one whose predicted peak, including the
-residual tail and pump overrun, reaches the target.
+The band is defined on what the owner sees: a 0.1 °C sensor that shows
+``target - deadband`` while the room is at ``target - deadband - 0.05`` or
+warmer, and ``target + deadband`` up to ``target + deadband + 0.05``.  So the
+room may move between a *floor* and a *ceiling* half a display step outside
+``target +/- deadband`` (22.85 and 23.15 for 23 +/- 0.1)::
+
+    floor   = target - deadband - step/2 + margin
+    ceiling = target + deadband + step/2 - margin
+    aim     = target + aim_fraction * deadband      (default: the target)
+    trigger = floor + uncertainty + learned correction
+
+The aim stays at the target: simulations of the installation showed that
+aiming higher inside [target, target + deadband] puts more peaks above the
+band (peaks scatter by about 0.1 K and passive gains only push upwards).
+
+*Idle* - simulate "fire after a short lookahead" (start delay of the boiler
+included).  If waiting would let the predicted minimum drop below the
+trigger (or the room already is below it), fire now.  ``uncertainty`` is
+half the estimator's standard deviation of the room temperature: it grows
+while the sensor is silent (a held reading only says the room is within a
+display step of it), so the controller fires earlier the less it knows.  The
+learned correction raises the trigger when readings below the band still
+show up after bursts.  The burst length is the shortest one whose predicted
+peak, including the residual tail and pump overrun, reaches ``aim``.
+
+If even the smallest burst lifts the room by more than ``ceiling -
+trigger``, the band cannot be held: the trigger is lowered so that the
+oscillation is centred on the band and both edges are exceeded by the same
+amount (``band_feasible`` is false), never lower than ``max_lower_band``
+below the target.
+
+*Piggyback* - while the shared boiler already fires for another zone, a zone
+that will need heat within ``piggyback_window`` fires now if even the
+smallest burst keeps the peak within ``piggyback_above_aim`` of the aim: one
+boiler start serves both zones without pushing the room up early.  A
+burst started while the boiler fires may be as short as
+``piggyback_min_burst_s`` (a valve-level burst cannot add a boiler start; the
+boiler policy still enforces its minimum run).
 
 *Heating* - re-plan every tick: once stopping now is predicted to bring the
-peak to the target, stop (respecting the minimum burst).  The burst is never
+peak to ``aim``, stop (respecting the minimum burst).  The burst is never
 extended past the maximum, and a burst that is clearly not enough (room
 colder than predicted) may run up to it.
 
@@ -45,11 +79,20 @@ class ControllerConfig:
     min_burst_s: float = 120.0
     max_burst_s: float = 45 * 60.0
     min_off_s: float = 300.0
-    lookahead_s: float = 600.0
     horizon_s: float = 4 * 3600.0
-    aim_offset: float = 0.0  # K added to the target the peak should reach
+    aim_offset: float = 0.0  # K added to the peak aim
+    aim_fraction: float = 0.0  # peak aim = target + aim_fraction * deadband
     emergency_below: float = 0.6  # K below target that overrides the tail wait
-    max_lower_band: float = 0.25  # K, lowest trigger below target when centring
+    max_lower_band: float = 0.25  # K, lowest trigger below target when the band is infeasible
+    # Reading-space band (see module docstring).
+    reading_step: float = 0.1  # K, display resolution of the room sensor
+    band_margin: float = 0.01  # K kept inside the floor and the ceiling
+    trigger_lookahead_s: float = 300.0  # control steps, valve travel, boiler coordination
+    uncertainty_k: float = 0.5  # share of the temperature sd added to the trigger
+    max_uncertainty_margin: float = 0.06
+    piggyback_window_s: float = 1200.0  # join a running boiler if heat is due this soon
+    piggyback_above_aim: float = 0.05  # K the smallest piggyback burst may peak above the aim
+    piggyback_min_burst_s: float | None = 60.0  # shorter bursts on a running boiler (None = off)
     model_confidence_on: float = 0.6
     model_confidence_off: float = 0.4
     # Fallback controller
@@ -88,6 +131,14 @@ class ControlInput:
     # Offset-free correction: observed minus predicted burst peaks (median of
     # recent bursts), added to every predicted burst peak.
     peak_correction: float = 0.0
+    # Standard deviation of the room temperature estimate (K).
+    temp_sd: float = 0.0
+    # Learned trigger raise (K): readings below the band still appeared.
+    trigger_correction: float = 0.0
+    # The shared boiler is firing (for another zone when this one is idle).
+    boiler_firing: bool = False
+    # Minimum heat time of the active burst (None = the configured minimum).
+    burst_min_s: float | None = None
 
 
 @dataclass
@@ -102,6 +153,14 @@ class ControlDecision:
     tail_s: float | None = None
     time_to_peak_s: float | None = None
     reason: str = ""
+    # Reading-space plan (model mode): fire when the predicted minimum would
+    # drop below ``trigger``, burst aimed at ``aim``; ``min_rise`` is the
+    # lift of the smallest burst, ``feasible`` whether the band can be held.
+    trigger: float | None = None
+    aim: float | None = None
+    min_rise: float | None = None
+    feasible: bool | None = None
+    min_burst_s: float | None = None  # minimum heat time of a burst started now
 
 
 class BurstController:
@@ -148,7 +207,13 @@ class BurstController:
         return pred
 
     def burst_for_peak(
-        self, inp: ControlInput, *, delay_s: float, aim: float, already_s: float = 0.0
+        self,
+        inp: ControlInput,
+        *,
+        delay_s: float,
+        aim: float,
+        already_s: float = 0.0,
+        min_s: float | None = None,
     ) -> tuple[float, BurstPrediction]:
         """Shortest burst (>= min) whose predicted peak reaches ``aim``.
 
@@ -156,7 +221,7 @@ class BurstController:
         returned length is the *remaining* heat time.
         """
         cfg = self.config
-        lo = max(0.0, cfg.min_burst_s - already_s)
+        lo = max(0.0, (cfg.min_burst_s if min_s is None else min_s) - already_s)
         hi = max(lo, cfg.max_burst_s - already_s)
         pred_lo = self.predict(inp, delay_s=delay_s, burst_s=lo)
         if pred_lo.peak >= aim or hi <= lo:
@@ -183,32 +248,49 @@ class BurstController:
             return self._decide_model(inp)
         return self._decide_fallback(inp)
 
+    def band(self, inp: ControlInput) -> tuple[float, float, float]:
+        """``(floor, ceiling, aim)`` of the reading-space band (true temperature)."""
+        cfg = self.config
+        half_step = 0.5 * cfg.reading_step
+        floor = inp.target - inp.deadband - half_step + cfg.band_margin
+        ceiling = inp.target + inp.deadband + half_step - cfg.band_margin
+        aim = min(ceiling, inp.target + cfg.aim_fraction * inp.deadband + cfg.aim_offset)
+        return floor, ceiling, aim
+
+    def trigger_level(self, inp: ControlInput, floor: float) -> float:
+        """Floor raised by the estimate's uncertainty and the learned correction."""
+        cfg = self.config
+        uncertainty = min(cfg.max_uncertainty_margin, cfg.uncertainty_k * max(0.0, inp.temp_sd))
+        return floor + uncertainty + max(0.0, inp.trigger_correction)
+
     def _decide_model(self, inp: ControlInput) -> ControlDecision:
         cfg = self.config
         assert inp.state is not None
-        aim = inp.target + cfg.aim_offset
+        floor, ceiling, aim = self.band(inp)
         temp = inp.state.temp
         if inp.heating:
             elapsed = inp.heat_elapsed_s
+            min_s = cfg.min_burst_s if inp.burst_min_s is None else inp.burst_min_s
             stop_now = self.predict(inp, delay_s=0.0, burst_s=1e-3)
             decision = ControlDecision(
                 mode=MODE_MODEL,
                 predicted_peak=stop_now.peak,
                 tail_s=stop_now.tail_s,
                 time_to_peak_s=stop_now.peak_after_s,
+                aim=aim,
             )
             if elapsed >= cfg.max_burst_s:
                 decision.stop = True
                 decision.reason = "max burst"
                 return decision
-            if elapsed < cfg.min_burst_s:
+            if elapsed < min_s:
                 decision.reason = "min burst"
                 return decision
             if stop_now.peak >= aim:
                 decision.stop = True
-                decision.reason = "predicted peak reaches target"
+                decision.reason = "predicted peak reaches aim"
                 return decision
-            remaining, pred = self.burst_for_peak(inp, delay_s=0.0, aim=aim, already_s=elapsed)
+            remaining, pred = self.burst_for_peak(inp, delay_s=0.0, aim=aim, already_s=elapsed, min_s=min_s)
             decision.burst_s = elapsed + remaining
             decision.predicted_peak = pred.peak
             decision.tail_s = pred.tail_s
@@ -219,8 +301,24 @@ class BurstController:
         # Idle.
         free = self.predict(inp, delay_s=0.0, burst_s=0.0)
         decision = ControlDecision(
-            mode=MODE_MODEL, predicted_peak=free.peak, time_to_peak_s=free.peak_after_s
+            mode=MODE_MODEL, predicted_peak=free.peak, time_to_peak_s=free.peak_after_s, aim=aim
         )
+        delay = inp.start_delay_s
+        min_s = cfg.min_burst_s
+        if inp.boiler_firing and cfg.piggyback_min_burst_s is not None:
+            min_s = min(min_s, cfg.piggyback_min_burst_s)
+        # Lift of the smallest burst: from the dip while the heat arrives to
+        # the peak of its tail.
+        smallest = self.predict(inp, delay_s=delay, burst_s=min_s)
+        rise = max(0.0, smallest.peak - smallest.minimum)
+        trigger = self.trigger_level(inp, floor)
+        feasible = rise <= ceiling - trigger
+        if not feasible:
+            # Centre the unavoidable oscillation on the band.
+            trigger = max(inp.target - cfg.max_lower_band, 0.5 * (trigger + ceiling - rise))
+        decision.trigger = trigger
+        decision.min_rise = rise
+        decision.feasible = feasible
         if temp >= inp.target + inp.deadband:
             decision.reason = "above band"
             return decision
@@ -231,23 +329,31 @@ class BurstController:
         if not emergency and inp.last_burst_tail_until is not None and inp.now < inp.last_burst_tail_until:
             decision.reason = "waiting for tail"
             return decision
-        delay = inp.start_delay_s
-        # The shortest allowed burst lifts the room by some amount; centre the
-        # oscillation on the target by firing half that rise below it.
-        smallest = self.predict(inp, delay_s=delay, burst_s=cfg.min_burst_s)
-        rise = max(0.0, smallest.peak - free.peak)
-        low = inp.target - max(inp.deadband, min(cfg.max_lower_band, 0.5 * rise))
-        _later_len, later = self.burst_for_peak(inp, delay_s=delay + cfg.lookahead_s, aim=aim)
-        if later.minimum >= low and temp >= low:
-            decision.reason = "not needed yet"
-            return decision
-        burst, pred = self.burst_for_peak(inp, delay_s=delay, aim=aim)
+        _later_len, later = self.burst_for_peak(
+            inp, delay_s=delay + cfg.trigger_lookahead_s, aim=aim, min_s=min_s
+        )
+        reason = "fire"
+        if later.minimum >= trigger and temp >= trigger:
+            # Not needed yet; join a running boiler if heat is due soon anyway
+            # and even the smallest burst keeps the peak close to the aim.
+            if not (inp.boiler_firing and smallest.peak <= min(ceiling, aim + cfg.piggyback_above_aim)):
+                decision.reason = "not needed yet"
+                return decision
+            _soon_len, soon = self.burst_for_peak(
+                inp, delay_s=delay + cfg.piggyback_window_s, aim=aim, min_s=min_s
+            )
+            if soon.minimum >= trigger:
+                decision.reason = "not needed yet"
+                return decision
+            reason = "piggyback"
+        burst, pred = self.burst_for_peak(inp, delay_s=delay, aim=aim, min_s=min_s)
         decision.start = True
         decision.burst_s = burst
+        decision.min_burst_s = min_s
         decision.predicted_peak = pred.peak
         decision.tail_s = pred.tail_s
         decision.time_to_peak_s = pred.peak_after_s
-        decision.reason = "fire"
+        decision.reason = reason
         return decision
 
     def _decide_fallback(self, inp: ControlInput) -> ControlDecision:

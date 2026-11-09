@@ -11,8 +11,10 @@ the tests exercise robustness to model mismatch:
 * passive gains: sun (midday bell), random cooking/shower spikes, people;
 * daily outdoor temperature cycle with noise;
 * sensor: first-order lag, noise, 0.1 °C rounding, threshold reports (>= one
-  or two steps) with a minimum interval, 30-minute heartbeats that only show
-  up when the value changed, random drop-outs;
+  or two steps) with a minimum interval, 30-minute heartbeats, random
+  drop-outs; :func:`zigbee_sensor` reproduces the recorded behaviour of the
+  installation's sensors (single 0.1 °C steps only on the 30-minute periodic
+  report, 0.2 °C steps after >= 10 min, larger ones within a minute);
 * valves: 18 s travel (opening/closing states), random unavailable blips.
 
 The control side is the real engine: one :class:`ZoneCore` per zone, one
@@ -22,11 +24,14 @@ Home Assistant one (desired valve = want heat or overrun hold).
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass, field
 import math
 from pathlib import Path
 import random
 import sys
+from types import SimpleNamespace
+from typing import Any
 
 ENGINE_DIR = Path(__file__).resolve().parents[2] / "custom_components" / "adaptive_thermostat"
 if str(ENGINE_DIR) not in sys.path:
@@ -34,6 +39,12 @@ if str(ENGINE_DIR) not in sys.path:
 
 from engine.boiler import BoilerConfig, BoilerPolicy, ZoneReport  # noqa: E402
 from engine.zone import ZoneConfig, ZoneCore, ZoneStatus  # noqa: E402
+
+# The engine a plant drives (another engine version can be swapped in, e.g.
+# a released one for before/after comparisons).
+CURRENT_ENGINE = SimpleNamespace(
+    ZoneCore=ZoneCore, ZoneConfig=ZoneConfig, BoilerPolicy=BoilerPolicy, ZoneReport=ZoneReport
+)
 
 
 @dataclass
@@ -59,6 +70,13 @@ class RoomTruth:
     window_h: float = 120.0  # W/K extra loss while a window is open
     window_minutes: float = 10.0
     valves: int = 1
+    # Unmodelled random gains (people, appliances, sun behind clouds): an
+    # Ornstein-Uhlenbeck process with this spread (W) and correlation time.
+    noise_power: float = 0.0
+    noise_tau_s: float = 3600.0
+    # Sensor placement: share of the radiator's excess heat flux that the
+    # sensor sees on top of the room air (plume / proximity), in K per K/h.
+    sensor_plume: float = 0.0
 
 
 @dataclass
@@ -72,6 +90,34 @@ class SensorTruth:
     min_interval_s: float = 30.0
     dropout_rate_per_day: float = 1.0
     dropout_minutes: float = 8.0
+    # Periodic report: the sensor re-reports its value this long after its
+    # last report of any kind (unchanged values reach Home Assistant as
+    # "reported" events).  None = legacy behaviour (heartbeat_s clock).
+    periodic_s: float | None = None
+    # Larger steps are reported after a shorter minimum interval.
+    big_steps: int = 99
+    big_min_interval_s: float = 60.0
+
+
+def zigbee_sensor(**overrides: Any) -> SensorTruth:
+    """Report behaviour of the installation's room sensors (recorded history).
+
+    Single 0.1 °C steps appear only with the 30-minute periodic report, 0.2 °C
+    steps after at least ~10 minutes, 0.3 °C and more within a minute or two.
+    """
+    values: dict[str, Any] = {
+        "lag_s": 120.0,
+        "noise": 0.01,
+        "threshold_steps": 2,
+        "min_interval_s": 600.0,
+        "periodic_s": 1800.0,
+        "big_steps": 3,
+        "big_min_interval_s": 60.0,
+        "dropout_rate_per_day": 0.2,
+        "dropout_minutes": 5.0,
+    }
+    values.update(overrides)
+    return SensorTruth(**values)
 
 
 @dataclass
@@ -94,6 +140,7 @@ class ZoneSim:
     dropout_until: float = -1.0
     spike_until: float = -1.0
     window_until: float = -1.0
+    noise_gain: float = 0.0
     status: ZoneStatus | None = None
     log: list[tuple[float, float, float, bool, float]] = field(default_factory=list)
     bursts: list[tuple[float, float]] = field(default_factory=list)
@@ -101,6 +148,15 @@ class ZoneSim:
     heat_seconds: float = 0.0
     passive_events: list[tuple[float, float, str]] = field(default_factory=list)
     air_trace: list[tuple[float, float]] = field(default_factory=list)
+    # Reading-space history: every value Home Assistant shows (t, value or
+    # None) and every (t, target, heat mode on) change.
+    readings: list[tuple[float, float | None]] = field(default_factory=list)
+    setpoints: list[tuple[float, float, bool]] = field(default_factory=list)
+    # Burst requests: (t, displayed, estimate, true air, reason, trigger, aim).
+    fires: list[tuple[float, float | None, float, float, str, Any, Any]] = field(default_factory=list)
+    schedule: list[tuple[float, str, Any]] = field(default_factory=list)
+    window_open: bool = False
+    hvac_on: bool = True
 
 
 class Plant:
@@ -122,7 +178,13 @@ class Plant:
         turn_off_delay_s: float = 120.0,
         stored: dict[str, dict] | None = None,
         t0: float = 1_790_000_000.0,
+        engine: Any = None,
+        outdoor_fn: Callable[[float], float] | None = None,
+        schedules: dict[str, list[tuple[float, str, Any]]] | None = None,
+        zone_configs: dict[str, Any] | None = None,
     ) -> None:
+        self.engine = engine or CURRENT_ENGINE
+        self.outdoor_fn = outdoor_fn
         self.rng = random.Random(seed)
         self.t = t0
         self.t0 = t0
@@ -137,12 +199,12 @@ class Plant:
         self.boiler_switches: list[tuple[float, bool]] = []
         self.turn_on_delay_s = turn_on_delay_s
         self.turn_off_delay_s = turn_off_delay_s
-        self.policy = BoilerPolicy(config=boiler_config or BoilerConfig())
+        self.policy = self.engine.BoilerPolicy(config=boiler_config or BoilerConfig())
         self.policy.sync_actual(False, t0 - 3600.0)
         self.zones: list[ZoneSim] = []
         for room, sensor in rooms:
-            cfg = zone_config or ZoneConfig()
-            core = ZoneCore(cfg, stored=(stored or {}).get(room.name), now=t0)
+            cfg = (zone_configs or {}).get(room.name) or zone_config or self.engine.ZoneConfig()
+            core = self.engine.ZoneCore(cfg, stored=(stored or {}).get(room.name), now=t0)
             core.set_hvac(t0, True)
             core.set_target(target)
             zone = ZoneSim(
@@ -157,12 +219,16 @@ class Plant:
                 valve_move_until=[0.0] * room.valves,
                 valve_unavailable_until=[-1.0] * room.valves,
             )
+            zone.setpoints.append((t0, target, True))
+            zone.schedule = sorted((schedules or {}).get(room.name, []), key=lambda e: e[0])
             self.zones.append(zone)
         self._next_control = t0
         self._outdoor_reported: float | None = None
 
     # ------------------------------------------------------------ truth
     def outdoor(self, t: float) -> float:
+        if self.outdoor_fn is not None:
+            return self.outdoor_fn(t)
         hours = (t - self.t0) / 3600.0
         return self.outdoor_mean + self.outdoor_swing * math.sin(2 * math.pi * (hours - 9.0) / 24.0)
 
@@ -176,12 +242,16 @@ class Plant:
         pump = self.boiler_on or self.t < self.pump_until
         open_frac = sum(1.0 for s in z.valve_state if s in ("open", "closing")) / len(z.valve_state)
         flow = r.w_flow * open_frac if pump else 0.0
-        gains = r.base_gain + r.sun_peak * self._sun(self.t)
+        gains = r.base_gain + r.sun_peak * self._sun(self.t) + z.noise_gain
+        if r.noise_power > 0:
+            a = dt / r.noise_tau_s
+            z.noise_gain += -z.noise_gain * a + r.noise_power * math.sqrt(2 * a) * self.rng.gauss(0.0, 1.0)
         if self.t < z.spike_until:
             gains += r.spike_power
         if pump:
             gains += r.pipe_gain * max(0.0, (self.t_supply - z.t_air) / 40.0)
-        h_out = r.h_air_out + (r.window_h if self.t < z.window_until else 0.0)
+        window = self.t < z.window_until or z.window_open
+        h_out = r.h_air_out + (r.window_h if window else 0.0)
         q_emit = r.h_emitter * (z.t_emit - z.t_air)
         d_emit = (flow * (self.t_supply - z.t_emit) - q_emit) / r.c_emitter
         d_air = (q_emit - r.h_air_mass * (z.t_air - z.t_mass) - h_out * (z.t_air - t_out) + gains) / r.c_air
@@ -189,7 +259,8 @@ class Plant:
         z.t_emit += d_emit * dt
         z.t_air += d_air * dt
         z.t_mass += d_mass * dt
-        z.t_sensor += (z.t_air - z.t_sensor) * (1.0 - math.exp(-dt / z.sensor.lag_s))
+        seen = z.t_air + r.sensor_plume * max(0.0, q_emit) * 3600.0 / r.c_air
+        z.t_sensor += (seen - z.t_sensor) * (1.0 - math.exp(-dt / z.sensor.lag_s))
         # Random events.
         day = 86400.0
         if self.rng.random() < r.spike_rate_per_day * dt / day:
@@ -213,15 +284,35 @@ class Plant:
         if self.t < z.dropout_until:
             if z.reported is not None:
                 z.reported = None
+                z.readings.append((self.t, None))
                 z.core.on_temperature(self.t, None)
             return
         value = round(z.t_sensor + self.rng.gauss(0.0, s.noise), 1)
         if z.reported is None:
             z.reported = value
             z.last_report_t = self.t
+            z.last_heartbeat_t = self.t
+            z.readings.append((self.t, value))
             z.core.on_temperature(self.t, value)
             return
         steps = round(abs(value - z.reported) * 10)
+        if s.periodic_s is not None:
+            since = self.t - z.last_report_t
+            due = since >= s.periodic_s
+            if (
+                due
+                or (steps >= s.threshold_steps and since >= s.min_interval_s)
+                or (steps >= s.big_steps and since >= s.big_min_interval_s)
+            ):
+                z.last_report_t = self.t
+                z.last_heartbeat_t = self.t
+                if steps >= 1:
+                    z.reported = value
+                    z.readings.append((self.t, value))
+                    z.core.on_temperature(self.t, value)
+                else:
+                    z.core.on_temperature(self.t, value, reported_t=self.t)
+            return
         due_heartbeat = self.t - z.last_heartbeat_t >= s.heartbeat_s
         if (steps >= s.threshold_steps and self.t - z.last_report_t >= s.min_interval_s) or (
             due_heartbeat and steps >= 1
@@ -229,6 +320,7 @@ class Plant:
             z.reported = value
             z.last_report_t = self.t
             z.last_heartbeat_t = self.t
+            z.readings.append((self.t, value))
             z.core.on_temperature(self.t, value)
         elif due_heartbeat:
             z.last_heartbeat_t = self.t
@@ -252,10 +344,30 @@ class Plant:
                 z.valve_state[i] = "closing"
                 z.valve_move_until[i] = self.t + 18.0
 
+    def _apply_schedule(self, z: ZoneSim) -> None:
+        changed = False
+        while z.schedule and z.schedule[0][0] <= self.t:
+            _, kind, value = z.schedule.pop(0)
+            if kind == "target":
+                z.core.set_target(float(value))
+                changed = True
+            elif kind == "hvac":
+                z.hvac_on = bool(value)
+                z.core.set_hvac(self.t, z.hvac_on)
+                changed = True
+            elif kind == "window":
+                # A contact sensor: real extra loss, and the zone is told.
+                z.window_open = bool(value)
+                if hasattr(z.core, "set_window_contact"):
+                    z.core.set_window_contact(self.t, z.window_open)
+        if changed:
+            z.setpoints.append((self.t, z.core.target, z.hvac_on))
+
     def _control(self) -> None:
         t = self.t
         decisions: dict[str, ZoneStatus] = {}
         for z in self.zones:
+            self._apply_schedule(z)
             z.core.on_outdoor(t, round(self.outdoor(t), 1))
             frac = sum(1.0 for s in z.valve_state if s in ("open", "closing")) / len(z.valve_state)
             z.core.on_actuators(t, frac, self.boiler_on)
@@ -263,14 +375,30 @@ class Plant:
             if not self.boiler_on and self.policy.off_since is not None:
                 start_delay = max(start_delay, self.policy.off_since + self.policy.config.min_off_s - t)
             z.core.set_start_conditions(start_delay, 0.3)
+            if hasattr(z.core, "set_boiler_firing"):
+                z.core.set_boiler_firing(self.boiler_on)
+            was_active = bool(z.status and z.status.burst_active)
             status = z.core.update(t)
+            if status.burst_active and not was_active:
+                est = z.core.estimator
+                z.fires.append(
+                    (
+                        t,
+                        z.core.observer.displayed,
+                        est.temperature,
+                        z.t_air,
+                        status.reason,
+                        getattr(status, "heat_trigger_below", None),
+                        getattr(status, "aim_peak", None),
+                    )
+                )
             z.status = status
             decisions[z.truth.name] = status
             all_open = all(s == "open" for s in z.valve_state)
             all_closed = all(s == "closed" for s in z.valve_state)
             self.policy.update_zone(
                 z.truth.name,
-                ZoneReport(
+                self.engine.ZoneReport(
                     demand=status.want_heat,
                     forced_stop=status.forced_stop,
                     valves_open=all_open,
@@ -298,6 +426,10 @@ class Plant:
             elif not flowing and z.heat_on_since is not None:
                 z.bursts.append((z.heat_on_since, t))
                 z.heat_on_since = None
+
+    def wake(self) -> None:
+        """Run a control step at the next time step (the HA runtime wakes on intent changes)."""
+        self._next_control = self.t
 
     def run(self, hours: float, *, log_every_s: float = 300.0) -> None:
         end = self.t + hours * 3600.0

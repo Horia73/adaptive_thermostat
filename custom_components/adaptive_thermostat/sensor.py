@@ -275,6 +275,8 @@ class AdaptiveThermostatPredictedPeakSensor(_ZoneSensor):
     def _attributes(self, diag: dict[str, Any]) -> dict[str, Any]:
         attrs = super()._attributes(diag)
         attrs["control_reason"] = diag.get("control_reason")
+        attrs["heat_trigger_below"] = diag.get("heat_trigger_below")
+        attrs["aim_peak"] = diag.get("aim_peak")
         return attrs
 
 

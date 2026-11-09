@@ -2,15 +2,20 @@
 
 * The committed mini fixture (three short windows around the field
   incidents) always runs.
-* The full private export runs when available (``ADAPTIVE_THERMOSTAT_EXPORT``
-  or the orchestrator's ``../ha-export``); otherwise the test is skipped.
+* The full private exports run when available; otherwise the tests skip.
+  ``test_full_export_legacy`` holds the thresholds calibrated on the 15-25 Oct
+  export of the old controller (``ADAPTIVE_THERMOSTAT_LEGACY_EXPORT``, or
+  ``ADAPTIVE_THERMOSTAT_EXPORT`` / ``../ha-export`` when that is the old
+  export).  ``test_full_export`` checks what must hold for any export,
+  including ones recorded by 2.x, whose window detections already come from
+  the new detector (so "old vs new" is not a meaningful comparison there).
 """
 
 from __future__ import annotations
 
 from pathlib import Path
 
-from export_loader import find_export, load_export
+from export_loader import find_export, find_legacy_export, load_export
 import pytest
 from replay import ReplaySettings, replay_zone, run, summarize
 
@@ -64,9 +69,11 @@ def test_estimator_runs_on_recorded_data(mini) -> None:
         assert zone["params"]["q_s"] > 0
 
 
-@pytest.mark.skipif(find_export() is None, reason="private export not available")
-def test_full_export() -> None:
-    export = load_export(find_export())
+@pytest.mark.skipif(find_legacy_export() is None, reason="old-controller export not available")
+def test_full_export_legacy() -> None:
+    path = find_legacy_export()
+    assert path is not None
+    export = load_export(path)
     report = run(export)
     zones = report["zones"]
     old = sum(z["window"]["old_detections"] for z in zones.values())
@@ -79,3 +86,20 @@ def test_full_export() -> None:
         # The model is never much worse than persistence at multi-hour
         # horizons, and better in the zones where heating dominates.
         assert zone["4h"]["all"]["model_mae"] <= 1.15 * zone["4h"]["all"]["naive_mae"], name
+
+
+@pytest.mark.skipif(find_export() is None, reason="private export not available")
+def test_full_export() -> None:
+    export = load_export(find_export())
+    report = run(export)
+    zones = report["zones"]
+    judged = 0
+    for name, zone in zones.items():
+        assert zone["params"]["q_s"] > 0, name
+        one = zone["one_step"]
+        if one["n"] < 20:
+            continue  # too little data after the warm-up to judge
+        judged += 1
+        # One-step prediction at each report stays within half a degree.
+        assert one["model_mae"] is not None and one["model_mae"] < 0.5, name
+    assert judged > 0

@@ -19,10 +19,12 @@ by slow valves still delivers the planned amount of heat.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import math
 import statistics
 from typing import Any
 
 from .controller import (
+    MODE_MODEL,
     BurstController,
     ControlDecision,
     ControlInput,
@@ -55,6 +57,12 @@ CORE_STORAGE_FORMAT = 1
 EPISODE_GAP_S = 600.0  # heat pauses shorter than this belong to one episode
 EPISODE_MAX_HEAT_S = 40 * 60.0  # evaluate long continuous heating in chunks
 EPISODE_SETTLE_S = 30 * 60.0  # wait this long after the heat for the response
+# Learned trigger correction: raised when a reading below the band shows up
+# after a burst the controller timed itself, lowered slowly otherwise (the
+# equilibrium is about one burst in ten touching the lower edge).
+TRIGGER_CORRECTION_UP = 0.02
+TRIGGER_CORRECTION_DOWN = 0.002
+TRIGGER_CORRECTION_MAX = 0.1
 
 
 @dataclass
@@ -88,6 +96,7 @@ class Burst:
     predicted_peak: float | None = None
     start_state: ZoneState | None = None
     start_params: ThermalParams | None = None
+    min_s: float | None = None  # minimum heat time (None = configured minimum)
 
 
 @dataclass
@@ -98,6 +107,15 @@ class PendingValidation:
     predicted_peak: float
     until: float
     observed_max: float | None = None
+
+
+@dataclass
+class PendingTrigger:
+    """A burst the controller timed itself: did the reading leave the band?"""
+
+    until: float
+    floor_reading: float  # lowest reading inside the band (target - deadband)
+    below: bool = False
 
 
 @dataclass
@@ -128,6 +146,11 @@ class ZoneStatus:
     window_source: str = WINDOW_SOURCE_NONE
     linked_window_open: bool = False
     linked_window_open_zones: tuple[str, ...] = ()
+    # Reading-space plan of the model controller (last idle evaluation).
+    heat_trigger_below: float | None = None
+    aim_peak: float | None = None
+    min_burst_rise: float | None = None
+    band_feasible: bool | None = None
 
 
 class ZoneCore:
@@ -163,6 +186,7 @@ class ZoneCore:
         self.linked_open: tuple[str, ...] = ()
         self.start_delay_s = 30.0
         self.shared_duty = 0.0
+        self.boiler_firing = False
         self.mode_block_until = now + config.mode_change_block_s
         self.window_block_until = 0.0
         self.last_fault: str | None = None
@@ -178,6 +202,15 @@ class ZoneCore:
             float(v) for v in (stored or {}).get("validation_errors", []) if isinstance(v, (int, float))
         ][-config.validation_window :]
         self._pending_validation: list[PendingValidation] = []
+        stored_corr = (stored or {}).get("trigger_correction", 0.0)
+        self.trigger_correction = (
+            min(TRIGGER_CORRECTION_MAX, max(0.0, float(stored_corr)))
+            if isinstance(stored_corr, (int, float)) and math.isfinite(stored_corr)
+            else 0.0
+        )
+        self._pending_trigger: PendingTrigger | None = None
+        # Last reading-space plan: (trigger, aim, min rise, feasible).
+        self._plan: tuple[float | None, float | None, float | None, bool | None] = (None, None, None, None)
         self._restored_t = estimator.t
         if estimator.t is not None:
             # Restored model: the dynamic states are stale, re-anchor them at
@@ -218,6 +251,9 @@ class ZoneCore:
                 pending.observed_max = (
                     value if pending.observed_max is None else max(pending.observed_max, value)
                 )
+        trig = self._pending_trigger
+        if trig is not None and t <= trig.until and value < trig.floor_reading - 1e-6:
+            trig.below = True
         if self._autodetect_active:
             event = self.window.evaluate(t, self.observer.history)
             if event is not None:
@@ -284,6 +320,10 @@ class ZoneCore:
         self.start_delay_s = max(0.0, start_delay_s)
         self.shared_duty = min(1.0, max(0.0, shared_duty))
 
+    def set_boiler_firing(self, firing: bool) -> None:
+        """Whether the shared boiler fires right now (for piggyback starts)."""
+        self.boiler_firing = firing
+
     def dismiss_window(self, t: float) -> None:
         event = self.window.dismiss(t)
         self.window_alert = None
@@ -294,6 +334,8 @@ class ZoneCore:
         self.observer.estimator.reset_model()
         self._validations.clear()
         self._pending_validation.clear()
+        self.trigger_correction = 0.0
+        self._pending_trigger = None
 
     # ----------------------------------------------------------- helpers
     @property
@@ -327,6 +369,7 @@ class ZoneCore:
     def _on_block_start(self) -> None:
         # A burst tail observed with a window open says nothing about the model.
         self._pending_validation.clear()
+        self._pending_trigger = None
 
     def _account_heat(self, t: float) -> None:
         dt = t - self._heat_acc_t
@@ -461,6 +504,18 @@ class ZoneCore:
     def _model_ready(self) -> bool:
         return self.estimator.initialized
 
+    def _finish_trigger(self, t: float) -> None:
+        trig = self._pending_trigger
+        if trig is None or t <= trig.until:
+            return
+        self._pending_trigger = None
+        if trig.below:
+            self.trigger_correction = min(
+                TRIGGER_CORRECTION_MAX, self.trigger_correction + TRIGGER_CORRECTION_UP
+            )
+        else:
+            self.trigger_correction = max(0.0, self.trigger_correction - TRIGGER_CORRECTION_DOWN)
+
     def _finish_validations(self, t: float) -> None:
         done = [p for p in self._pending_validation if t > p.until]
         for pending in done:
@@ -516,6 +571,7 @@ class ZoneCore:
         self._apply_gates(t)
         self.observer.tick(t)
         self._finish_validations(t)
+        self._finish_trigger(t)
         if self._autodetect_active:
             if self.window.is_open:
                 event = self.window.evaluate(t, self.observer.history)
@@ -560,8 +616,13 @@ class ZoneCore:
                 self._stop_burst(t, forced=True, decision=None)
                 reason = "heat did not start"
             else:
+                previous = self._last_decision
                 decision = self.controller.decide(self._control_input(t))
                 reason = decision.reason
+                if decision.trigger is not None:
+                    self._plan = (decision.trigger, decision.aim, decision.min_rise, decision.feasible)
+                elif decision.mode != MODE_MODEL:
+                    self._plan = (None, None, None, None)
                 if self.burst is not None:
                     if decision.stop:
                         self._stop_burst(t, forced=False, decision=decision)
@@ -576,8 +637,21 @@ class ZoneCore:
                         predicted_peak=decision.predicted_peak,
                         start_state=est.zone_state(self.shared_duty) if est.initialized else None,
                         start_params=est.params,
+                        min_s=decision.min_burst_s,
                     )
                     self.last_forced_stop = False
+                    timed = (
+                        decision.mode == MODE_MODEL
+                        and decision.feasible is not False
+                        and previous is not None
+                        and previous.reason == "not needed yet"
+                    )
+                    if timed:
+                        # Watch the readings until the predicted peak.
+                        self._pending_trigger = PendingTrigger(
+                            until=t + self.start_delay_s + (decision.time_to_peak_s or 1800.0),
+                            floor_reading=self.target - self.config.deadband,
+                        )
             self._last_decision = decision
 
         burst = self.burst
@@ -587,6 +661,7 @@ class ZoneCore:
             next_wake = min(next_wake, t + max(1.0, remaining))
         window_open = self.own_window_open
         history = self.observer.history
+        trigger, aim, min_rise, feasible = self._plan
         return ZoneStatus(
             want_heat=burst is not None,
             forced_stop=self.last_forced_stop,
@@ -612,6 +687,10 @@ class ZoneCore:
             window_source=self.window_source,
             linked_window_open=bool(self.linked_open),
             linked_window_open_zones=self.linked_open,
+            heat_trigger_below=trigger,
+            aim_peak=aim,
+            min_burst_rise=min_rise,
+            band_feasible=feasible,
         )
 
     def _control_input(self, t: float) -> ControlInput:
@@ -635,6 +714,10 @@ class ZoneCore:
             heat_elapsed_s=burst.heat_elapsed_s if burst else 0.0,
             planned_burst_s=burst.planned_s if burst else None,
             peak_correction=self.peak_correction(),
+            temp_sd=est.temperature_sd if initialized else 0.0,
+            trigger_correction=self.trigger_correction,
+            boiler_firing=self.boiler_firing,
+            burst_min_s=burst.min_s if burst else None,
         )
 
     # ------------------------------------------------------- persistence
@@ -643,4 +726,5 @@ class ZoneCore:
             "format": CORE_STORAGE_FORMAT,
             "estimator": self.estimator.to_dict(),
             "validation_errors": [round(v, 4) for v in self._validations],
+            "trigger_correction": round(self.trigger_correction, 4),
         }
