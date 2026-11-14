@@ -13,7 +13,7 @@ from homeassistant.helpers.typing import ConfigType
 import voluptuous as vol
 
 from .const import DOMAIN, PLATFORMS
-from .storage import get_state_store
+from .storage import LedgerStore, get_state_store
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -92,6 +92,7 @@ async def async_remove_entry(hass: HomeAssistant, entry: ConfigEntry) -> None:
     store = get_state_store(hass)
     await store.async_load()
     store.remove(entry.entry_id)
+    await LedgerStore(hass, entry.entry_id).async_remove()
 
 
 async def async_update_options(hass: HomeAssistant, entry: ConfigEntry) -> None:

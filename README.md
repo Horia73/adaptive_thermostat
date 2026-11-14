@@ -324,7 +324,22 @@ Tail Duration, Cycle Time To Target (existing entity IDs kept), Heater Active
 A logbook entry is written for every real heating start/stop, for window
 detections and contact openings, and for corrected valve drift.
 
+**Cycle ledger and diagnostics download** *(2.3)*.  Each zone keeps a bounded
+record of its last 96 bursts (at most 14 days): the prediction at the stop
+(predicted peak, mode, reason), planned vs delivered vs commanded heat time,
+the highest reading afterwards, and every perturbation (target change,
+windows, off, faults, unavailable or silent sensor, early next burst,
+restart), with a `clean` verdict.  Get it with *Settings -> Devices &
+services -> Adaptive Thermostat -> zone -> ⋮ -> Download diagnostics*.  It
+adds no entity, attribute or recorder row and does not affect control.
+Schema and limits: [docs/CYCLE_LEDGER.md](docs/CYCLE_LEDGER.md).
+
 ## Upgrading from 1.x and rollback
+
+**2.2 -> 2.3.**  No migration and no control change.  A new store per zone,
+`.storage/adaptive_thermostat_cycles_<entry_id>`, starts empty; the existing
+state store is untouched.  Rolling back to 2.2.0 ignores those files (delete
+them if you like); removing a zone deletes its file.
 
 **2.1 -> 2.2.**  No migration: the learned models are kept, and the stored
 zone state gains one key (`trigger_correction`, starts at 0).  Rolling back to

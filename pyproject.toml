@@ -1,6 +1,6 @@
 [project]
 name = "adaptive-thermostat"
-version = "2.2.0"
+version = "2.3.0"
 description = "Adaptive Thermostat custom integration for Home Assistant (development tooling only)"
 requires-python = ">=3.13"
 

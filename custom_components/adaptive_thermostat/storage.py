@@ -19,6 +19,7 @@ Only the *minor* version changed, so Home Assistant hands the 1.2 data to
 
 from __future__ import annotations
 
+from collections.abc import Callable
 import logging
 from typing import Any
 
@@ -27,6 +28,9 @@ from homeassistant.helpers.storage import Store
 
 from .const import (
     DOMAIN,
+    LEDGER_SAVE_DELAY,
+    LEDGER_STORAGE_KEY,
+    LEDGER_STORAGE_VERSION,
     STORAGE_MINOR_VERSION,
     STORAGE_SAVE_DELAY,
     STORAGE_STATE_KEY,
@@ -106,6 +110,36 @@ class StateStore:
     async def async_flush(self) -> None:
         if self._data is not None:
             await self._store.async_save(dict(self._data))
+
+
+class LedgerStore:
+    """Cycle ledger of one zone (``.storage/adaptive_thermostat_cycles_<entry_id>``).
+
+    Diagnostics only: a separate file so the bounded ledger never delays or
+    bloats the control state above, and so older versions simply ignore it.
+    """
+
+    def __init__(self, hass: HomeAssistant, entry_id: str) -> None:
+        self._store: Store[dict[str, Any]] = Store(
+            hass, LEDGER_STORAGE_VERSION, f"{LEDGER_STORAGE_KEY}_{entry_id}"
+        )
+
+    async def async_load(self) -> dict[str, Any] | None:
+        try:
+            loaded = await self._store.async_load()
+        except Exception:
+            _LOGGER.exception("Could not load the cycle ledger; starting a new one")
+            return None
+        return loaded if isinstance(loaded, dict) else None
+
+    def schedule_save(self, data: Callable[[], dict[str, Any]]) -> None:
+        self._store.async_delay_save(data, LEDGER_SAVE_DELAY)
+
+    async def async_save(self, data: dict[str, Any]) -> None:
+        await self._store.async_save(data)
+
+    async def async_remove(self) -> None:
+        await self._store.async_remove()
 
 
 def get_state_store(hass: HomeAssistant) -> StateStore:

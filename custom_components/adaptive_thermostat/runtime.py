@@ -126,10 +126,11 @@ from .const import (
 from .coordinator import CentralHeaterCoordinator, get_coordinator
 from .engine.boiler import ZoneReport
 from .engine.controller import ControllerConfig
+from .engine.ledger import FLAG_AUTO_OFF, FLAG_MANUAL_OFF, FLAG_MODEL_RESET, CycleLedger
 from .engine.safety import SafetyConfig
 from .engine.window import WindowConfig
 from .engine.zone import ZoneConfig, ZoneCore, ZoneStatus
-from .storage import StateStore
+from .storage import LedgerStore, StateStore
 
 if TYPE_CHECKING:
     from .climate import AdaptiveThermostat
@@ -253,6 +254,9 @@ class ZoneRuntime:
         # Engine and HA plumbing.
         self.core: ZoneCore | None = None
         self.status: ZoneStatus | None = None
+        # Diagnostics only (see engine/ledger.py): never feeds back into control.
+        self.ledger: CycleLedger | None = None
+        self.ledger_store = LedgerStore(hass, self.entry_id)
         self.coordinator: CentralHeaterCoordinator | None = None
         self.trackers: dict[str, CommandTracker] = {h: CommandTracker(h) for h in self.heater_ids}
         self.entity: AdaptiveThermostat | None = None
@@ -312,6 +316,7 @@ class ZoneRuntime:
         self.core.set_hvac(now, self.hvac_mode == HVACMode.HEAT)
         self.core.set_target(self.target)
         self._seed_from_states(now)
+        await self._async_load_ledger(now)
 
         if self.central_heater_id:
             self.coordinator = get_coordinator(self.hass, self.central_heater_id)
@@ -391,6 +396,7 @@ class ZoneRuntime:
                     await async_command(self.hass, heater, False)
         self._persist(now, force=True)
         await self.store.async_flush()
+        await self._async_save_ledger(now)
 
     # ------------------------------------------------------------- intent
     def _restore_intent(self, stored: dict[str, Any]) -> None:
@@ -417,6 +423,8 @@ class ZoneRuntime:
     def set_hvac_mode(self, mode: HVACMode) -> None:
         now = self._now()
         if mode == HVACMode.OFF:
+            if self.hvac_mode == HVACMode.HEAT:
+                self._ledger_call(lambda ledger: ledger.note(now, FLAG_MANUAL_OFF))
             self.hvac_mode = HVACMode.OFF
             self.manual_override = self.auto_on_off
         elif mode == HVACMode.HEAT:
@@ -463,6 +471,7 @@ class ZoneRuntime:
     def reset_model(self) -> None:
         if self.core is not None:
             self.core.reset_model()
+        self._ledger_call(lambda ledger: ledger.note(self._now(), FLAG_MODEL_RESET))
         self._last_model_save = 0.0
         self._intent_changed()
 
@@ -554,6 +563,7 @@ class ZoneRuntime:
         now = self._now()
         reported = state.last_reported.timestamp() if state is not None else now
         self.core.on_temperature(now, value, reported_t=reported)
+        self._ledger_call(lambda ledger: ledger.on_reading(now, value))
         if value is not None:
             self.current_temperature = value
         self.wake()
@@ -569,6 +579,7 @@ class ZoneRuntime:
             return
         now = self._now()
         self.core.on_temperature(now, value, reported_t=now)
+        self._ledger_call(lambda ledger: ledger.on_reading(now, value))
         self.wake()
 
     @callback
@@ -720,6 +731,7 @@ class ZoneRuntime:
         if hold is not None:
             wake_at = min(wake_at, hold + 0.5)
         self._schedule(wake_at)
+        self._ledger_call(lambda ledger: ledger.observe(now, core, status))
 
     def _compute_zone_heater(self) -> bool:
         if self.hvac_mode != HVACMode.HEAT or self.status is None:
@@ -878,6 +890,7 @@ class ZoneRuntime:
             self.hvac_mode = HVACMode.HEAT
         elif self.hvac_mode == HVACMode.HEAT and outdoor > self.auto_off_temp:
             _LOGGER.info("[%s] Auto OFF (outdoor %.1f°C > %.1f°C)", self.name, outdoor, self.auto_off_temp)
+            self._ledger_call(lambda ledger: ledger.note(now, FLAG_AUTO_OFF))
             self.hvac_mode = HVACMode.OFF
         else:
             return
@@ -1053,6 +1066,42 @@ class ZoneRuntime:
             "bursts_learned": est.stats.bursts_learned,
         }
         return out
+
+    # -------------------------------------------------------- cycle ledger
+    async def _async_load_ledger(self, now: float) -> None:
+        stored = await self.ledger_store.async_load()
+        try:
+            self.ledger = CycleLedger(stored, now=now)
+        except Exception:
+            _LOGGER.exception("[%s] Stored cycle ledger unreadable; starting a new one", self.name)
+            self.ledger = CycleLedger(None, now=now)
+        self._ledger_call(lambda _ledger: None)
+
+    def _ledger_call(self, action: Callable[[CycleLedger], None]) -> None:
+        """Feed the ledger; a ledger error disables it but never touches control."""
+        ledger = self.ledger
+        if ledger is None:
+            return
+        try:
+            action(ledger)
+        except Exception:
+            _LOGGER.exception("[%s] Cycle ledger failed; disabled until reload", self.name)
+            self.ledger = None
+            return
+        if ledger.take_dirty():
+            self.ledger_store.schedule_save(ledger.to_dict)
+
+    async def _async_save_ledger(self, now: float) -> None:
+        ledger = self.ledger
+        if ledger is None:
+            return
+        try:
+            if self.core is not None:
+                ledger.flush(now, self.core)
+            ledger.take_dirty()
+            await self.ledger_store.async_save(ledger.to_dict())
+        except Exception:
+            _LOGGER.exception("[%s] Could not save the cycle ledger", self.name)
 
     # ---------------------------------------------------------- persistence
     def _payload(self) -> dict[str, Any]:

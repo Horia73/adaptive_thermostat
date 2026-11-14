@@ -75,6 +75,12 @@ STORAGE_MINOR_VERSION = 2
 STORAGE_STATE_KEY = "adaptive_thermostat_runtime_state"
 STORAGE_SAVE_DELAY = 10.0
 MODEL_SAVE_INTERVAL = 900.0  # s between saves caused only by model learning
+# Cycle ledger (2.3): one store per zone (<= ~175 kB at full retention),
+# written at most once an hour while cycles happen, on unload and at Home
+# Assistant's final write; never touches the recorder.
+LEDGER_STORAGE_VERSION = 1
+LEDGER_STORAGE_KEY = "adaptive_thermostat_cycles"  # + "_<entry_id>"
+LEDGER_SAVE_DELAY = 3600.0
 
 # Dispatcher signals
 SIGNAL_THERMOSTAT_READY = "adaptive_thermostat_thermostat_ready"

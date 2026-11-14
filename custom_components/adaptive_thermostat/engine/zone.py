@@ -501,6 +501,13 @@ class ZoneCore:
         prof.append((min(delay, prof[-1][0] + cfg.overrun_step_s) if prof else 0.0, 0.0))
         return tuple(prof)
 
+    def validation_prediction(self, heat_started_at: float) -> tuple[float, float] | None:
+        """(predicted peak, observe until) of the pending model check of a burst (read-only)."""
+        for pending in self._pending_validation:
+            if pending.started_at == heat_started_at:
+                return pending.predicted_peak, pending.until
+        return None
+
     def _model_ready(self) -> bool:
         return self.estimator.initialized
 
